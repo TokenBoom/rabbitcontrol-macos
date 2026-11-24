@@ -24,6 +24,7 @@ ICON_ICNS="$UI_DIR/icons/icon.icns"
 PROFILE="release"
 MAKE_DMG=1
 SIGN_ID="${RC_DEV_CERT:-}"
+SIGN_KEYCHAIN="${RC_SIGN_KEYCHAIN:-}"
 OUT_DIR="$REPO_ROOT/target/dist"
 TARGET_TRIPLE=""
 VERSION_OVERRIDE=""
@@ -42,6 +43,7 @@ usage() {
   --debug             构建 debug 包
   --no-dmg            仅生成 .app，不打包 .dmg
   --sign <身份>       指定 codesign 签名身份（如 "RabbitControl Dev"、"Developer ID Application: ..." 或 "-"）
+  --keychain <路径>   指定 codesign 使用的钥匙串路径（CI 临时钥匙串用）
   --out <目录>        指定输出目录（默认 target/dist）
   --target <triple>   指定 Cargo 目标三元组（如 aarch64-apple-darwin、x86_64-apple-darwin）
   --version <版本>    覆盖应用版本号与 DMG 文件名版本（自动去除可选前导 v）
@@ -57,6 +59,11 @@ while [[ $# -gt 0 ]]; do
         --sign)
             [[ $# -ge 2 ]] || die "--sign 需要提供签名身份"
             SIGN_ID="$2"
+            shift 2
+            ;;
+        --keychain)
+            [[ $# -ge 2 ]] || die "--keychain 需要提供钥匙串路径"
+            SIGN_KEYCHAIN="$2"
             shift 2
             ;;
         --out)
@@ -292,9 +299,13 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 EOF
 
 echo "==> 代码签名 (identity=$SIGN_ID, bundle_id=$BUNDLE_ID)"
-codesign --force --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.daemon" "$APP_BUNDLE/Contents/MacOS/rc-daemon"
-codesign --force --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.agent" "$APP_BUNDLE/Contents/MacOS/rc-host-agent"
-codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_BUNDLE"
+CODESIGN_KEYCHAIN_ARGS=()
+if [[ -n "$SIGN_KEYCHAIN" ]]; then
+    CODESIGN_KEYCHAIN_ARGS=(--keychain "$SIGN_KEYCHAIN")
+fi
+codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.daemon" "$APP_BUNDLE/Contents/MacOS/rc-daemon"
+codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.agent" "$APP_BUNDLE/Contents/MacOS/rc-host-agent"
+codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
 DMG_PATH=""
