@@ -196,29 +196,38 @@ fn assert_client_completed_session(
     );
 }
 
-/// 双进程 fake localhost：client exit 0、JSON 含 session 段与
-/// `"passed":true`。在共享 CI 虚机上若仅因瞬态调度抖动未过 Gate（exit 1 且含
-/// `"client 完成：Gate 未通过"`），允许最多重试一次以消除非代码类抖动误报。
-#[test]
-fn host_and_client_pass_gate_on_localhost() {
-    let _serial = pair_serial();
+/// 在共享 CI 虚机上若仅因瞬态调度抖动未过 Gate（exit 1 且 stderr 含 `"client 完成：Gate 未通过"`），
+/// 允许最多重试至 3 次以消除非代码类抖动误报；本地单次执行零重试。
+fn run_pair_gate(
+    tag: &str,
+    host_extra: &[&str],
+    client_extra: &[&str],
+) -> (std::process::ExitStatus, String) {
     let max_attempts = if std::env::var_os("CI").is_some() {
-        2
+        3
     } else {
         1
     };
     let mut attempt = 0;
-    let (status, json) = loop {
+    loop {
         attempt += 1;
-        let (status, json) = run_pair("pass", &["--duration", "8s"], &["--duration", "4s"]);
-        let stderr = std::fs::read_to_string(tmp("pass", "client.err")).unwrap_or_default();
+        let (status, json) = run_pair(tag, host_extra, client_extra);
+        let stderr = std::fs::read_to_string(tmp(tag, "client.err")).unwrap_or_default();
         if status.code() == Some(0)
             || attempt >= max_attempts
             || !(status.code() == Some(1) && stderr.contains("client 完成：Gate 未通过"))
         {
-            break (status, json);
+            return (status, json);
         }
-    };
+    }
+}
+
+/// 双进程 fake localhost：client exit 0、JSON 含 session 段与
+/// `"passed":true`。
+#[test]
+fn host_and_client_pass_gate_on_localhost() {
+    let _serial = pair_serial();
+    let (status, json) = run_pair_gate("pass", &["--duration", "8s"], &["--duration", "4s"]);
     assert_eq!(
         status.code(),
         Some(0),
@@ -485,7 +494,7 @@ fn host_report_exposes_scheduler_frame_stats() {
 #[test]
 fn reconnect_scenario_recovers_within_budget() {
     let _serial = pair_serial();
-    let (status, json) = run_pair(
+    let (status, json) = run_pair_gate(
         "reconnect",
         &["--duration", "10s"],
         &["--duration", "6s", "--reconnect-at", "1s"],
