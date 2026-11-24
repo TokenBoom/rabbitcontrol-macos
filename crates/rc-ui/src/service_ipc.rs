@@ -382,15 +382,23 @@ mod imp {
                     while !stop_bg.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((mut stream, _addr)) => {
-                                let reserved = inflight
-                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                                        if n < MAX_INFLIGHT_IPC {
-                                            Some(n + 1)
-                                        } else {
-                                            None
+                                let reserved = {
+                                    let mut cur = inflight.load(Ordering::Acquire);
+                                    loop {
+                                        if cur >= MAX_INFLIGHT_IPC {
+                                            break false;
                                         }
-                                    })
-                                    .is_ok();
+                                        match inflight.compare_exchange_weak(
+                                            cur,
+                                            cur + 1,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        ) {
+                                            Ok(_) => break true,
+                                            Err(observed) => cur = observed,
+                                        }
+                                    }
+                                };
                                 if !reserved {
                                     if let Ok(mut busy) =
                                         serde_json::to_vec(&ServiceResponse::Error {
