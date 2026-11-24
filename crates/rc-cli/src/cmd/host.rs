@@ -127,14 +127,9 @@ pub fn run(args: &HostArgs) -> CliResult<ExitCode> {
         .local_addr()
         .map_err(|e| format!("无法获取监听地址: {e}"))?;
     #[cfg(target_os = "macos")]
-    let _activity = if matches!(args.backend, super::BackendMode::Real) {
+    let _activity = {
         rc_capture_macos::promote_current_thread_qos();
-        Some(rc_capture_macos::LatencyCriticalActivity::begin(
-            "RabbitControl host",
-            true,
-        ))
-    } else {
-        None
+        rc_capture_macos::LatencyCriticalActivity::begin("RabbitControl host", true)
     };
     eprintln!(
         "host 等待连接：listen={listen}（{}x{} @ {}fps，注入={}）",

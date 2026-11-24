@@ -24,7 +24,7 @@ fn reserve_port() -> u16 {
 /// 只串行化测量环境。
 fn pair_serial() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().expect("进程对串行锁中毒")
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// spawn 一个子进程（stderr 落临时文件供断言）。
@@ -36,6 +36,23 @@ fn spawn(args: &[&str], stderr_path: &str) -> Child {
         .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap_or_else(|e| panic!("spawn rc-cli 失败: {e}"))
+}
+
+/// 等待 host 子进程完成 UDP 监听绑定（stderr 打印 `"host 等待连接："`）后再启动 client，
+/// 避免慢速 CI 虚机上 client 首包 QUIC Initial 撞空触发 1s PTO 拖垮首帧预算。
+fn wait_host_listening(host: &mut Child, stderr_path: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(stderr_path) {
+            if text.contains("host 等待连接：") {
+                return;
+            }
+        }
+        if let Ok(Some(_)) = host.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// 等子进程退出；超时先 kill `child` 与 `also_kill` 里的全部同伴进程，
@@ -96,6 +113,7 @@ fn run_pair(
     let port = reserve_port();
     let connect = format!("127.0.0.1:{port}");
 
+    let host_err = tmp(test_name, "host.err");
     let mut host = spawn(
         &[
             "host",
@@ -112,8 +130,9 @@ fn run_pair(
         .chain(host_extra.iter())
         .copied()
         .collect::<Vec<_>>(),
-        &tmp(test_name, "host.err"),
+        &host_err,
     );
+    wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
 
     // host 起来需要毫秒级（endpoint + 等待连接），client 自带 10s connect
     // 超时——直接 connect 即可。
@@ -254,6 +273,7 @@ fn host_report_has_no_gate_key() {
     let port = reserve_port();
     let connect = format!("127.0.0.1:{port}");
     let host_report = tmp("hostrep", "host.json");
+    let host_err = tmp("hostrep", "host.err");
     let mut host = spawn(
         &[
             "host",
@@ -270,8 +290,9 @@ fn host_report_has_no_gate_key() {
             "--report",
             &host_report,
         ],
-        &tmp("hostrep", "host.err"),
+        &host_err,
     );
+    wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
     let mut client = spawn(
         &[
             "client",
@@ -325,6 +346,7 @@ fn host_report_exposes_scheduler_frame_stats() {
     let port = reserve_port();
     let connect = format!("127.0.0.1:{port}");
     let host_report = tmp("sched", "host.json");
+    let host_err = tmp("sched", "host.err");
     let mut host = spawn(
         &[
             "host",
@@ -341,8 +363,9 @@ fn host_report_exposes_scheduler_frame_stats() {
             "--report",
             &host_report,
         ],
-        &tmp("sched", "host.err"),
+        &host_err,
     );
+    wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
     let mut client = spawn(
         &[
             "client",
@@ -541,6 +564,7 @@ fn clipboard_scripted_sync_over_real_quic() {
         let port = reserve_port();
         let connect = format!("127.0.0.1:{port}");
         let host_report = tmp("clip-on", "host.json");
+        let host_err = tmp("clip-on", "host.err");
         let client_report = tmp("clip-on", "client.json");
 
         let mut host = spawn(
@@ -561,8 +585,9 @@ fn clipboard_scripted_sync_over_real_quic() {
                 "--report",
                 &host_report,
             ],
-            &tmp("clip-on", "host.err"),
+            &host_err,
         );
+        wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
         let mut client = spawn(
             &[
                 "client",
@@ -573,7 +598,7 @@ fn clipboard_scripted_sync_over_real_quic() {
                 "--resolution",
                 "64x64",
                 "--duration",
-                "3s",
+                "4s",
                 "--input-mode",
                 "scripted",
                 "--clipboard",
@@ -648,6 +673,7 @@ fn clipboard_scripted_sync_over_real_quic() {
         let port = reserve_port();
         let connect = format!("127.0.0.1:{port}");
         let host_report = tmp("clip-off", "host.json");
+        let host_err = tmp("clip-off", "host.err");
         let client_report = tmp("clip-off", "client.json");
 
         let mut host = spawn(
@@ -666,8 +692,9 @@ fn clipboard_scripted_sync_over_real_quic() {
                 "--report",
                 &host_report,
             ],
-            &tmp("clip-off", "host.err"),
+            &host_err,
         );
+        wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
         let mut client = spawn(
             &[
                 "client",
@@ -678,7 +705,7 @@ fn clipboard_scripted_sync_over_real_quic() {
                 "--resolution",
                 "64x64",
                 "--duration",
-                "2s",
+                "4s",
                 "--input-mode",
                 "scripted",
                 "--report",
@@ -746,6 +773,7 @@ fn deny_mode_rejects_client() {
         ],
         &host_err,
     );
+    wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
     let mut client = spawn(
         &[
             "client",

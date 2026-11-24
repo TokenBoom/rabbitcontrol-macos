@@ -159,6 +159,12 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
         },
     };
 
+    #[cfg(target_os = "macos")]
+    let _activity = {
+        rc_capture_macos::promote_current_thread_qos();
+        rc_capture_macos::LatencyCriticalActivity::begin("RabbitControl client", true)
+    };
+
     // ── 计时起点：Endpoint 创建之前（坑 3 写死的口径）──
     let t0 = Instant::now();
     // 会话钟 = 可变锚点（修复卡 C-1，对齐 host 侧 ClockOrigin 模式）：
