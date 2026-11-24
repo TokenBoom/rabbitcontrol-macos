@@ -293,6 +293,7 @@ fn host_report_has_no_gate_key() {
         &host_err,
     );
     wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
+    let client_err = tmp("hostrep", "client.err");
     let mut client = spawn(
         &[
             "client",
@@ -303,16 +304,27 @@ fn host_report_has_no_gate_key() {
             "--resolution",
             "64x64",
             "--duration",
-            "2s",
+            "3s",
             "--input-mode",
             "scripted",
         ],
-        &tmp("hostrep", "client.err"),
+        &client_err,
     );
     let client_status = wait(&mut client, &mut [&mut host], Duration::from_secs(20));
     let host_status = wait(&mut host, &mut [], Duration::from_secs(20));
-    assert!(client_status.success());
-    assert!(host_status.success());
+    assert!(
+        client_status.success(),
+        "host_report_has_no_gate_key client exit {:?}, client_err: {}, host_err: {}",
+        client_status.code(),
+        std::fs::read_to_string(&client_err).unwrap_or_default(),
+        std::fs::read_to_string(&host_err).unwrap_or_default(),
+    );
+    assert!(
+        host_status.success(),
+        "host_report_has_no_gate_key host exit {:?}, host_err: {}",
+        host_status.code(),
+        std::fs::read_to_string(&host_err).unwrap_or_default(),
+    );
 
     let json = std::fs::read_to_string(&host_report).expect("host 报告必须落盘");
     assert!(json.contains("\"config\""), "host 报告缺 config：{json}");
@@ -366,6 +378,7 @@ fn host_report_exposes_scheduler_frame_stats() {
         &host_err,
     );
     wait_host_listening(&mut host, &host_err, Duration::from_secs(5));
+    let client_err = tmp("sched", "client.err");
     let mut client = spawn(
         &[
             "client",
@@ -376,16 +389,27 @@ fn host_report_exposes_scheduler_frame_stats() {
             "--resolution",
             "64x64",
             "--duration",
-            "2s",
+            "3s",
             "--input-mode",
             "scripted",
         ],
-        &tmp("sched", "client.err"),
+        &client_err,
     );
     let client_status = wait(&mut client, &mut [&mut host], Duration::from_secs(20));
     let host_status = wait(&mut host, &mut [], Duration::from_secs(20));
-    assert!(client_status.success());
-    assert!(host_status.success());
+    assert!(
+        client_status.success(),
+        "host_report_exposes_scheduler_frame_stats client exit {:?}, client_err: {}, host_err: {}",
+        client_status.code(),
+        std::fs::read_to_string(&client_err).unwrap_or_default(),
+        std::fs::read_to_string(&host_err).unwrap_or_default(),
+    );
+    assert!(
+        host_status.success(),
+        "host_report_exposes_scheduler_frame_stats host exit {:?}, host_err: {}",
+        host_status.code(),
+        std::fs::read_to_string(&host_err).unwrap_or_default(),
+    );
 
     let json = std::fs::read_to_string(&host_report).expect("host 报告必须落盘");
     // 四键贯通（summary → 报告 JSON）。
