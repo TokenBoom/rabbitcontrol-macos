@@ -670,6 +670,7 @@ fn build_signal_client_options(state: &AppState) -> SignalClientOptions {
         token_provider: Some(token_provider),
         device_pubkey,
         allow_remote_assist,
+        dynamic_lan_discovery: true,
     }
 }
 
@@ -1975,6 +1976,25 @@ pub fn list_lan_devices(state: State<'_, AppState>) -> Result<Vec<LanPeer>, Stri
 // 信令与中继服务器配置与生命周期控制
 // ─────────────────────────────────────────────────────────────────
 
+fn filter_usable_display_lan_addr(addr: &str) -> Option<String> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: SocketAddr = trimmed.parse().ok()?;
+    let canonical_ip = parsed.ip().to_canonical();
+    let usable = match canonical_ip {
+        std::net::IpAddr::V4(v4) => lan_discovery::is_usable_lan_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    };
+    usable.then(|| SocketAddr::new(canonical_ip, parsed.port()).to_string())
+}
+
 fn collect_local_lan_addrs(state: &AppState) -> Vec<String> {
     let mut out = Vec::new();
     let display = state
@@ -1983,10 +2003,8 @@ fn collect_local_lan_addrs(state: &AppState) -> Vec<String> {
         .unwrap_or_else(|e| e.into_inner())
         .display_addr
         .clone();
-    if let Some(addr) = display {
-        if !addr.is_empty() {
-            out.push(addr);
-        }
+    if let Some(addr) = display.as_deref().and_then(filter_usable_display_lan_addr) {
+        out.push(addr);
     } else if let Some(ip) = lan_discovery::detect_local_lan_ipv4() {
         out.push(format!("{ip}:{}", host_bridge::DEFAULT_HOST_PORT));
     }
@@ -5491,5 +5509,65 @@ mod tests {
         assert_eq!(saved[0].local_port, 18080);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_local_lan_addrs_filters_loopback_and_unusable_display_addrs() {
+        assert_eq!(filter_usable_display_lan_addr(""), None);
+        assert_eq!(filter_usable_display_lan_addr("not-an-addr"), None);
+        assert_eq!(filter_usable_display_lan_addr("127.0.0.1:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("[::1]:9901"), None);
+        assert_eq!(
+            filter_usable_display_lan_addr("[::ffff:127.0.0.1]:9901"),
+            None
+        );
+        assert_eq!(filter_usable_display_lan_addr("0.0.0.0:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("[::]:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("224.0.0.1:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("[ff02::1]:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("169.254.1.2:9901"), None);
+        assert_eq!(filter_usable_display_lan_addr("[fe80::1]:9901"), None);
+        assert_eq!(
+            filter_usable_display_lan_addr("192.168.1.50:9901").as_deref(),
+            Some("192.168.1.50:9901")
+        );
+        assert_eq!(
+            filter_usable_display_lan_addr("[::ffff:192.168.1.50]:9901").as_deref(),
+            Some("192.168.1.50:9901")
+        );
+        assert_eq!(
+            filter_usable_display_lan_addr("[fd00::10]:9901").as_deref(),
+            Some("[fd00::10]:9901")
+        );
+
+        let state = AppState::new_for_test();
+        assert!(build_signal_client_options(&state).dynamic_lan_discovery);
+
+        {
+            let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+            host.display_addr = Some("192.168.1.50:9901".to_string());
+        }
+        assert_eq!(
+            collect_local_lan_addrs(&state),
+            vec!["192.168.1.50:9901".to_string()]
+        );
+
+        for rejected in ["127.0.0.1:9901", "[::1]:9901"] {
+            {
+                let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+                host.display_addr = Some(rejected.to_string());
+            }
+            let addrs = collect_local_lan_addrs(&state);
+            assert!(
+                !addrs.iter().any(|a| a == rejected),
+                "must not keep rejected display_addr {rejected}, got {addrs:?}"
+            );
+            assert!(
+                addrs
+                    .iter()
+                    .all(|a| filter_usable_display_lan_addr(a).is_some()),
+                "all fallback addresses must be usable LAN addresses: {addrs:?}"
+            );
+        }
     }
 }

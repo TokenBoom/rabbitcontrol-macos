@@ -3444,7 +3444,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 [[package]]
 name = "rc-audio"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3466,7 +3466,7 @@ dependencies = [
 [[package]]
 name = "rc-capture"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3513,7 +3513,7 @@ dependencies = [
 [[package]]
 name = "rc-client-core"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "base64 0.22.1",
  "rand 0.8.8",
@@ -3558,7 +3558,7 @@ dependencies = [
 [[package]]
 name = "rc-decode"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-capture",
  "rc-types",
@@ -3581,7 +3581,7 @@ dependencies = [
 [[package]]
 name = "rc-diff"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3589,7 +3589,7 @@ dependencies = [
 [[package]]
 name = "rc-encode"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-capture",
  "rc-types",
@@ -3610,7 +3610,7 @@ dependencies = [
 [[package]]
 name = "rc-fec"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3628,7 +3628,7 @@ dependencies = [
 [[package]]
 name = "rc-input"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-net",
  "rc-types",
@@ -3650,7 +3650,7 @@ dependencies = [
 [[package]]
 name = "rc-loopback"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rand 0.8.8",
  "rc-capture",
@@ -3665,7 +3665,7 @@ dependencies = [
 [[package]]
 name = "rc-net"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "bytes",
  "quinn",
@@ -3681,7 +3681,7 @@ dependencies = [
 [[package]]
 name = "rc-pipeline"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-capture",
  "rc-decode",
@@ -3720,7 +3720,7 @@ dependencies = [
 [[package]]
 name = "rc-proto"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3728,7 +3728,7 @@ dependencies = [
 [[package]]
 name = "rc-render"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-capture",
  "rc-decode",
@@ -3757,7 +3757,7 @@ dependencies = [
 [[package]]
 name = "rc-sched"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
  "thiserror 1.0.69",
@@ -3766,7 +3766,7 @@ dependencies = [
 [[package]]
 name = "rc-session"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rand 0.8.8",
  "rc-capture",
@@ -3783,7 +3783,7 @@ dependencies = [
 [[package]]
 name = "rc-tools"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -3795,7 +3795,7 @@ dependencies = [
 [[package]]
 name = "rc-trace"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "rc-types",
 ]
@@ -3803,7 +3803,7 @@ dependencies = [
 [[package]]
 name = "rc-types"
 version = "0.1.0"
-source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.6#27bbefffca01304c6c4fac7bfda987aaf4f587b1"
+source = "git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag=v0.1.7#f1dc3614c162f65bd61c90ee8f7077679062777d"
 dependencies = [
  "thiserror 1.0.69",
 ]

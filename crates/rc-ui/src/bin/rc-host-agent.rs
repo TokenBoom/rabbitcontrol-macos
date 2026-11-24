@@ -450,6 +450,7 @@ impl AgentInner {
             token_provider: Some(token_provider),
             device_pubkey: Some(self.auth.cert_manager().device_pubkey_hex()),
             allow_remote_assist: self.signal_allow_remote_assist(),
+            dynamic_lan_discovery: true,
         };
         let mut lan_addrs = Vec::new();
         if let Some(ip) = lan_discovery::detect_local_lan_ipv4() {
