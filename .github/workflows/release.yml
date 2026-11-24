@@ -1,0 +1,129 @@
+name: macOS Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  build:
+    name: Build DMG (${{ matrix.arch }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, arch: arm64 }
+          - { target: x86_64-apple-darwin, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Ensure Rust target stdlib is installed
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Setup optional macOS signing certificate
+        id: signing
+        env:
+          SIGN_P12_BASE64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
+          SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$SIGN_P12_BASE64" && -n "$SIGN_P12_PASSWORD" && -n "$SIGN_IDENTITY" ]]; then
+            KEYCHAIN_PATH="$RUNNER_TEMP/rc-signing.keychain-db"
+            KEYCHAIN_PASS="$(uuidgen)"
+            P12_PATH="$RUNNER_TEMP/rc-signing.p12"
+            echo "$SIGN_P12_BASE64" | base64 --decode > "$P12_PATH"
+            security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH"
+            rm -f "$P12_PATH"
+            echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
+            echo "sign_id=$SIGN_IDENTITY" >> "$GITHUB_OUTPUT"
+          else
+            echo "keychain_path=" >> "$GITHUB_OUTPUT"
+            echo "sign_id=-" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Package RabbitControl.app and DMG
+        env:
+          SIGN_ID: ${{ steps.signing.outputs.sign_id }}
+        run: |
+          set -euo pipefail
+          bash -n scripts/package-macos.sh
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            APP_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            APP_VERSION="0.0.0-dev-${GITHUB_SHA::7}"
+          fi
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          ./scripts/package-macos.sh \
+            --release \
+            --target "${{ matrix.target }}" \
+            --version "$APP_VERSION" \
+            --sign "$SIGN_ID" \
+            --out dist
+      - name: Verify DMG and generate SHA256 checksum
+        run: |
+          set -euo pipefail
+          DMG_NAME="RabbitControl-${APP_VERSION}-${{ matrix.arch }}.dmg"
+          hdiutil verify "dist/$DMG_NAME"
+          (cd dist && shasum -a 256 "$DMG_NAME" > "${DMG_NAME}.sha256")
+      - name: Clean up temporary signing keychain
+        if: always() && steps.signing.outputs.keychain_path != ''
+        run: security delete-keychain "${{ steps.signing.outputs.keychain_path }}" || true
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          retention-days: 3
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Build combined SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          LC_ALL=C sort -k2 dist/*.dmg.sha256 > dist/SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "RabbitControl macOS ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

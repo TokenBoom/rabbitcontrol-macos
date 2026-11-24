@@ -25,6 +25,8 @@ PROFILE="release"
 MAKE_DMG=1
 SIGN_ID="${RC_DEV_CERT:-}"
 OUT_DIR="$REPO_ROOT/target/dist"
+TARGET_TRIPLE=""
+VERSION_OVERRIDE=""
 
 die() {
     echo "错误: $*" >&2
@@ -36,12 +38,14 @@ usage() {
 用法: ./scripts/package-macos.sh [选项]
 
 选项:
-  --release         构建 release 包（默认）
-  --debug           构建 debug 包
-  --no-dmg          仅生成 .app，不打包 .dmg
-  --sign <身份>     指定 codesign 签名身份（如 "RabbitControl Dev"、"Developer ID Application: ..." 或 "-"）
-  --out <目录>      指定输出目录（默认 target/dist）
-  -h, --help        显示帮助
+  --release           构建 release 包（默认）
+  --debug             构建 debug 包
+  --no-dmg            仅生成 .app，不打包 .dmg
+  --sign <身份>       指定 codesign 签名身份（如 "RabbitControl Dev"、"Developer ID Application: ..." 或 "-"）
+  --out <目录>        指定输出目录（默认 target/dist）
+  --target <triple>   指定 Cargo 目标三元组（如 aarch64-apple-darwin、x86_64-apple-darwin）
+  --version <版本>    覆盖应用版本号与 DMG 文件名版本（自动去除可选前导 v）
+  -h, --help          显示帮助
 EOF
 }
 
@@ -58,6 +62,16 @@ while [[ $# -gt 0 ]]; do
         --out)
             [[ $# -ge 2 ]] || die "--out 需要提供输出目录"
             OUT_DIR="$2"
+            shift 2
+            ;;
+        --target)
+            [[ $# -ge 2 ]] || die "--target 需要提供 Cargo target triple"
+            TARGET_TRIPLE="$2"
+            shift 2
+            ;;
+        --version)
+            [[ $# -ge 2 ]] || die "--version 需要提供版本号"
+            VERSION_OVERRIDE="$2"
             shift 2
             ;;
         -h|--help) usage; exit 0 ;;
@@ -83,7 +97,21 @@ print(
 ' "$TAURI_CONF"
 )
 
-ARCH="$(uname -m)"
+if [[ -n "$VERSION_OVERRIDE" ]]; then
+    APP_VERSION="${VERSION_OVERRIDE#v}"
+fi
+[[ -n "$APP_VERSION" ]] || die "版本号不能为空"
+
+if [[ -n "$TARGET_TRIPLE" ]]; then
+    case "$TARGET_TRIPLE" in
+        aarch64-apple-darwin) ARCH="arm64" ;;
+        x86_64-apple-darwin) ARCH="x86_64" ;;
+        *) ARCH="$TARGET_TRIPLE" ;;
+    esac
+else
+    ARCH="$(uname -m)"
+fi
+
 if [[ -z "$SIGN_ID" ]]; then
     if security find-identity -p codesigning 2>/dev/null | grep -Fq '"RabbitControl Dev"'; then
         SIGN_ID="RabbitControl Dev"
@@ -94,14 +122,22 @@ fi
 
 echo "==> 构建 $PRODUCT_NAME v$APP_VERSION ($PROFILE, $ARCH)"
 BUILD_ARGS=(-p rc-ui --bin rc-ui --bin rc-daemon --bin rc-host-agent)
+if [[ -n "$TARGET_TRIPLE" ]]; then
+    BUILD_ARGS+=(--target "$TARGET_TRIPLE")
+fi
 if [[ "$PROFILE" == "release" ]]; then
     BUILD_ARGS+=(--release)
 fi
 (cd "$REPO_ROOT" && cargo build "${BUILD_ARGS[@]}")
 
-SRC_BIN="$REPO_ROOT/target/$PROFILE/rc-ui"
-DAEMON_BIN="$REPO_ROOT/target/$PROFILE/rc-daemon"
-AGENT_BIN="$REPO_ROOT/target/$PROFILE/rc-host-agent"
+if [[ -n "$TARGET_TRIPLE" ]]; then
+    BIN_DIR="$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE"
+else
+    BIN_DIR="$REPO_ROOT/target/$PROFILE"
+fi
+SRC_BIN="$BIN_DIR/rc-ui"
+DAEMON_BIN="$BIN_DIR/rc-daemon"
+AGENT_BIN="$BIN_DIR/rc-host-agent"
 [[ -x "$SRC_BIN" ]] || die "构建产物不存在: $SRC_BIN"
 [[ -x "$DAEMON_BIN" ]] || die "构建产物不存在: $DAEMON_BIN"
 [[ -x "$AGENT_BIN" ]] || die "构建产物不存在: $AGENT_BIN"
@@ -272,12 +308,22 @@ if [[ "$MAKE_DMG" -eq 1 ]]; then
 
     rm -f "$DMG_PATH"
     echo "==> 生成 DMG 安装镜像: $DMG_PATH"
-    hdiutil create \
-        -volname "$PRODUCT_NAME" \
-        -srcfolder "$STAGE_DIR" \
-        -ov \
-        -format UDZO \
-        "$DMG_PATH" >/dev/null
+    for attempt in 1 2 3; do
+        if hdiutil create \
+            -volname "$PRODUCT_NAME" \
+            -srcfolder "$STAGE_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_PATH" >/dev/null; then
+            break
+        fi
+        if [[ "$attempt" -eq 3 ]]; then
+            die "hdiutil create 连续失败 3 次: $DMG_PATH"
+        fi
+        echo "hdiutil create 第 ${attempt} 次失败，2 秒后重试..." >&2
+        rm -f "$DMG_PATH"
+        sleep 2
+    done
     rm -rf "$STAGE_DIR"
     trap - EXIT
 fi
