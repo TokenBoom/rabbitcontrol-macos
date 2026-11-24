@@ -1,0 +1,51 @@
+[package]
+name = "rc-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tauri v2 macOS 桌面应用：RabbitControl GUI 载体、Metal 窗口渲染与 LaunchDaemon/LaunchAgent 后台服务宿主。"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+rc-client-core = { workspace = true }
+rc-session = { workspace = true }
+rc-net = { workspace = true }
+rc-input = { workspace = true }
+rc-types = { workspace = true }
+rc-pipeline = { workspace = true }
+rc-capture = { workspace = true }
+rc-encode = { workspace = true }
+rc-render = { workspace = true }
+rc-decode = { workspace = true }
+rc-trace = { workspace = true }
+rc-audio = { workspace = true }
+rc-tools = { workspace = true }
+rc-platform-macos = { path = "../rc-platform-macos" }
+rand = "0.8"
+socket2 = { version = "0.6.5", features = ["all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+base64 = "0.22"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rc-capture-macos = { path = "../rc-capture-macos" }
+rc-render-macos = { path = "../rc-render-macos" }
+rc-input-macos = { path = "../rc-input-macos" }
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "CABase",
+    "CALayer",
+    "CAMetalLayer",
+    "objc2-core-foundation",
+] }
+
+[build-dependencies]
+tauri-build = "2"

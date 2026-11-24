@@ -1,0 +1,57 @@
+name: macOS CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  macos-client:
+    name: macOS Client (fmt + JS + clippy + test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-client
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check UI JS syntax, validation, and zero innerHTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in crates/rc-ui/ui/assets/js/*.js; do
+            node --check "$f"
+          done
+          node -e "
+            const v = require('./crates/rc-ui/ui/assets/js/validate.js');
+            if (v.validateTargetAddr('127.0.0.1') !== '') process.exit(1);
+            if (v.validateTargetAddr('127.0.0.1 bad') === '') process.exit(1);
+          "
+          if grep -nE '\.innerHTML|\.insertAdjacentHTML' crates/rc-ui/ui/assets/js/terminal.js; then
+            echo "terminal.js must not use .innerHTML" >&2
+            exit 1
+          fi
+          bash -n scripts/package-macos.sh
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace -- --test-threads=1

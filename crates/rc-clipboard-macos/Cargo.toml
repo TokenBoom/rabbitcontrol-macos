@@ -1,0 +1,24 @@
+[package]
+name = "rc-clipboard-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl macOS 系统剪贴板适配器：基于 CarbonCore Pasteboard C API 实现 `ClipboardBackend`。"
+
+[dependencies]
+rc-session = { workspace = true }
+rc-types = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[dev-dependencies]
+rc-capture = { workspace = true }
+rc-decode = { workspace = true }
+rc-encode = { workspace = true }
+rc-input = { workspace = true }
+rc-net = { workspace = true }
+rc-pipeline = { workspace = true }
+rc-proto = { workspace = true }
+rc-render = { workspace = true }
