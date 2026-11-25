@@ -31,8 +31,8 @@ use rc_ui::metal_attach::{self, StatusBarAction, StatusBarDisplay};
 use rc_ui::permissions::{self, PermissionSnapshot};
 use rc_ui::server_config::{self, ServerConfig, ServerConnectionState};
 use rc_ui::service_ipc::{
-    read_or_create_ipc_secret, AgentSnapshot, IpcClient, IpcServer, ServiceRequest,
-    ServiceResponse, ServiceSessionType,
+    current_exe_sha256, read_or_create_ipc_secret, AgentSnapshot, IpcClient, IpcServer,
+    ServiceRequest, ServiceResponse, ServiceSessionType,
 };
 #[cfg(target_os = "macos")]
 use rc_ui::service_manager;
@@ -1049,6 +1049,7 @@ fn main() {
         return;
     }
 
+    let binary_sha256 = current_exe_sha256();
     let session_type = detect_session_type();
     let secret_path = config_paths::ipc_secret_path();
     let ipc_secret = match read_or_create_ipc_secret(&secret_path) {
@@ -1081,6 +1082,7 @@ fn main() {
     let agent_ipc = Arc::clone(&agent);
     let stop_ipc = Arc::clone(&stop_flag);
     let secret_ipc = ipc_secret.clone();
+    let binary_sha_ipc = binary_sha256.clone();
     let mut ipc_server = match IpcServer::bind(
         config_paths::agent_socket_path(),
         ipc_secret.clone(),
@@ -1088,6 +1090,7 @@ fn main() {
             ServiceRequest::Ping => ServiceResponse::Pong {
                 pid: std::process::id(),
                 session_type,
+                binary_sha256: binary_sha_ipc.clone(),
             },
             ServiceRequest::GetSnapshot => {
                 let guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
@@ -1231,6 +1234,11 @@ fn main() {
             }
             ServiceRequest::QuitAll => {
                 perform_quit_all(&agent_ipc, &stop_ipc, &secret_ipc);
+                ServiceResponse::Ok
+            }
+            ServiceRequest::RestartForUpgrade => {
+                // 绝不写入 manual-stop：令主循环按 ByeReason::SessionSwitching 优雅退场，由 launchd 拉起新版。
+                stop_ipc.store(true, Ordering::Release);
                 ServiceResponse::Ok
             }
             ServiceRequest::EnsureAccessToken { .. } => ServiceResponse::Error {

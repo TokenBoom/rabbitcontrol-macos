@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config_paths::{ENV_CONFIG_DIR, ENV_DAEMON_MODE};
-use crate::service_ipc::ServiceSessionType;
+use crate::service_ipc::{compute_file_sha256, ServiceSessionType};
 
 /// LaunchDaemon 任务标签。
 pub const DAEMON_LABEL: &str = "com.rabbitcontrol.daemon";
@@ -70,6 +70,121 @@ pub fn escape_xml(raw: &str) -> String {
         }
     }
     out
+}
+
+/// 还原 XML 文本中的常见实体转义（单遍扫描，避免多重反转义与裸 `&` 误吞后续实体）。
+pub fn unescape_xml(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp_idx) = rest.find('&') {
+        out.push_str(&rest[..amp_idx]);
+        let after_amp = &rest[amp_idx..];
+        let matched = [
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+        ]
+        .into_iter()
+        .find_map(|(pat, ch)| after_amp.strip_prefix(pat).map(|tail| (ch, tail)));
+        if let Some((ch, tail)) = matched {
+            out.push(ch);
+            rest = tail;
+        } else {
+            out.push('&');
+            rest = &after_amp[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 从 launchd plist XML 中提取 `<key>ProgramArguments</key>` 首个 `<string>` 可执行文件路径。
+pub fn parse_plist_program_path(plist_xml: &str) -> Option<PathBuf> {
+    let key_pos = plist_xml.find("<key>ProgramArguments</key>")?;
+    let after_key = &plist_xml[key_pos + "<key>ProgramArguments</key>".len()..];
+    let array_start = after_key.find("<array>")?;
+    let after_array = &after_key[array_start + "<array>".len()..];
+    let array_end = after_array.find("</array>")?;
+    let array_body = &after_array[..array_end];
+    let str_start = array_body.find("<string>")?;
+    let after_str = &array_body[str_start + "<string>".len()..];
+    let str_end = after_str.find("</string>")?;
+    let unescaped = unescape_xml(&after_str[..str_end]);
+    let trimmed = unescaped.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// 判断运行中后台进程指纹与磁盘二进制 SHA-256 是否不一致（需触发升级重启）。
+pub fn needs_binary_upgrade(running_sha: Option<&str>, disk_sha: &str) -> bool {
+    if disk_sha.is_empty() {
+        return false;
+    }
+    running_sha != Some(disk_sha)
+}
+
+/// 判断已安装 plist 指向的二进制是否落在了当前 `.app` Bundle 之外的其它应用包路径。
+pub fn is_plist_pointing_to_other_bundle(plist_bin: &Path, current_bundle: Option<&Path>) -> bool {
+    let Some(bundle) = current_bundle else {
+        return false;
+    };
+    let bin_resolved = std::fs::canonicalize(plist_bin).unwrap_or_else(|_| plist_bin.to_path_buf());
+    let bundle_resolved = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    !bin_resolved.starts_with(&bundle_resolved)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeRestartOutcome {
+    UpToDate,
+    NotRunning,
+    RestartRequested { old_pid: u32 },
+    UnsupportedByLegacy { old_pid: u32 },
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn request_restart_if_outdated(
+    sock_path: &Path,
+    secret_path: &Path,
+    disk_sha: &str,
+) -> UpgradeRestartOutcome {
+    use crate::service_ipc::{IpcClient, ServiceRequest, ServiceResponse};
+    use std::time::Duration;
+
+    let Ok(ServiceResponse::Pong {
+        pid, binary_sha256, ..
+    }) = IpcClient::call(
+        sock_path,
+        secret_path,
+        ServiceRequest::Ping,
+        Duration::from_millis(350),
+    )
+    else {
+        return UpgradeRestartOutcome::NotRunning;
+    };
+
+    if !needs_binary_upgrade(binary_sha256.as_deref(), disk_sha) {
+        return UpgradeRestartOutcome::UpToDate;
+    }
+
+    match IpcClient::call(
+        sock_path,
+        secret_path,
+        ServiceRequest::RestartForUpgrade,
+        Duration::from_secs(2),
+    ) {
+        // 连接被服务端在退出瞬间提前关闭（Err）或明确收到 Ok，均按已触发重启处理；
+        // 只有服务端明确返回 Error（如旧版本不认识 RestartForUpgrade）才判定为旧版本不兼容。
+        Ok(ServiceResponse::Ok) | Err(_) => {
+            UpgradeRestartOutcome::RestartRequested { old_pid: pid }
+        }
+        Ok(_) => UpgradeRestartOutcome::UnsupportedByLegacy { old_pid: pid },
+    }
 }
 
 /// 为 POSIX Shell 参数生成单引号安全转义字面量。
@@ -326,15 +441,15 @@ mod macos_imp {
             && sys_dir.join(SERVICE_MANAGED_MARKER).is_file();
 
         let secret_path = config_paths::ipc_secret_path();
-        let daemon_running = matches!(
-            IpcClient::call(
-                &config_paths::daemon_socket_path(),
-                &secret_path,
-                ServiceRequest::Ping,
-                Duration::from_millis(350),
-            ),
-            Ok(ServiceResponse::Pong { .. })
-        );
+        let (daemon_running, daemon_sha) = match IpcClient::call(
+            &config_paths::daemon_socket_path(),
+            &secret_path,
+            ServiceRequest::Ping,
+            Duration::from_millis(350),
+        ) {
+            Ok(ServiceResponse::Pong { binary_sha256, .. }) => (true, binary_sha256),
+            _ => (false, None),
+        };
 
         let agent_pong = IpcClient::call(
             &config_paths::agent_socket_path(),
@@ -342,9 +457,13 @@ mod macos_imp {
             ServiceRequest::Ping,
             Duration::from_millis(350),
         );
-        let (agent_running, session_type) = match agent_pong {
-            Ok(ServiceResponse::Pong { session_type, .. }) => (true, Some(session_type)),
-            _ => (false, None),
+        let (agent_running, session_type, agent_sha) = match agent_pong {
+            Ok(ServiceResponse::Pong {
+                session_type,
+                binary_sha256,
+                ..
+            }) => (true, Some(session_type), binary_sha256),
+            _ => (false, None, None),
         };
 
         let bundle = locate_app_bundle();
@@ -359,6 +478,51 @@ mod macos_imp {
                 "已通过「整体退出」暂停系统后台服务；重新启动应用或关闭后再开启即可恢复"
                     .to_string(),
             )
+        } else if installed {
+            let current_bundle = std::env::current_exe()
+                .ok()
+                .and_then(|exe| locate_app_bundle_from_exe(&exe));
+            let daemon_plist_bin = std::fs::read_to_string(DAEMON_PLIST_PATH)
+                .ok()
+                .and_then(|xml| parse_plist_program_path(&xml));
+            let agent_plist_bin = std::fs::read_to_string(AGENT_PLIST_PATH)
+                .ok()
+                .and_then(|xml| parse_plist_program_path(&xml));
+
+            let other_bundle = current_bundle.as_deref().is_some_and(|cur| {
+                daemon_plist_bin
+                    .as_deref()
+                    .map_or(true, |b| is_plist_pointing_to_other_bundle(b, Some(cur)))
+                    || agent_plist_bin
+                        .as_deref()
+                        .map_or(true, |b| is_plist_pointing_to_other_bundle(b, Some(cur)))
+            });
+
+            if other_bundle {
+                Some(
+                    "系统后台服务当前指向其他路径的应用包，请点击「重新安装服务」以切换至当前应用"
+                        .to_string(),
+                )
+            } else {
+                let daemon_outdated = daemon_running
+                    && daemon_plist_bin
+                        .as_deref()
+                        .and_then(compute_file_sha256)
+                        .is_some_and(|disk| needs_binary_upgrade(daemon_sha.as_deref(), &disk));
+                let agent_outdated = agent_running
+                    && agent_plist_bin
+                        .as_deref()
+                        .and_then(compute_file_sha256)
+                        .is_some_and(|disk| needs_binary_upgrade(agent_sha.as_deref(), &disk));
+                if daemon_outdated || agent_outdated {
+                    Some(
+                        "检测到后台服务仍为旧版本进程，重启电脑或点击「重新安装服务」即可切换至最新版本"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
         } else {
             None
         };
@@ -526,11 +690,31 @@ mod macos_imp {
         let _ = std::fs::remove_dir_all(&stage_dir);
         res?;
 
-        // 等待 agent.sock 就绪（最多 ~3s），确保安装完前端立即看到在线状态。
+        // 轻量等待 daemon.sock 与 agent.sock 均就绪（最多 ~3s），避免轮询期间重复哈希大二进制。
+        let secret_path = config_paths::ipc_secret_path();
+        let daemon_sock = config_paths::daemon_socket_path();
+        let agent_sock = config_paths::agent_socket_path();
         for _ in 0..30 {
-            let status = query_service_status();
-            if status.daemon_running && status.agent_running {
-                return Ok(status);
+            let daemon_ok = matches!(
+                IpcClient::call(
+                    &daemon_sock,
+                    &secret_path,
+                    ServiceRequest::Ping,
+                    Duration::from_millis(200),
+                ),
+                Ok(ServiceResponse::Pong { .. })
+            );
+            let agent_ok = matches!(
+                IpcClient::call(
+                    &agent_sock,
+                    &secret_path,
+                    ServiceRequest::Ping,
+                    Duration::from_millis(200),
+                ),
+                Ok(ServiceResponse::Pong { .. })
+            );
+            if daemon_ok && agent_ok {
+                break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -630,22 +814,158 @@ mod macos_imp {
         Ok(query_service_status())
     }
 
-    /// 清除「整体退出」标记并唤醒被控后台服务（无需管理员密码）。
+    fn current_console_uid() -> Option<String> {
+        let out = Command::new("id").arg("-u").output().ok()?;
+        let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if uid.is_empty() {
+            None
+        } else {
+            Some(uid)
+        }
+    }
+
+    fn kickstart_agent(uid: &str, kill_existing: bool) {
+        let target = format!("gui/{uid}/{AGENT_LABEL}");
+        let args: &[&str] = if kill_existing {
+            &["kickstart", "-k", "-p", &target]
+        } else {
+            &["kickstart", "-p", &target]
+        };
+        let _ = Command::new("launchctl").args(args).output();
+    }
+
+    fn wait_for_service_ready(
+        sock_path: &Path,
+        secret_path: &Path,
+        old_pid: u32,
+        disk_sha: &str,
+        max_wait: Duration,
+        kick_agent_after: Option<(Duration, &str)>,
+    ) {
+        let start = std::time::Instant::now();
+        let mut gone_since: Option<std::time::Instant> = None;
+        let mut kicked = false;
+        while start.elapsed() < max_wait {
+            match IpcClient::call(
+                sock_path,
+                secret_path,
+                ServiceRequest::Ping,
+                Duration::from_millis(250),
+            ) {
+                Ok(ServiceResponse::Pong {
+                    pid, binary_sha256, ..
+                }) => {
+                    if pid != old_pid || binary_sha256.as_deref() == Some(disk_sha) {
+                        return;
+                    }
+                    // 旧进程仍在优雅退场中，清空下线计时避免在旧进程活着时提前空耗 kickstart -p。
+                    gone_since = None;
+                }
+                _ => {
+                    let since = *gone_since.get_or_insert_with(std::time::Instant::now);
+                    if !kicked {
+                        if let Some((after, uid)) = kick_agent_after {
+                            if since.elapsed() >= after {
+                                kickstart_agent(uid, false);
+                                kicked = true;
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(125));
+        }
+    }
+
+    /// 清除「整体退出」标记、按磁盘二进制指纹自动热切换新版后台并唤醒服务（无需管理员密码）。
     pub fn wake_services_on_launch() {
         let stop_path = config_paths::manual_stop_path();
-        let had_manual_stop = stop_path.exists();
-        if had_manual_stop {
+        if stop_path.exists() {
             let _ = std::fs::remove_file(&stop_path);
         }
-        // launchd PathState 在路径删除时会自动触发；顺带 kickstart gui agent 以消除延迟。
-        let status = query_service_status();
-        if status.installed && !status.agent_running {
-            if let Ok(out) = Command::new("id").arg("-u").output() {
-                let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !uid.is_empty() {
-                    let _ = Command::new("launchctl")
-                        .args(["kickstart", "-p", &format!("gui/{uid}/{AGENT_LABEL}")])
-                        .output();
+
+        let sys_dir = PathBuf::from(MACOS_SYSTEM_CONFIG_DIR);
+        let installed = Path::new(DAEMON_PLIST_PATH).is_file()
+            && Path::new(AGENT_PLIST_PATH).is_file()
+            && sys_dir.join(SERVICE_MANAGED_MARKER).is_file();
+        if !installed {
+            return;
+        }
+
+        let secret_path = config_paths::ipc_secret_path();
+        let daemon_sock = config_paths::daemon_socket_path();
+        let agent_sock = config_paths::agent_socket_path();
+
+        // 1) 先检查 rc-daemon：与 plist 指向的磁盘二进制对比，不一致则优雅退出由 launchd 拉起新版。
+        if let Some(disk_sha) = std::fs::read_to_string(DAEMON_PLIST_PATH)
+            .ok()
+            .and_then(|xml| parse_plist_program_path(&xml))
+            .and_then(|bin| compute_file_sha256(&bin))
+        {
+            match request_restart_if_outdated(&daemon_sock, &secret_path, &disk_sha) {
+                UpgradeRestartOutcome::RestartRequested { old_pid } => {
+                    wait_for_service_ready(
+                        &daemon_sock,
+                        &secret_path,
+                        old_pid,
+                        &disk_sha,
+                        Duration::from_millis(1_500),
+                        None,
+                    );
+                }
+                UpgradeRestartOutcome::UnsupportedByLegacy { old_pid } => {
+                    eprintln!(
+                        "[rc-ui] 后台 rc-daemon (pid={old_pid}) 为旧版本且不支持自动热重启，请在设置页重新安装或重启系统"
+                    );
+                }
+                UpgradeRestartOutcome::UpToDate | UpgradeRestartOutcome::NotRunning => {}
+            }
+        }
+
+        // 2) 再检查 rc-host-agent：不一致则优雅重启（或对旧版 agent 免密 kickstart -k），未运行则 kickstart -p。
+        let uid = current_console_uid();
+        if let Some(disk_sha) = std::fs::read_to_string(AGENT_PLIST_PATH)
+            .ok()
+            .and_then(|xml| parse_plist_program_path(&xml))
+            .and_then(|bin| compute_file_sha256(&bin))
+        {
+            match request_restart_if_outdated(&agent_sock, &secret_path, &disk_sha) {
+                UpgradeRestartOutcome::RestartRequested { old_pid } => {
+                    let kick_opt = uid.as_deref().map(|u| (Duration::from_millis(400), u));
+                    wait_for_service_ready(
+                        &agent_sock,
+                        &secret_path,
+                        old_pid,
+                        &disk_sha,
+                        Duration::from_millis(2_500),
+                        kick_opt,
+                    );
+                }
+                UpgradeRestartOutcome::UnsupportedByLegacy { old_pid } => {
+                    if let Some(u) = uid.as_deref() {
+                        kickstart_agent(u, true);
+                        wait_for_service_ready(
+                            &agent_sock,
+                            &secret_path,
+                            old_pid,
+                            &disk_sha,
+                            Duration::from_millis(2_500),
+                            None,
+                        );
+                    }
+                }
+                UpgradeRestartOutcome::NotRunning => {
+                    if let Some(u) = uid.as_deref() {
+                        kickstart_agent(u, false);
+                    }
+                }
+                UpgradeRestartOutcome::UpToDate => {}
+            }
+        } else {
+            let status = query_service_status();
+            if status.installed && !status.agent_running {
+                if let Some(u) = uid.as_deref() {
+                    kickstart_agent(u, false);
                 }
             }
         }
@@ -747,6 +1067,188 @@ mod tests {
         std::fs::write(macos.join("rc-daemon"), b"d").unwrap();
         std::fs::write(macos.join("rc-host-agent"), b"a").unwrap();
         assert_eq!(locate_app_bundle_from_exe(&gui_exe), Some(root.clone()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_plist_program_path_with_xml_escaping_and_rejects_invalid() {
+        let daemon_bin =
+            Path::new("/Applications/RabbitControl & Dev.app/Contents/MacOS/rc-daemon");
+        let stop_path = Path::new("/Library/Application Support/RabbitControl/run/manual-stop");
+        let log_dir = Path::new("/Library/Application Support/RabbitControl/logs");
+        let cfg_dir = Path::new("/Library/Application Support/RabbitControl");
+
+        let plist = render_daemon_plist(daemon_bin, stop_path, log_dir, cfg_dir);
+        assert_eq!(
+            parse_plist_program_path(&plist),
+            Some(daemon_bin.to_path_buf())
+        );
+
+        assert_eq!(unescape_xml("a&amp;lt;b"), "a&lt;b");
+        assert_eq!(unescape_xml("a & b &amp; c"), "a & b & c");
+        assert!(parse_plist_program_path("<dict></dict>").is_none());
+        assert!(parse_plist_program_path(
+            "<key>ProgramArguments</key><array><string>   </string></array>"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn needs_binary_upgrade_and_bundle_mismatch_checks() {
+        assert!(!needs_binary_upgrade(Some("abc"), ""));
+        assert!(needs_binary_upgrade(None, "abc"));
+        assert!(needs_binary_upgrade(Some("old"), "new"));
+        assert!(!needs_binary_upgrade(Some("same"), "same"));
+
+        let cur_bundle = Path::new("/Applications/RabbitControl.app");
+        let inside = Path::new("/Applications/RabbitControl.app/Contents/MacOS/rc-daemon");
+        let sibling_prefix =
+            Path::new("/Applications/RabbitControl.app.bak/Contents/MacOS/rc-daemon");
+        let outside = Path::new("/Users/tester/Desktop/RabbitControl.app/Contents/MacOS/rc-daemon");
+        assert!(!is_plist_pointing_to_other_bundle(inside, Some(cur_bundle)));
+        assert!(is_plist_pointing_to_other_bundle(
+            sibling_prefix,
+            Some(cur_bundle)
+        ));
+        assert!(is_plist_pointing_to_other_bundle(outside, Some(cur_bundle)));
+        assert!(!is_plist_pointing_to_other_bundle(outside, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_restart_if_outdated_handles_match_mismatch_and_legacy_error() {
+        use crate::service_ipc::{
+            encode_hex_lower, read_or_create_ipc_secret, IpcServer, ServiceRequest, ServiceResponse,
+        };
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let mut b = [0u8; 8];
+        OsRng.fill_bytes(&mut b);
+        let root = std::env::temp_dir().join(format!("rc-ui-upgrade-mgr-{}", encode_hex_lower(&b)));
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("run/agent.sock");
+        let secret_path = root.join("run/ipc.secret");
+        let manual_stop = root.join("run/manual-stop");
+        let secret = read_or_create_ipc_secret(&secret_path).unwrap();
+
+        // 1) 未启动时返回 NotRunning
+        assert_eq!(
+            request_restart_if_outdated(&sock, &secret_path, "sha_new"),
+            UpgradeRestartOutcome::NotRunning
+        );
+
+        // 2) 指纹一致时返回 UpToDate 且不触发重启
+        let restarted = Arc::new(AtomicBool::new(false));
+        let restarted_flag = Arc::clone(&restarted);
+        let mut srv_ok = IpcServer::bind(sock.clone(), secret.clone(), move |req| match req {
+            ServiceRequest::Ping => ServiceResponse::Pong {
+                pid: 101,
+                session_type: ServiceSessionType::Aqua,
+                binary_sha256: Some("sha_new".to_string()),
+            },
+            ServiceRequest::RestartForUpgrade => {
+                restarted_flag.store(true, Ordering::Release);
+                ServiceResponse::Ok
+            }
+            _ => ServiceResponse::Error {
+                message: "unexpected".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            request_restart_if_outdated(&sock, &secret_path, "sha_new"),
+            UpgradeRestartOutcome::UpToDate
+        );
+        assert!(!restarted.load(Ordering::Acquire));
+        srv_ok.stop();
+
+        // 3) 指纹不一致时发送 RestartForUpgrade 且绝不创建 manual-stop
+        let restarted2 = Arc::new(AtomicBool::new(false));
+        let restarted2_flag = Arc::clone(&restarted2);
+        let mut srv_outdated =
+            IpcServer::bind(sock.clone(), secret.clone(), move |req| match req {
+                ServiceRequest::Ping => ServiceResponse::Pong {
+                    pid: 202,
+                    session_type: ServiceSessionType::Aqua,
+                    binary_sha256: Some("sha_old".to_string()),
+                },
+                ServiceRequest::RestartForUpgrade => {
+                    restarted2_flag.store(true, Ordering::Release);
+                    ServiceResponse::Ok
+                }
+                _ => ServiceResponse::Error {
+                    message: "unexpected".to_string(),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            request_restart_if_outdated(&sock, &secret_path, "sha_new"),
+            UpgradeRestartOutcome::RestartRequested { old_pid: 202 }
+        );
+        assert!(restarted2.load(Ordering::Acquire));
+        assert!(!manual_stop.exists());
+        srv_outdated.stop();
+
+        // 4) 旧版本后台（binary_sha256: None 且拒绝 RestartForUpgrade）返回 UnsupportedByLegacy
+        let mut srv_legacy = IpcServer::bind(sock.clone(), secret, move |req| match req {
+            ServiceRequest::Ping => ServiceResponse::Pong {
+                pid: 303,
+                session_type: ServiceSessionType::Aqua,
+                binary_sha256: None,
+            },
+            ServiceRequest::RestartForUpgrade => ServiceResponse::Error {
+                message: "unknown op".to_string(),
+            },
+            _ => ServiceResponse::Ok,
+        })
+        .unwrap();
+        assert_eq!(
+            request_restart_if_outdated(&sock, &secret_path, "sha_new"),
+            UpgradeRestartOutcome::UnsupportedByLegacy { old_pid: 303 }
+        );
+        srv_legacy.stop();
+
+        // 5) 服务端收到 RestartForUpgrade 后在写回 Ok 前提前断连（EOF / Err(_)），仍应视为 RestartRequested
+        {
+            use crate::service_ipc::ServiceResponse;
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixListener;
+
+            let listener = UnixListener::bind(&sock).unwrap();
+            let eof_jh = std::thread::spawn(move || {
+                // 连接 1：Ping -> 返回旧 SHA-256 的 Pong
+                let (mut s1, _) = listener.accept().unwrap();
+                let mut r1 = BufReader::new(s1.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = r1.read_line(&mut line);
+                let mut pong = serde_json::to_vec(&ServiceResponse::Pong {
+                    pid: 404,
+                    session_type: ServiceSessionType::Aqua,
+                    binary_sha256: Some("sha_old".to_string()),
+                })
+                .unwrap();
+                pong.push(b'\n');
+                s1.write_all(&pong).unwrap();
+                s1.flush().unwrap();
+                drop(s1);
+
+                // 连接 2：RestartForUpgrade -> 读取请求后直接断开不写回，模拟进程退出竞态 EOF
+                let (s2, _) = listener.accept().unwrap();
+                let mut r2 = BufReader::new(s2);
+                line.clear();
+                let _ = r2.read_line(&mut line);
+            });
+
+            assert_eq!(
+                request_restart_if_outdated(&sock, &secret_path, "sha_new"),
+                UpgradeRestartOutcome::RestartRequested { old_pid: 404 }
+            );
+            eof_jh.join().unwrap();
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

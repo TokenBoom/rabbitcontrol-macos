@@ -116,6 +116,8 @@ pub enum ServiceRequest {
     GetServerStatus,
     /// 执行「整体退出」：写 `manual-stop` 标记并优雅关闭 agent 与 daemon。
     QuitAll,
+    /// 检测到磁盘二进制已更新时请求平滑重启：不写 `manual-stop` 优雅退出，由 `launchd` 拉起新版。
+    RestartForUpgrade,
     /// 请求后台立刻重新检查系统权限快照。
     TriggerPermissionCheck,
 }
@@ -132,6 +134,9 @@ pub enum ServiceResponse {
         pid: u32,
         /// 服务端当前会话类型。
         session_type: ServiceSessionType,
+        /// 服务端进程启动时自身可执行文件的 SHA-256 十六进制指纹（旧版本后台缺省为 `None`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary_sha256: Option<String>,
     },
     /// 状态快照应答。
     Snapshot(Box<AgentSnapshot>),
@@ -191,6 +196,32 @@ pub(crate) fn encode_hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0F) as usize] as char);
     }
     out
+}
+
+/// 流式计算指定路径文件的 SHA-256（64 位小写十六进制）；文件不存在或不可读时返回 `None`。
+pub fn compute_file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Read};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(encode_hex_lower(&hasher.finalize()))
+}
+
+/// 计算当前进程可执行文件在启动时的 SHA-256 指纹；无法定位或读取时返回 `None`。
+pub fn current_exe_sha256() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| compute_file_sha256(&p))
 }
 
 /// 读取现有 IPC 共享密钥，或以安全随机源生成新密钥并写入 `path`。
@@ -332,6 +363,7 @@ mod imp {
         socket_path: PathBuf,
         sock_id: Option<(u64, u64)>,
         stop: Arc<AtomicBool>,
+        inflight: Arc<AtomicUsize>,
         join: Option<JoinHandle<()>>,
     }
 
@@ -368,6 +400,7 @@ mod imp {
             let handler = Arc::new(handler);
             let secret = Arc::new(secret);
             let inflight = Arc::new(AtomicUsize::new(0));
+            let inflight_bg = Arc::clone(&inflight);
             let sock_clone = socket_path.clone();
 
             let join = thread::Builder::new()
@@ -383,12 +416,12 @@ mod imp {
                         match listener.accept() {
                             Ok((mut stream, _addr)) => {
                                 let reserved = {
-                                    let mut cur = inflight.load(Ordering::Acquire);
+                                    let mut cur = inflight_bg.load(Ordering::Acquire);
                                     loop {
                                         if cur >= MAX_INFLIGHT_IPC {
                                             break false;
                                         }
-                                        match inflight.compare_exchange_weak(
+                                        match inflight_bg.compare_exchange_weak(
                                             cur,
                                             cur + 1,
                                             Ordering::AcqRel,
@@ -410,7 +443,7 @@ mod imp {
                                     }
                                     continue;
                                 }
-                                let guard = InflightGuard(Arc::clone(&inflight));
+                                let guard = InflightGuard(Arc::clone(&inflight_bg));
                                 let sec = Arc::clone(&secret);
                                 let h = Arc::clone(&handler);
                                 if let Err(_e) = thread::Builder::new()
@@ -438,11 +471,12 @@ mod imp {
                 socket_path,
                 sock_id,
                 stop,
+                inflight,
                 join: Some(join),
             })
         }
 
-        /// 主动停止监听线程并清理 socket 文件（仅当 inode 仍属于本实例时才删除，防误删新会话重建的 socket）。
+        /// 主动停止监听线程、短暂等待在途响应写回并清理 socket 文件（仅当 inode 仍属于本实例时才删除）。
         pub fn stop(&mut self) {
             self.stop.store(true, Ordering::Release);
             if let Some(handle) = self.join.take() {
@@ -456,6 +490,11 @@ mod imp {
                 if matches {
                     let _ = std::fs::remove_file(&self.socket_path);
                 }
+            }
+            let deadline = std::time::Instant::now() + Duration::from_millis(150);
+            while self.inflight.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
             }
         }
     }
@@ -650,6 +689,7 @@ mod tests {
             ServiceRequest::Ping => ServiceResponse::Pong {
                 pid: 42,
                 session_type: ServiceSessionType::Aqua,
+                binary_sha256: Some("abcd".repeat(16)),
             },
             ServiceRequest::SetRemoteAssist { enabled } => {
                 ServiceResponse::Snapshot(Box::new(AgentSnapshot {
@@ -684,7 +724,8 @@ mod tests {
             resp,
             ServiceResponse::Pong {
                 pid: 42,
-                session_type: ServiceSessionType::Aqua
+                session_type: ServiceSessionType::Aqua,
+                binary_sha256: Some("abcd".repeat(16)),
             }
         );
 
@@ -755,6 +796,7 @@ mod tests {
             ServiceResponse::Pong {
                 pid: 99,
                 session_type: ServiceSessionType::Aqua,
+                binary_sha256: None,
             }
         })
         .unwrap();
@@ -777,6 +819,7 @@ mod tests {
             ServiceResponse::Pong {
                 pid: 99,
                 session_type: ServiceSessionType::Aqua,
+                binary_sha256: None,
             }
         );
 
@@ -789,6 +832,146 @@ mod tests {
         let repaired = read_or_create_ipc_secret(&corrupt_path).unwrap();
         assert!(repaired.len() >= 32 && repaired.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(read_ipc_secret(&corrupt_path).unwrap(), repaired);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compute_file_sha256_matches_known_vector_and_handles_missing_file() {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+
+        let mut b = [0u8; 8];
+        OsRng.fill_bytes(&mut b);
+        let root = std::env::temp_dir().join(format!("rc-ui-sha256-test-{}", encode_hex_lower(&b)));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let missing = root.join("nonexistent.bin");
+        assert!(compute_file_sha256(&missing).is_none());
+
+        let sample = root.join("abc.bin");
+        std::fs::write(&sample, b"abc").unwrap();
+        assert_eq!(
+            compute_file_sha256(&sample).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pong_legacy_json_compat_and_restart_for_upgrade_roundtrip() {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // 1) 无 binary_sha256 字段的旧版本 Pong JSON 必须能兼容反序列化为 None。
+        let legacy_json = r#"{"kind":"pong","pid":123,"session_type":"aqua"}"#;
+        let parsed: ServiceResponse = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            parsed,
+            ServiceResponse::Pong {
+                pid: 123,
+                session_type: ServiceSessionType::Aqua,
+                binary_sha256: None,
+            }
+        );
+
+        // 2) RestartForUpgrade 经 IpcServer/IpcClient 正常往返，且由服务端标记升级退出。
+        let mut b = [0u8; 8];
+        OsRng.fill_bytes(&mut b);
+        let root = std::env::temp_dir().join(format!("rc-ui-ipc-upgrade-{}", encode_hex_lower(&b)));
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("run/agent.sock");
+        let secret_path = root.join("run/ipc.secret");
+        let secret = read_or_create_ipc_secret(&secret_path).unwrap();
+
+        let restart_called = Arc::new(AtomicBool::new(false));
+        let restart_flag = Arc::clone(&restart_called);
+        let mut server = IpcServer::bind(sock.clone(), secret, move |req| match req {
+            ServiceRequest::RestartForUpgrade => {
+                restart_flag.store(true, Ordering::Release);
+                ServiceResponse::Ok
+            }
+            _ => ServiceResponse::Error {
+                message: "unexpected".to_string(),
+            },
+        })
+        .unwrap();
+
+        let resp = IpcClient::call(
+            &sock,
+            &secret_path,
+            ServiceRequest::RestartForUpgrade,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(resp, ServiceResponse::Ok);
+        assert!(restart_called.load(Ordering::Acquire));
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_server_stop_drains_inflight_response_before_returning() {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut b = [0u8; 8];
+        OsRng.fill_bytes(&mut b);
+        let root = std::env::temp_dir().join(format!("rc-ui-ipc-drain-{}", encode_hex_lower(&b)));
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("run/agent.sock");
+        let secret_path = root.join("run/ipc.secret");
+        let secret = read_or_create_ipc_secret(&secret_path).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let handler_finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&handler_finished);
+        let mut server = IpcServer::bind(sock.clone(), secret, move |req| match req {
+            ServiceRequest::RestartForUpgrade => {
+                let _ = entered_tx.send(());
+                std::thread::sleep(Duration::from_millis(40));
+                finished_flag.store(true, Ordering::Release);
+                ServiceResponse::Ok
+            }
+            _ => ServiceResponse::Error {
+                message: "unexpected".to_string(),
+            },
+        })
+        .unwrap();
+
+        let sock_c = sock.clone();
+        let sec_c = secret_path.clone();
+        let client_jh = std::thread::spawn(move || {
+            IpcClient::call(
+                &sock_c,
+                &sec_c,
+                ServiceRequest::RestartForUpgrade,
+                Duration::from_secs(2),
+            )
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker must enter handler");
+        server.stop();
+        assert!(
+            handler_finished.load(Ordering::Acquire),
+            "stop() 必须在等待在途 worker 完成处理并释放 InflightGuard 后才返回"
+        );
+        let resp = client_jh
+            .join()
+            .unwrap()
+            .expect("client must receive complete response before stop returns");
+        assert_eq!(resp, ServiceResponse::Ok);
 
         let _ = std::fs::remove_dir_all(&root);
     }

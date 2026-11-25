@@ -21,8 +21,8 @@ use rc_ui::config_paths;
 use rc_ui::metal_attach;
 use rc_ui::server_config;
 use rc_ui::service_ipc::{
-    read_or_create_ipc_secret, IpcClient, IpcServer, ServiceRequest, ServiceResponse,
-    ServiceSessionType,
+    current_exe_sha256, read_or_create_ipc_secret, IpcClient, IpcServer, ServiceRequest,
+    ServiceResponse, ServiceSessionType,
 };
 
 fn current_os_boot_id() -> Option<String> {
@@ -183,6 +183,7 @@ fn main() {
         return;
     }
 
+    let binary_sha256 = current_exe_sha256();
     let secret_path = config_paths::ipc_secret_path();
     let ipc_secret = match read_or_create_ipc_secret(&secret_path) {
         Ok(s) => s,
@@ -219,6 +220,7 @@ fn main() {
     rt.restart_maintainer();
 
     let rt_ipc = Arc::clone(&rt);
+    let binary_sha_ipc = binary_sha256.clone();
     let mut ipc_server = match IpcServer::bind(
         config_paths::daemon_socket_path(),
         ipc_secret,
@@ -226,6 +228,7 @@ fn main() {
             ServiceRequest::Ping => ServiceResponse::Pong {
                 pid: std::process::id(),
                 session_type: ServiceSessionType::Standalone,
+                binary_sha256: binary_sha_ipc.clone(),
             },
             ServiceRequest::RefreshAuthAndCerts => {
                 let _sync = rt_ipc
@@ -293,6 +296,11 @@ fn main() {
                     &config_paths::manual_stop_path(),
                     b"manual-stop\n",
                 );
+                rt_ipc.stop_flag.store(true, Ordering::Release);
+                ServiceResponse::Ok
+            }
+            ServiceRequest::RestartForUpgrade => {
+                // 绝不写入 manual-stop：保持 KeepAlive.PathState 满足条件，由 launchd 自动拉起新版二进制。
                 rt_ipc.stop_flag.store(true, Ordering::Release);
                 ServiceResponse::Ok
             }
