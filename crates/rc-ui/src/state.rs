@@ -791,6 +791,8 @@ pub struct AppState {
     /// 会话打开代次计数器（H9：`open_session` 与 `disconnect_active_session` 递增，
     /// 使在途 `request_connect` 在被更新请求或关窗取消后自动作废）。
     pub session_open_epoch: AtomicU64,
+    /// 记录最近一次由 `close_session_window` 主动关闭的代次，避免异步 `WindowEvent::Destroyed` 二次递增 `session_open_epoch` 或误杀新会话窗。
+    pub programmatic_close_epoch: AtomicU64,
     /// 本机被控端运行时状态（一体化 All-in-One 模式）。
     pub host: Mutex<HostRuntime>,
     /// 局域网多播发现后台线程句柄。
@@ -898,6 +900,7 @@ impl AppState {
             session: Mutex::new(None),
             last_session_update: Mutex::new(None),
             session_open_epoch: AtomicU64::new(0),
+            programmatic_close_epoch: AtomicU64::new(0),
             host: Mutex::new(host_rt),
             lan: Mutex::new(None),
             server: Mutex::new(ServerRuntime::new(initial_server_cfg)),

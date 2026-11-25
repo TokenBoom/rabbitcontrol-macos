@@ -325,6 +325,7 @@
 
     if (IS_TAURI) {
       state.myDevices.forEach(function (d) {
+        if (d.isLocal) return;
         var row = buildSidebarRow({
           key: "device:" + d.id,
           dot: d.online ? "online" : "offline",
@@ -452,7 +453,7 @@
   function inSidebar(id) {
     if (IS_TAURI) {
       for (var m = 0; m < state.myDevices.length; m++) {
-        if (state.myDevices[m].id === id) return true;
+        if (state.myDevices[m].id === id && !state.myDevices[m].isLocal) return true;
       }
       return false;
     }
@@ -719,8 +720,7 @@
         }
         connectToTarget(device.deviceId, {
           watchOnly: Boolean(watchOnly),
-          promptPassword: true,
-          placeholder: "请输入设备验证码（已开启免密自控可直接留空）",
+          promptPassword: false,
           displayName: device.name
         });
         return;
@@ -927,6 +927,19 @@
     return digits;
   }
 
+  function findMyDeviceById(deviceId) {
+    if (!deviceId || !Array.isArray(state.myDevices)) return null;
+    var norm = String(deviceId).replace(/[\s-]+/g, "");
+    for (var i = 0; i < state.myDevices.length; i++) {
+      var d = state.myDevices[i];
+      var did = d && (d.deviceId || d.id);
+      if (did && String(did).replace(/[\s-]+/g, "") === norm) {
+        return d;
+      }
+    }
+    return null;
+  }
+
   function formatDeviceId(raw) {
     var digits = String(raw || "").replace(/[\s-]+/g, "");
     if (/^\d{9}$/.test(digits)) {
@@ -1127,6 +1140,19 @@
         pendingToolAfterConnect = null;
         toast("请先在「设置 → 网络」配置并连接服务器");
         return;
+      }
+      var ownDev = findMyDeviceById(deviceId);
+      if (ownDev) {
+        if (ownDev.isLocal) {
+          pendingToolAfterConnect = null;
+          toast("当前为本机设备，请选择其他在线设备连接");
+          return;
+        }
+        options = {
+          watchOnly: options.watchOnly,
+          promptPassword: false,
+          displayName: options.displayName || ownDev.name
+        };
       }
       promptAndLaunchSession(deviceId, formatDeviceId(deviceId), "目标设备码", options);
       return;
@@ -1615,7 +1641,7 @@
     state.myDevices = rawList.map(normalizeMyDevice);
     if (IS_TAURI) {
       var curExists = state.myDevices.some(function (d) {
-        return d.id === state.deviceId;
+        return d.id === state.deviceId && !d.isLocal;
       });
       if (!curExists) {
         var preferred = null;
@@ -1625,8 +1651,13 @@
             break;
           }
         }
-        if (!preferred && state.myDevices.length > 0) {
-          preferred = state.myDevices[0];
+        if (!preferred) {
+          for (var j = 0; j < state.myDevices.length; j++) {
+            if (!state.myDevices[j].isLocal) {
+              preferred = state.myDevices[j];
+              break;
+            }
+          }
         }
         if (preferred) {
           state.deviceId = preferred.id;
@@ -1635,6 +1666,9 @@
           }
         } else {
           state.deviceId = null;
+          if (state.route === "p1") {
+            go("p3", "all");
+          }
         }
       }
     }
@@ -2749,8 +2783,26 @@
     function invalidateProbe() {
       gateLastProbe = null;
       if (gateProbeResult) gateProbeResult.hidden = true;
-      if (gateConfirmServerBtn) gateConfirmServerBtn.disabled = true;
       setGateError(gateServerError, "");
+    }
+
+    function renderGateProbeResult(res) {
+      gateLastProbe = res;
+      if (gateProbeResult) gateProbeResult.hidden = false;
+      if (gateProbeBadge) gateProbeBadge.textContent = res.status === "ok" ? "连接正常" : res.status;
+      if (gateProbeMeta) {
+        gateProbeMeta.textContent =
+          (res.version ? "v" + res.version + " · " : "") + res.latencyMs + " ms";
+      }
+      if (gateCaFingerprint) {
+        gateCaFingerprint.textContent =
+          res.caFingerprintSha256 || res.tlsLeafFingerprintSha256 || "未启用 TLS（明文 HTTP）";
+      }
+      if (gateProbeReg) {
+        gateProbeReg.textContent = res.allowRegistration
+          ? "注册策略：开放自助注册"
+          : "注册策略：管理员已关闭自助注册";
+      }
     }
 
     [gateServerHost, gateApiPort, gateSignalPort, gateRelayPort, gateUseHttps].forEach(function (inp) {
@@ -2807,23 +2859,7 @@
           save: false
         })
           .then(function (res) {
-            gateLastProbe = res;
-            if (gateProbeResult) gateProbeResult.hidden = false;
-            if (gateProbeBadge) gateProbeBadge.textContent = res.status === "ok" ? "连接正常" : res.status;
-            if (gateProbeMeta) {
-              gateProbeMeta.textContent =
-                (res.version ? "v" + res.version + " · " : "") + res.latencyMs + " ms";
-            }
-            if (gateCaFingerprint) {
-              gateCaFingerprint.textContent =
-                res.caFingerprintSha256 || res.tlsLeafFingerprintSha256 || "未启用 TLS（明文 HTTP）";
-            }
-            if (gateProbeReg) {
-              gateProbeReg.textContent = res.allowRegistration
-                ? "注册策略：开放自助注册"
-                : "注册策略：管理员已关闭自助注册";
-            }
-            if (gateConfirmServerBtn) gateConfirmServerBtn.disabled = false;
+            renderGateProbeResult(res);
           })
           .catch(function (err) {
             invalidateProbe();
@@ -2842,19 +2878,45 @@
         if (!form) return;
         setGateError(gateServerError, "");
         gateConfirmServerBtn.disabled = true;
-        gateConfirmServerBtn.textContent = "保存中…";
-        Bridge.probeAndSaveServer({
-          serverHost: form.serverHost,
-          apiPort: form.apiPort,
-          signalPort: form.signalPort,
-          relayPort: form.relayPort,
-          useHttps: form.useHttps,
-          expectedCaFingerprintSha256:
-            gateLastProbe && gateLastProbe.caFingerprintSha256
-              ? gateLastProbe.caFingerprintSha256
-              : null,
-          save: true
-        })
+        if (gateProbeBtn) gateProbeBtn.disabled = true;
+
+        var savePromise;
+        if (gateLastProbe) {
+          gateConfirmServerBtn.textContent = "保存中…";
+          savePromise = Bridge.probeAndSaveServer({
+            serverHost: form.serverHost,
+            apiPort: form.apiPort,
+            signalPort: form.signalPort,
+            relayPort: form.relayPort,
+            useHttps: form.useHttps,
+            expectedCaFingerprintSha256: gateLastProbe.caFingerprintSha256 || null,
+            save: true
+          });
+        } else {
+          gateConfirmServerBtn.textContent = "检测并保存中…";
+          savePromise = Bridge.probeAndSaveServer({
+            serverHost: form.serverHost,
+            apiPort: form.apiPort,
+            signalPort: form.signalPort,
+            relayPort: form.relayPort,
+            useHttps: form.useHttps,
+            save: false
+          }).then(function (probe) {
+            renderGateProbeResult(probe);
+            gateConfirmServerBtn.textContent = "保存中…";
+            return Bridge.probeAndSaveServer({
+              serverHost: form.serverHost,
+              apiPort: form.apiPort,
+              signalPort: form.signalPort,
+              relayPort: form.relayPort,
+              useHttps: form.useHttps,
+              expectedCaFingerprintSha256: probe && probe.caFingerprintSha256 ? probe.caFingerprintSha256 : null,
+              save: true
+            });
+          });
+        }
+
+        savePromise
           .then(function (res) {
             gateServerViewOverride = false;
             if (res && res.gateStatus) {
@@ -2864,11 +2926,13 @@
             }
           })
           .catch(function (err) {
-            setGateError(gateServerError, String(err || "保存服务器配置失败"));
-            gateConfirmServerBtn.disabled = false;
+            invalidateProbe();
+            setGateError(gateServerError, String(err || "连接或保存服务器失败"));
           })
           .then(function () {
+            gateConfirmServerBtn.disabled = false;
             gateConfirmServerBtn.textContent = "确认并进入登录";
+            if (gateProbeBtn) gateProbeBtn.disabled = false;
           });
       });
     }

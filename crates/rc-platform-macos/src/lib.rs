@@ -80,18 +80,30 @@ impl PlatformMediaProvider for MacosMediaProvider {
         }
     }
 
-    fn create_decoder(&self, _cfg: &PipelineConfig) -> Result<(Box<dyn Decoder>, &'static str)> {
+    fn create_decoder(&self, cfg: &PipelineConfig) -> Result<(Box<dyn Decoder>, &'static str)> {
         #[cfg(target_os = "macos")]
         {
-            let dec = rc_decode_vt::new_decoder(rc_decode_vt::VtDecoderConfig::default())?;
+            let dec = rc_decode_vt::new_decoder(rc_decode_vt::VtDecoderConfig {
+                codec: cfg.codec,
+                max_resolution: Resolution::new(
+                    cfg.resolution.width.max(4096),
+                    cfg.resolution.height.max(4096),
+                ),
+                ..rc_decode_vt::VtDecoderConfig::default()
+            })?;
             Ok((Box::new(dec), "videotoolbox"))
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = cfg;
             Err(rc_types::Error::InvalidConfig(
                 "VideoToolbox decoder is only supported on macOS".into(),
             ))
         }
+    }
+
+    fn supports_hevc(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 
     fn create_renderer(&self, cfg: &PipelineConfig) -> Result<(Box<dyn Renderer>, &'static str)> {

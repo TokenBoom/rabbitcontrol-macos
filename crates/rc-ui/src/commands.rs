@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use rc_input::{InputEvent, MouseButton};
 use rc_session::auth::{OwnerTicketSigner, OwnerTicketVerifier};
-use rc_tools::{FileEntry, PortMapRuleSnapshot, TransferItem};
+use rc_tools::{fonts::TerminalFontInfo, FileEntry, PortMapRuleSnapshot, TransferItem};
 use rc_ui::app_prefs::{
     self, AppPrefs, DeviceSnapshotView, SavedPortMapRule, SecurityPrefsPatch, StreamPrefsPatch,
+    TerminalPrefsPatch,
 };
 use rc_ui::auth_client::{
     AuthClientError, AuthHttpClient, AuthSessionManager, BindDeviceRequest, MyDeviceInfo,
@@ -47,10 +48,10 @@ use crate::state::{
 };
 use crate::window;
 
-/// `open_session` 默认请求宽度（像素，实际以 Welcome 握手裁定为准）。
-const DEFAULT_SESSION_WIDTH: u32 = 1920;
-/// `open_session` 默认请求高度（像素，实际以 Welcome 握手裁定为准）。
-const DEFAULT_SESSION_HEIGHT: u32 = 1080;
+/// `open_session` 默认请求宽度（0 表示采用被控端当前分辨率）。
+const DEFAULT_SESSION_WIDTH: u32 = 0;
+/// `open_session` 默认请求高度（0 表示采用被控端当前分辨率）。
+const DEFAULT_SESSION_HEIGHT: u32 = 0;
 /// `open_session` 默认优先硬件后端。
 fn default_prefer_hardware() -> bool {
     true
@@ -363,8 +364,12 @@ pub(crate) fn teardown_session(app: &AppHandle, mut old: ActiveSession) {
 }
 
 /// 断开并回收当前活动会话；可按需覆写或在未传入时读取 `prefs.lock_on_exit` 在断线前发送锁屏指令。
-pub(crate) fn disconnect_active_session_with_lock(app: &AppHandle, lock_override: Option<bool>) {
-    let (old, should_lock) = {
+/// 返回递增后的 `session_open_epoch`。
+pub(crate) fn disconnect_active_session_with_lock(
+    app: &AppHandle,
+    lock_override: Option<bool>,
+) -> u64 {
+    let (old, should_lock, new_epoch) = {
         let state = app.state::<AppState>();
         let lock_pref = state
             .prefs
@@ -374,9 +379,9 @@ pub(crate) fn disconnect_active_session_with_lock(app: &AppHandle, lock_override
         let should_lock = lock_override.unwrap_or(lock_pref);
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
         // H9：递增会话打开代次，使任何在途的 `open_session` (`request_connect`) 醒来后自动作废。
-        state.session_open_epoch.fetch_add(1, Ordering::AcqRel);
+        let new_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         state::clear_session_snapshot_locked(&state.last_session_update);
-        (slot.take(), should_lock)
+        (slot.take(), should_lock, new_epoch)
     };
     if let Some(session) = old {
         if should_lock {
@@ -393,11 +398,12 @@ pub(crate) fn disconnect_active_session_with_lock(app: &AppHandle, lock_override
         teardown_session(app, session);
     }
     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+    new_epoch
 }
 
 /// 断开并回收当前活动会话（供 S1 窗口关闭事件兜底调用，T21 U10 + U-H2 + H9）。
 pub(crate) fn disconnect_active_session(app: &AppHandle) {
-    disconnect_active_session_with_lock(app, None);
+    let _ = disconnect_active_session_with_lock(app, None);
 }
 
 /// 脱离当前活动会话上已附着的远端终端视图（供 W3 `"terminal"` 窗口销毁事件兜底调用，保持被控端后台 PTY 存活）。
@@ -522,6 +528,21 @@ async fn resolve_endpoint_and_grant(
     }
 }
 
+fn preallocate_metal_layer_for_session(
+    app: &AppHandle,
+    prefer_hardware: bool,
+) -> Option<metal_attach::MainThreadMetalLayer> {
+    if cfg!(target_os = "macos") && prefer_hardware {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = app.run_on_main_thread(move || {
+            let _ = tx.send(metal_attach::new_metal_layer_on_main_thread().ok());
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    } else {
+        None
+    }
+}
+
 fn activate_session_with_cfg(
     app: &AppHandle,
     state: &AppState,
@@ -529,30 +550,20 @@ fn activate_session_with_cfg(
     ui_cfg: UiSessionConfig,
     watch_only: bool,
     meta: ActiveSessionMeta,
+    preallocated_override: Option<Option<metal_attach::MainThreadMetalLayer>>,
 ) -> Result<(), String> {
     state.require_authenticated()?;
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Ok(());
     }
 
-    *state
-        .last_session_params
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some((watch_only, meta.clone()));
-
-    // C1：仅在输入校验与 `request_connect` 全部成功后才打开 S1 会话窗口。
-    window::ensure_session_window(app, state, watch_only)?;
-    window::set_session_window_title(app, &meta.device_name);
-
-    // macOS 硬件路径需在主线程预创建 `CAMetalLayer`，避免后台线程创建的 layer 无法合成黑屏。
-    let preallocated_layer = if cfg!(target_os = "macos") && ui_cfg.prefer_hardware {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let _ = app.run_on_main_thread(move || {
-            let _ = tx.send(metal_attach::new_metal_layer_on_main_thread().ok());
-        });
-        rx.recv().ok().flatten()
-    } else {
-        None
+    let preallocated_layer = match preallocated_override {
+        Some(layer) => layer,
+        None => {
+            window::ensure_session_window(app, state, watch_only)?;
+            window::set_session_window_title(app, &meta.device_name);
+            preallocate_metal_layer_for_session(app, ui_cfg.prefer_hardware)
+        }
     };
 
     let (previous, active_info) = {
@@ -562,6 +573,10 @@ fn activate_session_with_cfg(
         {
             return Ok(());
         }
+        *state
+            .last_session_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((watch_only, meta.clone()));
         let old = slot.take();
         // 在 `session` 锁内原子清空旧快照（U-H2 / U-H3），防止新窗口拉到旧会话的 `Ended` / `Negotiated`。
         state::clear_session_snapshot_locked(&state.last_session_update);
@@ -594,6 +609,7 @@ fn local_device_id_snapshot(state: &AppState) -> Option<String> {
     rt.current_status()
         .device_id
         .or_else(|| rt.config.cached_device_id.clone())
+        .or_else(|| state.auth.server_config().cached_device_id)
 }
 
 fn build_session_mtls_bundle(
@@ -638,14 +654,6 @@ pub(crate) fn build_relay_reject_mtls(
 }
 
 fn build_owner_verifier(state: &AppState) -> Option<Arc<dyn OwnerTicketVerifier>> {
-    let allow_self = state
-        .prefs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .allow_owner_self_control;
-    if !allow_self {
-        return None;
-    }
     let server_auth_pubkey_hex = {
         let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
         rt.config
@@ -780,7 +788,7 @@ fn prepare_session_security(
     })
 }
 
-/// IPC 命令：打开远控会话（支持直连 `ip:port` 与 9 位设备码中继 → 校验/获取中继凭据 → 打开 S1 窗口 → 断开旧会话 → 启动新 `SessionHandle`）。
+/// IPC 命令：打开远控会话（校验输入后立即弹出 S1 会话窗口并预分配 Metal 图层，同时异步拉取信令凭据与安全配置，减少首屏等待）。
 #[tauri::command]
 pub async fn open_session(
     cfg: OpenSessionRequest,
@@ -788,10 +796,6 @@ pub async fn open_session(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     state.require_authenticated()?;
-
-    // H9：在 `request_connect` 之前递增代次；若在途期间出现新的 `open_session` 或 S1 关窗，
-    // 返回后自动丢弃过期凭据且不打开窗口 / 不启动会话。
-    let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
     let parsed = model::parse_connect_input(&cfg.target)?;
     let (device_key, device_name, relay_target_id) =
@@ -812,7 +816,50 @@ pub async fn open_session(
         parsed
     };
 
-    let (connect_addr, relay_grant) = resolve_endpoint_and_grant(&state, effective_target).await?;
+    // H9：在打开窗口与 `request_connect` 之前递增代次；若在途期间出现新的 `open_session` 或 S1 关窗，
+    // 返回后自动丢弃过期凭据且不启动会话。
+    let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
+    // 先回收旧会话并推送初始 Connecting 状态，再立即创建/展示 S1 窗口，使控制界面秒开。
+    let previous = {
+        let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        state::clear_session_snapshot_locked(&state.last_session_update);
+        slot.take()
+    };
+    if let Some(old) = previous {
+        let _ = old.handle.tools().detach_all_terminals();
+        let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
+        let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+        teardown_session(&app, old);
+    }
+
+    window::ensure_session_window(&app, &state, cfg.watch_only)?;
+    window::set_session_window_title(&app, &device_name);
+    let _ = app.emit(
+        "session://update",
+        &SessionUpdate::Connecting {
+            phase: rc_ui::session_bridge::ConnectPhase::EndpointCreating,
+            watch_only: cfg.watch_only,
+        },
+    );
+    let preallocated_layer = preallocate_metal_layer_for_session(&app, cfg.prefer_hardware);
+
+    let (connect_addr, relay_grant) =
+        match resolve_endpoint_and_grant(&state, effective_target).await {
+            Ok(res) => res,
+            Err(err) => {
+                if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                    let _ = app.emit(
+                        "session://update",
+                        &SessionUpdate::Ended {
+                            reason: err.clone(),
+                        },
+                    );
+                    window::destroy_session_window_if_epoch(&app, my_epoch);
+                }
+                return Err(err);
+            }
+        };
 
     // 若等待 `request_connect` 期间已被更新的 `open_session` 或 `disconnect_active_session` 取代，静默丢弃。
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
@@ -824,21 +871,47 @@ pub async fn open_session(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let req_width = cfg.width.unwrap_or(DEFAULT_SESSION_WIDTH).max(1);
-    let req_height = cfg.height.unwrap_or(DEFAULT_SESSION_HEIGHT).max(1);
+    let (req_width, req_height) = match (cfg.width, cfg.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT),
+    };
     let req_fps = cfg.fps.unwrap_or(prefs_snap.fps).max(1);
     let req_bitrate_bps = cfg.bitrate_bps.unwrap_or(prefs_snap.bitrate_bps).max(1);
     let password = cfg.password.filter(|p| !p.is_empty());
     let encrypt_connection = cfg
         .encrypt_connection
         .unwrap_or(prefs_snap.default_encrypt_connection);
-    let security = prepare_session_security(
-        &state,
-        relay_target_id.as_deref(),
-        relay_grant.as_ref(),
-        cfg.force_relay,
-        encrypt_connection,
-    )?;
+    let force_relay = cfg.force_relay;
+    let relay_target_for_sec = relay_target_id.clone();
+    let grant_for_sec = relay_grant.clone();
+    let app_sec = app.clone();
+    let security = match tauri::async_runtime::spawn_blocking(move || {
+        let st_sec = app_sec.state::<AppState>();
+        prepare_session_security(
+            &st_sec,
+            relay_target_for_sec.as_deref(),
+            grant_for_sec.as_ref(),
+            force_relay,
+            encrypt_connection,
+        )
+    })
+    .await
+    .map_err(|e| format!("准备会话安全配置异常：{e}"))?
+    {
+        Ok(sec) => sec,
+        Err(err) => {
+            if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                let _ = app.emit(
+                    "session://update",
+                    &SessionUpdate::Ended {
+                        reason: err.clone(),
+                    },
+                );
+                window::destroy_session_window_if_epoch(&app, my_epoch);
+            }
+            return Err(err);
+        }
+    };
 
     let ui_cfg = UiSessionConfig {
         connect_addr,
@@ -881,7 +954,15 @@ pub async fn open_session(
         transport: None,
     };
 
-    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, cfg.watch_only, meta)
+    activate_session_with_cfg(
+        &app,
+        &state,
+        my_epoch,
+        ui_cfg,
+        cfg.watch_only,
+        meta,
+        Some(preallocated_layer),
+    )
 }
 
 /// IPC 命令：在当前远控会话中动态切换「使用安全中转连接」模式，保持窗口与画质/帧率偏好并重建会话。
@@ -925,7 +1006,42 @@ pub async fn set_session_relay_mode(
     };
 
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let (connect_addr, relay_grant) = resolve_endpoint_and_grant(&state, effective_target).await?;
+
+    // 切换传输模式前先断开并回收旧会话（让对端先退出 LAN 会话，避免与新下发的 PunchCoord/中继令牌竞争或误清理）。
+    let previous = {
+        let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        state::clear_session_snapshot_locked(&state.last_session_update);
+        slot.take()
+    };
+    if let Some(old) = previous {
+        let _ = old.handle.tools().detach_all_terminals();
+        let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
+        teardown_session(&app, old);
+    }
+    let _ = app.emit(
+        "session://update",
+        &SessionUpdate::Connecting {
+            phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+            watch_only,
+        },
+    );
+
+    let (connect_addr, relay_grant) =
+        match resolve_endpoint_and_grant(&state, effective_target).await {
+            Ok(res) => res,
+            Err(err) => {
+                if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                    let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                    let _ = app.emit(
+                        "session://update",
+                        &SessionUpdate::Ended {
+                            reason: err.clone(),
+                        },
+                    );
+                }
+                return Err(err);
+            }
+        };
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Err("会话状态已变更，请重试".to_string());
     }
@@ -943,20 +1059,49 @@ pub async fn set_session_relay_mode(
     meta.connected = false;
     meta.transport = None;
 
-    let security = prepare_session_security(
-        &state,
-        meta.relay_target_id.as_deref(),
-        relay_grant.as_ref(),
-        force_relay,
-        meta.encrypt_connection,
-    )?;
+    let relay_target_for_sec = meta.relay_target_id.clone();
+    let grant_for_sec = relay_grant.clone();
+    let encrypt_conn = meta.encrypt_connection;
+    let app_sec = app.clone();
+    let security = match tauri::async_runtime::spawn_blocking(move || {
+        let st_sec = app_sec.state::<AppState>();
+        prepare_session_security(
+            &st_sec,
+            relay_target_for_sec.as_deref(),
+            grant_for_sec.as_ref(),
+            force_relay,
+            encrypt_conn,
+        )
+    })
+    .await
+    .map_err(|e| format!("准备会话安全配置异常：{e}"))?
+    {
+        Ok(sec) => sec,
+        Err(err) => {
+            if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                let _ = app.emit(
+                    "session://update",
+                    &SessionUpdate::Ended {
+                        reason: err.clone(),
+                    },
+                );
+            }
+            return Err(err);
+        }
+    };
 
+    let (req_width, req_height) = if meta.width > 0 && meta.height > 0 {
+        (meta.width, meta.height)
+    } else {
+        (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT)
+    };
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password: meta.password.clone(),
         watch_only,
-        width: meta.width.max(1),
-        height: meta.height.max(1),
+        width: req_width,
+        height: req_height,
         fps: meta.fps,
         bitrate_bps: meta.bitrate_bps,
         prefer_hardware: meta.prefer_hardware,
@@ -971,7 +1116,7 @@ pub async fn set_session_relay_mode(
         lan_direct_addr: security.lan_direct_addr,
     };
 
-    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta)?;
+    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)?;
     Ok(if force_relay {
         "TCP Relay".to_string()
     } else {
@@ -1101,12 +1246,17 @@ pub async fn set_session_mtls_mode(
         enabled,
     )?;
 
+    let (req_width, req_height) = if meta.width > 0 && meta.height > 0 {
+        (meta.width, meta.height)
+    } else {
+        (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT)
+    };
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password: meta.password.clone(),
         watch_only,
-        width: meta.width.max(1),
-        height: meta.height.max(1),
+        width: req_width,
+        height: req_height,
         fps: meta.fps,
         bitrate_bps: meta.bitrate_bps,
         prefer_hardware: meta.prefer_hardware,
@@ -1121,7 +1271,7 @@ pub async fn set_session_mtls_mode(
         lan_direct_addr: security.lan_direct_addr,
     };
 
-    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta)?;
+    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)?;
     Ok(state.active_session_info())
 }
 
@@ -1393,9 +1543,12 @@ pub(crate) fn sync_lan_advertising_locked(state: &AppState, host: &HostRuntime) 
     let target = if state.is_service_proxy() {
         None
     } else {
-        host.handle
-            .as_ref()
-            .map(|h| (h.listen_addr().port(), !host.password.is_empty()))
+        host.handle.as_ref().map(|h| {
+            (
+                h.listen_addr().port(),
+                host.allow_remote_assist && !host.password.is_empty(),
+            )
+        })
     };
     if let Some(lan) = state.lan.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         lan.set_advertising(target);
@@ -1660,13 +1813,39 @@ pub fn check_permissions(state: State<'_, AppState>) -> PermissionSnapshot {
             return snap.permissions;
         }
     }
-    permissions::check_permissions()
+    let perms = permissions::check_permissions();
+    if !state.is_service_proxy()
+        && state.gate_state() == AppGateState::Authenticated
+        && permissions::ensure_host_ready(&perms).is_ok()
+        && state
+            .host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle
+            .is_none()
+    {
+        auto_start_host_if_permitted(&state);
+    }
+    perms
 }
 
 /// IPC 命令：请求 macOS 屏幕录制权限并返回最新系统权限快照。
 #[tauri::command]
-pub fn request_screen_recording_permission() -> PermissionSnapshot {
-    permissions::request_screen_recording()
+pub fn request_screen_recording_permission(state: State<'_, AppState>) -> PermissionSnapshot {
+    let perms = permissions::request_screen_recording();
+    if !state.is_service_proxy()
+        && state.gate_state() == AppGateState::Authenticated
+        && permissions::ensure_host_ready(&perms).is_ok()
+        && state
+            .host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle
+            .is_none()
+    {
+        auto_start_host_if_permitted(&state);
+    }
+    perms
 }
 
 /// IPC 命令：打开指定权限对应的系统设置隐私面板（`"screen_recording"` / `"accessibility"` / `"input_monitoring"`）。
@@ -1717,15 +1896,13 @@ fn persist_custom_host_password_to_path(
     })
 }
 
-/// 若已开启「允许其他设备远控本机」或「允许本人其他设备免密自控本机」且系统权限均就绪，则在认证放行后自动启用被控端监听。
+/// 认证放行且系统权限均就绪时自动启用被控端监听（默认始终承接同账号本人免密自控；是否放行他人由 `prefs.allow_remote_assist` 控制）。
 pub(crate) fn auto_start_host_if_permitted(state: &AppState) {
-    let (allow_assist, allow_self) = {
-        let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
-        (prefs.allow_remote_assist, prefs.allow_owner_self_control)
-    };
-    if !allow_assist && !allow_self {
-        return;
-    }
+    let allow_assist = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_remote_assist;
     let perms = permissions::check_permissions();
     if permissions::ensure_host_ready(&perms).is_ok() {
         let default_addr = SocketAddr::from(([0, 0, 0, 0], host_bridge::DEFAULT_HOST_PORT));
@@ -1734,7 +1911,7 @@ pub(crate) fn auto_start_host_if_permitted(state: &AppState) {
 }
 
 /// IPC 命令：开启或关闭本机「允许他人远程协助」服务（入口强门禁校验 `gate == Authenticated`；
-/// 开启前在 macOS 校验必需系统权限；关闭时若仍开启本人免密自控则保留仅本人通道监听并拒绝外来协助；
+/// 开启前在 macOS 校验必需系统权限；关闭时始终保留仅本人免密自控通道监听并拒绝外来协助；
 /// 同步更新局域网信标、信令服务器在线状态与持久化偏好，关闭时取消在途外来审批弹窗 U-M5）。
 #[tauri::command]
 pub fn set_host_enabled(
@@ -1806,7 +1983,7 @@ pub fn set_host_enabled(
         Ok(snapshot)
     } else {
         let prefs_path = app_prefs::default_prefs_path();
-        let (snapshot, cancelled_gen, keep_owner_listener) = {
+        let (snapshot, cancelled_gen) = {
             if state.is_service_proxy() {
                 let snap = match call_agent_ipc(
                     ServiceRequest::SetRemoteAssist { enabled: false },
@@ -1828,7 +2005,7 @@ pub fn set_host_enabled(
                     config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
                 let loaded = app_prefs::load_from_path(&prefs_path);
                 *state.prefs.lock().unwrap_or_else(|e| e.into_inner()) = loaded;
-                (snap, None, true)
+                (snap, None)
             } else {
                 let _io = state
                     .prefs_io_lock
@@ -1836,45 +2013,36 @@ pub fn set_host_enabled(
                     .unwrap_or_else(|e| e.into_inner());
                 let _file_lock =
                     config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
-                let (prev_allow, keep_owner) = {
+                let _prev_allow = {
                     let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
                     let prev = prefs.allow_remote_assist;
                     prefs.allow_remote_assist = false;
                     let snapshot_prefs = prefs.clone();
-                    let keep_owner = prefs.allow_owner_self_control;
                     drop(prefs);
                     app_prefs::save_to_path(&prefs_path, &snapshot_prefs).map_err(|err| {
                         let mut revert = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
                         revert.allow_remote_assist = prev;
                         err
                     })?;
-                    (prev, keep_owner)
+                    prev
                 };
-                let _ = prev_allow;
-                if keep_owner {
-                    let (snapshot, cancelled_gen) = {
-                        let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
-                        host.allow_remote_assist = false;
-                        let cancelled = host.pending_approval.take().map(|p| p.generation);
-                        if let Some(handle) = host.handle.as_ref() {
-                            if let Some(gen) = cancelled {
-                                let _ = handle.respond_approval(gen, false);
-                            }
-                            handle.set_allow_remote_assist(false);
+                let (snapshot, cancelled_gen) = {
+                    let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+                    host.allow_remote_assist = false;
+                    let cancelled = host.pending_approval.take().map(|p| p.generation);
+                    if let Some(handle) = host.handle.as_ref() {
+                        if let Some(gen) = cancelled {
+                            let _ = handle.respond_approval(gen, false);
                         }
-                        sync_lan_advertising_locked(&state, &host);
-                        (host.snapshot(), cancelled)
-                    };
-                    (snapshot, cancelled_gen, true)
-                } else {
-                    let (snapshot, cancelled_gen) = stop_host_service_with_cancelled(&state, false);
-                    (snapshot, cancelled_gen, false)
-                }
+                        handle.set_allow_remote_assist(false);
+                    }
+                    sync_lan_advertising_locked(&state, &host);
+                    (host.snapshot(), cancelled)
+                };
+                (snapshot, cancelled_gen)
             }
         };
-        if keep_owner_listener {
-            refresh_host_security_runtime(&state);
-        }
+        refresh_host_security_runtime(&state);
         sync_assist_state_to_server(&app, &state, false);
         if let Some(generation) = cancelled_gen {
             let _ = app.emit(
@@ -2459,11 +2627,39 @@ fn save_stream_prefs_to_path(
     Ok(next)
 }
 
-/// IPC 命令：读取持久化应用偏好（远程协助开关、画质/帧率/分辨率/HUD 状态）。
+fn save_terminal_prefs_to_path(
+    state: &AppState,
+    patch: TerminalPrefsPatch,
+    path: &Path,
+) -> Result<AppPrefs, String> {
+    let _io = state
+        .prefs_io_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _file_lock = config_paths::acquire_file_lock(path, Duration::from_secs(3));
+    let next = {
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && path.exists() {
+            *prefs = app_prefs::load_from_path(path);
+        }
+        prefs.apply_terminal_patch(patch)?;
+        prefs.clone()
+    };
+    app_prefs::save_to_path(path, &next)?;
+    Ok(next)
+}
+
+/// IPC 命令：读取持久化应用偏好（异步在工作线程执行，避免文件锁与磁盘读阻塞主线程）。
 #[tauri::command]
-pub fn get_app_prefs(state: State<'_, AppState>) -> Result<AppPrefs, String> {
-    state.require_authenticated()?;
-    Ok(sync_prefs_from_disk_if_proxy(&state))
+pub async fn get_app_prefs(app: AppHandle) -> Result<AppPrefs, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let app_for_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_blocking.state::<AppState>();
+        sync_prefs_from_disk_if_proxy(&state)
+    })
+    .await
+    .map_err(|e| format!("读取应用偏好任务异常：{e}"))
 }
 
 /// IPC 命令：增量保存远控流画质、帧率、分辨率与 HUD 显隐偏好。
@@ -2662,8 +2858,6 @@ pub struct MyDeviceEntry {
 pub struct SecurityPrefsSnapshot {
     /// 默认开启端到端加密连接 (mTLS)。
     pub default_encrypt_connection: bool,
-    /// 允许本人其他设备免密自控本机。
-    pub allow_owner_self_control: bool,
     /// 是否开启允许他人远程协助。
     pub allow_remote_assist: bool,
     /// 是否显示局域网设备（默认关闭）。
@@ -3415,12 +3609,7 @@ pub async fn list_my_devices(app: AppHandle) -> Result<Vec<MyDeviceEntry>, Strin
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         state.require_authenticated()?;
-        let local_did = {
-            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
-            rt.current_status()
-                .device_id
-                .or_else(|| rt.config.cached_device_id.clone())
-        };
+        let local_did = local_device_id_snapshot(&state);
         let list = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.list_my_devices(token)
         })?;
@@ -3444,12 +3633,7 @@ pub async fn rename_my_device(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         state.require_authenticated()?;
-        let local_did = {
-            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
-            rt.current_status()
-                .device_id
-                .or_else(|| rt.config.cached_device_id.clone())
-        };
+        let local_did = local_device_id_snapshot(&state);
         let updated = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.rename_device(token, &device_id, &alias)
         })?;
@@ -3468,12 +3652,7 @@ pub async fn remove_my_device(device_id: String, app: AppHandle) -> Result<(), S
         state.require_authenticated()?;
         let norm_target = server_config::parse_device_id_input(&device_id)
             .ok_or_else(|| format!("设备码格式无效：{device_id:?}"))?;
-        let local_did = {
-            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
-            rt.current_status()
-                .device_id
-                .or_else(|| rt.config.cached_device_id.clone())
-        };
+        let local_did = local_device_id_snapshot(&state);
         with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.remove_device(token, &norm_target)
         })?;
@@ -3493,7 +3672,6 @@ fn security_prefs_snapshot(state: &AppState) -> SecurityPrefsSnapshot {
     let prefs = sync_prefs_from_disk_if_proxy(state);
     SecurityPrefsSnapshot {
         default_encrypt_connection: prefs.default_encrypt_connection,
-        allow_owner_self_control: prefs.allow_owner_self_control,
         allow_remote_assist: prefs.allow_remote_assist,
         show_lan_devices: prefs.show_lan_devices,
         cert_status: state.cert_status(),
@@ -3518,21 +3696,26 @@ fn save_security_prefs_to_path(
     app_prefs::save_to_path(path, &next)?;
     Ok(SecurityPrefsSnapshot {
         default_encrypt_connection: next.default_encrypt_connection,
-        allow_owner_self_control: next.allow_owner_self_control,
         allow_remote_assist: next.allow_remote_assist,
         show_lan_devices: next.show_lan_devices,
         cert_status: state.cert_status(),
     })
 }
 
-/// IPC 命令：读取安全与 mTLS 加密偏好设置。
+/// IPC 命令：读取安全与 mTLS 加密偏好设置（异步在工作线程执行，避免文件锁与证书解析阻塞主线程）。
 #[tauri::command]
-pub fn get_security_prefs(state: State<'_, AppState>) -> Result<SecurityPrefsSnapshot, String> {
-    state.require_authenticated()?;
-    Ok(security_prefs_snapshot(&state))
+pub async fn get_security_prefs(app: AppHandle) -> Result<SecurityPrefsSnapshot, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let app_for_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_blocking.state::<AppState>();
+        security_prefs_snapshot(&state)
+    })
+    .await
+    .map_err(|e| format!("读取安全偏好任务异常：{e}"))
 }
 
-/// IPC 命令：保存安全与 mTLS 加密偏好设置，并实时同步被控端策略与按需启停本人自控监听。
+/// IPC 命令：保存安全与 mTLS 加密偏好设置，并实时同步被控端策略（始终保留同账号本人免密自控监听）。
 #[tauri::command]
 pub async fn save_security_prefs(
     patch: SecurityPrefsPatch,
@@ -3565,70 +3748,50 @@ pub async fn save_security_prefs(
                 return Err(err);
             }
             if state.gate_state() == AppGateState::Authenticated && !state.is_service_proxy() {
-                if next.allow_owner_self_control || next.allow_remote_assist {
-                    let host_missing = state
-                        .host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .handle
-                        .is_none();
-                    if host_missing {
-                        let perms = permissions::check_permissions();
-                        if permissions::ensure_host_ready(&perms).is_ok() {
-                            let default_addr =
-                                SocketAddr::from(([0, 0, 0, 0], host_bridge::DEFAULT_HOST_PORT));
-                            let _ = start_host_service_with_policy(
-                                &state,
-                                default_addr,
-                                true,
-                                next.allow_remote_assist,
-                            );
-                        }
-                    } else {
-                        if !next.allow_remote_assist {
-                            let cancelled_gen = {
-                                let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
-                                host.allow_remote_assist = false;
-                                let cancelled = host.pending_approval.take().map(|p| p.generation);
-                                if let Some(handle) = host.handle.as_ref() {
-                                    if let Some(gen) = cancelled {
-                                        let _ = handle.respond_approval(gen, false);
-                                    }
-                                    handle.set_allow_remote_assist(false);
-                                }
-                                cancelled
-                            };
-                            if let Some(generation) = cancelled_gen {
-                                let _ = app_for_blocking.emit(
-                                    "host://update",
-                                    &HostUpdate::ApprovalCancelled { generation },
-                                );
-                            }
-                        }
-                        refresh_host_security_runtime(&state);
+                let host_missing = state
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle
+                    .is_none();
+                if host_missing {
+                    let perms = permissions::check_permissions();
+                    if permissions::ensure_host_ready(&perms).is_ok() {
+                        let default_addr =
+                            SocketAddr::from(([0, 0, 0, 0], host_bridge::DEFAULT_HOST_PORT));
+                        let _ = start_host_service_with_policy(
+                            &state,
+                            default_addr,
+                            true,
+                            next.allow_remote_assist,
+                        );
                     }
                 } else {
-                    let has_host = state
-                        .host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .handle
-                        .is_some();
-                    if has_host {
-                        let (_, cancelled_gen) = stop_host_service_with_cancelled(&state, false);
+                    if !next.allow_remote_assist {
+                        let cancelled_gen = {
+                            let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+                            host.allow_remote_assist = false;
+                            let cancelled = host.pending_approval.take().map(|p| p.generation);
+                            if let Some(handle) = host.handle.as_ref() {
+                                if let Some(gen) = cancelled {
+                                    let _ = handle.respond_approval(gen, false);
+                                }
+                                handle.set_allow_remote_assist(false);
+                            }
+                            cancelled
+                        };
                         if let Some(generation) = cancelled_gen {
                             let _ = app_for_blocking.emit(
                                 "host://update",
                                 &HostUpdate::ApprovalCancelled { generation },
                             );
                         }
-                        let _ = app_for_blocking.emit("host://update", &HostUpdate::Stopped);
                     }
+                    refresh_host_security_runtime(&state);
                 }
             }
             SecurityPrefsSnapshot {
                 default_encrypt_connection: next.default_encrypt_connection,
-                allow_owner_self_control: next.allow_owner_self_control,
                 allow_remote_assist: next.allow_remote_assist,
                 show_lan_devices: next.show_lan_devices,
                 cert_status: state.cert_status(),
@@ -3760,6 +3923,30 @@ pub async fn file_mkdir_local(
         .map_err(|e| format!("创建本地目录任务异常：{e}"))?
 }
 
+/// IPC 命令：异步删除本机文件或目录（`spawn_blocking`）。
+#[tauri::command]
+pub async fn file_delete_local(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.require_authenticated()?;
+    tauri::async_runtime::spawn_blocking(move || rc_tools::file_transfer::delete_local_path(&path))
+        .await
+        .map_err(|e| format!("删除本地文件任务异常：{e}"))?
+}
+
+/// IPC 命令：异步重命名本机文件或目录（`spawn_blocking`）。
+#[tauri::command]
+pub async fn file_rename_local(
+    path: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.require_authenticated()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rc_tools::file_transfer::rename_local_path(&path, &new_name)
+    })
+    .await
+    .map_err(|e| format!("重命名本地文件任务异常：{e}"))?
+}
+
 /// 校验 W3 终端行列尺寸（M10：1–512）。
 fn validate_terminal_size(cols: u16, rows: u16) -> Result<(), String> {
     if cols == 0 || rows == 0 || cols > 512 || rows > 512 {
@@ -3814,6 +4001,28 @@ pub async fn file_mkdir_remote(
     tauri::async_runtime::spawn_blocking(move || tools.file_mkdir_remote(parent, name))
         .await
         .map_err(|e| format!("创建远端目录任务异常：{e}"))?
+}
+
+/// IPC 命令：请求删除远端文件或目录（结果通过 `"file://event"` 推送）。
+#[tauri::command]
+pub async fn file_delete_remote(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let tools = active_session_tools(&state)?;
+    tauri::async_runtime::spawn_blocking(move || tools.file_delete_remote(path))
+        .await
+        .map_err(|e| format!("删除远端文件任务异常：{e}"))?
+}
+
+/// IPC 命令：请求重命名远端文件或目录（结果通过 `"file://event"` 推送）。
+#[tauri::command]
+pub async fn file_rename_remote(
+    path: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let tools = active_session_tools(&state)?;
+    tauri::async_runtime::spawn_blocking(move || tools.file_rename_remote(path, new_name))
+        .await
+        .map_err(|e| format!("重命名远端文件任务异常：{e}"))?
 }
 
 /// IPC 命令：上传本地文件至远端目录，返回传输任务 ID（H12：不阻塞 UI IPC 线程与 60fps 视频线程）。
@@ -3961,6 +4170,58 @@ pub fn terminal_resize(
 #[tauri::command]
 pub fn terminal_close(term_id: u32, state: State<'_, AppState>) -> Result<(), String> {
     active_session_tools(&state)?.terminal_close(term_id)
+}
+
+/// IPC 命令：扫描本机系统字体（用于 W3 终端本地字体选择）。
+#[tauri::command]
+pub async fn terminal_list_local_fonts(
+    state: State<'_, AppState>,
+) -> Result<Vec<TerminalFontInfo>, String> {
+    state.require_authenticated()?;
+    tauri::async_runtime::spawn_blocking(rc_tools::fonts::list_local_fonts)
+        .await
+        .map_err(|e| format!("扫描本机字体任务异常：{e}"))
+}
+
+/// IPC 命令：请求被控端列举其已安装的系统字体（结果经 `"terminal://event"` 推送）。
+#[tauri::command]
+pub fn terminal_list_remote_fonts(state: State<'_, AppState>) -> Result<(), String> {
+    active_session_tools(&state)?.terminal_list_remote_fonts()
+}
+
+/// IPC 命令：请求从被控端拉取指定 `font_id` 的字体二进制流（就绪后经 `"terminal://event"` 推送 `fontReady`）。
+#[tauri::command]
+pub fn terminal_fetch_remote_font(
+    font_id: String,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    active_session_tools(&state)?.terminal_fetch_remote_font(font_id)
+}
+
+/// IPC 命令：读取已缓存的远程字体原始二进制（避免 Base64 膨胀与 DOM 重写开销）。
+#[tauri::command]
+pub fn terminal_get_remote_font_bytes(
+    font_id: String,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = active_session_tools(&state)?.terminal_get_cached_remote_font(&font_id)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// IPC 命令：保存 W3 终端字体偏好设置。
+#[tauri::command]
+pub async fn terminal_set_font_prefs(
+    patch: TerminalPrefsPatch,
+    app: AppHandle,
+) -> Result<AppPrefs, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let app_for_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_blocking.state::<AppState>();
+        save_terminal_prefs_to_path(&state, patch, &app_prefs::default_prefs_path())
+    })
+    .await
+    .map_err(|e| format!("保存终端字体偏好任务异常：{e}"))?
 }
 
 fn persist_portmaps_locked(
@@ -4326,10 +4587,10 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
                                     *prefs = prev;
                                     None
                                 } else {
-                                    Some((prev.allow_remote_assist, prefs.allow_owner_self_control))
+                                    Some(prev.allow_remote_assist)
                                 }
                             };
-                            let Some((prev_allow, keep_owner)) = prefs_res else {
+                            let Some(prev_allow) = prefs_res else {
                                 return;
                             };
                             if target {
@@ -4366,7 +4627,7 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
                                         return;
                                     }
                                 }
-                            } else if keep_owner {
+                            } else {
                                 let (cancelled_gen, emit_listening) = {
                                     let mut host =
                                         st.host.lock().unwrap_or_else(|e| e.into_inner());
@@ -4393,6 +4654,7 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
                                     };
                                     (cancelled, listening)
                                 };
+                                refresh_host_security_runtime(&st);
                                 if let Some(generation) = cancelled_gen {
                                     let _ = app_worker.emit(
                                         "host://update",
@@ -4404,16 +4666,6 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
                                 } else {
                                     let _ = app_worker.emit("host://update", &HostUpdate::Stopped);
                                 }
-                            } else {
-                                let (_, cancelled_gen) =
-                                    stop_host_service_with_cancelled(&st, false);
-                                if let Some(generation) = cancelled_gen {
-                                    let _ = app_worker.emit(
-                                        "host://update",
-                                        &HostUpdate::ApprovalCancelled { generation },
-                                    );
-                                }
-                                let _ = app_worker.emit("host://update", &HostUpdate::Stopped);
                             }
                         }
                         sync_assist_state_to_server(&app_worker, &st, target);
@@ -4656,7 +4908,7 @@ pub async fn reconnect_last_session(
         lan_direct_addr: security.lan_direct_addr,
     };
 
-    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta)
+    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)
 }
 
 /// IPC 命令：彻底「整体退出」RabbitControl（同时终止系统后台服务与控制端界面，不触发自动重启）。
@@ -5429,21 +5681,34 @@ mod tests {
         let state = AppState::new_for_test();
         let initial = security_prefs_snapshot(&state);
         assert!(initial.default_encrypt_connection);
-        assert!(initial.allow_owner_self_control);
         assert!(!initial.show_lan_devices);
 
         let updated = save_security_prefs_to_path(
             &state,
             SecurityPrefsPatch {
                 default_encrypt_connection: Some(false),
-                allow_owner_self_control: Some(false),
+                allow_remote_assist: Some(true),
                 ..Default::default()
             },
             &prefs_path,
         )
         .expect("save_security_prefs_to_path must succeed");
         assert!(!updated.default_encrypt_connection);
-        assert!(!updated.allow_owner_self_control);
+        assert!(updated.allow_remote_assist);
+        let snap_json = serde_json::to_value(&updated).expect("serialize SecurityPrefsSnapshot");
+        assert!(
+            snap_json.get("allowOwnerSelfControl").is_none(),
+            "SecurityPrefsSnapshot must not emit removed allowOwnerSelfControl field"
+        );
+
+        let legacy_path = dir.join("legacy-prefs.json");
+        std::fs::write(
+            &legacy_path,
+            r#"{"defaultEncryptConnection":false,"allowOwnerSelfControl":false}"#,
+        )
+        .expect("write legacy prefs json");
+        let legacy_loaded = app_prefs::load_from_path(&legacy_path);
+        assert!(!legacy_loaded.default_encrypt_connection);
 
         let entry = map_my_device_entry(
             MyDeviceInfo {
@@ -5569,5 +5834,20 @@ mod tests {
                 "all fallback addresses must be usable LAN addresses: {addrs:?}"
             );
         }
+    }
+
+    #[test]
+    fn local_device_id_snapshot_falls_back_to_cached_device_id() {
+        let state = AppState::new_for_test();
+        assert_eq!(local_device_id_snapshot(&state), None);
+
+        {
+            let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+            rt.config.cached_device_id = Some("604928235".to_string());
+        }
+        assert_eq!(
+            local_device_id_snapshot(&state).as_deref(),
+            Some("604928235")
+        );
     }
 }

@@ -77,6 +77,15 @@
     fitSessionWindow: function () {
       return invoke("fit_session_window");
     },
+    isSessionFullscreen: function () {
+      return invoke("is_session_fullscreen");
+    },
+    setSessionFullscreen: function (fullscreen) {
+      return invoke("set_session_fullscreen", { fullscreen: Boolean(fullscreen) });
+    },
+    toggleSessionFullscreen: function () {
+      return invoke("toggle_session_fullscreen");
+    },
     validateMapForm: function (form) {
       return invoke("validate_map_form", { form: form });
     },
@@ -135,11 +144,23 @@
     fileMkdirLocal: function (parent, name) {
       return invoke("file_mkdir_local", { parent: String(parent), name: String(name) });
     },
+    fileDeleteLocal: function (path) {
+      return invoke("file_delete_local", { path: String(path) });
+    },
+    fileRenameLocal: function (path, newName) {
+      return invoke("file_rename_local", { path: String(path), newName: String(newName) });
+    },
     fileListRemote: function (path) {
       return invoke("file_list_remote", { path: path == null ? null : String(path) });
     },
     fileMkdirRemote: function (parent, name) {
       return invoke("file_mkdir_remote", { parent: String(parent), name: String(name) });
+    },
+    fileDeleteRemote: function (path) {
+      return invoke("file_delete_remote", { path: String(path) });
+    },
+    fileRenameRemote: function (path, newName) {
+      return invoke("file_rename_remote", { path: String(path), newName: String(newName) });
     },
     fileUpload: function (localPath, remoteDir) {
       return invoke("file_upload", { localPath: String(localPath), remoteDir: String(remoteDir) });
@@ -193,6 +214,21 @@
     },
     terminalClose: function (termId) {
       return invoke("terminal_close", { termId: Number(termId) });
+    },
+    terminalListLocalFonts: function () {
+      return invoke("terminal_list_local_fonts");
+    },
+    terminalListRemoteFonts: function () {
+      return invoke("terminal_list_remote_fonts");
+    },
+    terminalFetchRemoteFont: function (fontId) {
+      return invoke("terminal_fetch_remote_font", { fontId: String(fontId) });
+    },
+    terminalGetRemoteFontBytes: function (fontId) {
+      return invoke("terminal_get_remote_font_bytes", { fontId: String(fontId) });
+    },
+    terminalSetFontPrefs: function (patch) {
+      return invoke("terminal_set_font_prefs", { patch: patch || {} });
     },
     portmapList: function () {
       return invoke("portmap_list");
@@ -395,6 +431,13 @@
     },
     onActiveSessionState: function (cb) {
       return listen("session://active-state", function (ev) {
+        if (typeof cb === "function") {
+          cb(ev && ev.payload !== undefined ? ev.payload : ev);
+        }
+      });
+    },
+    onSessionFullscreenChanged: function (cb) {
+      return listen("session://fullscreen-changed", function (ev) {
         if (typeof cb === "function") {
           cb(ev && ev.payload !== undefined ? ev.payload : ev);
         }

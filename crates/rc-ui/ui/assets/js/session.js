@@ -196,6 +196,9 @@
 
     var BITRATE_BPS = {
       auto: 14000000,
+      '150m': 150000000,
+      '100m': 100000000,
+      '60m': 60000000,
       '30m': 30000000,
       '14m': 14000000,
       '8m': 8000000
@@ -530,19 +533,8 @@
     }
 
     function maybeAutoApplySavedResolution() {
-      if (autoAppliedSavedRes || !preferredResolution || !hasDisplayConfig) return;
+      /* 首次连接保持被控端当前原始分辨率，不自动套用历史全局分辨率偏好 */
       autoAppliedSavedRes = true;
-      var match = findMatchingPreset(streamState.presets, preferredResolution);
-      if (match && (match.width !== streamState.width || match.height !== streamState.height)) {
-        if (IS_TAURI && typeof Bridge.sessionCommand === 'function') {
-          Bridge.sessionCommand({
-            type: 'set_stream_params',
-            width: match.width,
-            height: match.height,
-            fps: Number(streamState.fps || 144)
-          }).catch(function () {});
-        }
-      }
     }
 
     function selectResolutionPreset(w, h) {
@@ -1445,13 +1437,11 @@
       }
     }
 
-    /* ── 全屏（§7.3 F / §6 S3「进入全屏幕」）───────────────────── */
-    function fullscreenElement() {
-      return document.fullscreenElement || document.webkitFullscreenElement || null;
-    }
+    /* ── 全屏（§6 S3：使用 Tauri 原生 NSWindow 全屏，保留 sibling CAMetalLayer） ── */
+    var nativeFullscreen = false;
 
     function syncFullscreenLabels() {
-      var isFs = Boolean(fullscreenElement() || win.classList.contains('is-fullscreen'));
+      var isFs = Boolean(nativeFullscreen || win.classList.contains('is-fullscreen'));
       var text = isFs ? '退出全屏幕' : '进入全屏幕';
       var labels = document.querySelectorAll('.sn-fullscreen-label');
       Array.prototype.forEach.call(labels, function (el) {
@@ -1459,11 +1449,29 @@
       });
     }
 
-    document.addEventListener('fullscreenchange', syncFullscreenLabels);
-    document.addEventListener('webkitfullscreenchange', syncFullscreenLabels);
+    function applyNativeFullscreenState(isFs) {
+      nativeFullscreen = Boolean(isFs);
+      win.classList.toggle('is-fullscreen', nativeFullscreen);
+      syncFullscreenLabels();
+      if (typeof window.__rcScheduleStageRectSync === 'function') {
+        window.__rcScheduleStageRectSync();
+      }
+    }
+
+    if (IS_TAURI) {
+      if (typeof Bridge.isSessionFullscreen === 'function') {
+        Bridge.isSessionFullscreen()
+          .then(applyNativeFullscreenState)
+          .catch(function () {});
+      }
+      if (typeof Bridge.onSessionFullscreenChanged === 'function') {
+        Bridge.onSessionFullscreenChanged(function (payload) {
+          applyNativeFullscreenState(Boolean(payload && payload.fullscreen));
+        });
+      }
+    }
 
     function enterFallback() {
-      /* 预览环境（file:// 无全屏权限）下用等价视觉态兜底；Tauri 内走 Fullscreen API */
       win.classList.add('is-fullscreen');
       syncFullscreenLabels();
     }
@@ -1474,28 +1482,19 @@
     }
 
     function toggleFullscreen() {
-      var doc = document;
-      if (fullscreenElement()) {
-        var exit = doc.exitFullscreen || doc.webkitExitFullscreen;
-        if (exit) {
-          var ep = exit.call(doc);
-          if (ep && typeof ep.catch === 'function') ep.catch(function () {});
-        }
+      if (IS_TAURI && typeof Bridge.toggleSessionFullscreen === 'function') {
+        Bridge.toggleSessionFullscreen()
+          .then(applyNativeFullscreenState)
+          .catch(function (err) {
+            toast('切换全屏失败：' + String(err || '未知错误'));
+          });
         return;
       }
       if (win.classList.contains('is-fullscreen')) {
         exitFallback();
-        return;
+      } else {
+        enterFallback();
       }
-      var request = win.requestFullscreen || win.webkitRequestFullscreen;
-      if (request) {
-        var p = request.call(win);
-        if (p && typeof p.catch === 'function') {
-          p.catch(enterFallback);
-        }
-        return;
-      }
-      enterFallback();
     }
 
     /* ── 退出远控（§6 S3：断开并销毁 S1 窗口回到主窗口 P1）────────── */
@@ -1543,6 +1542,7 @@
     }
 
     /* ── 快捷键（§7.3）────────────────────────────────────────── */
+    var swallowEscapeKeyup = false;
     document.addEventListener('keydown', function (e) {
       var target = e.target;
       var typing =
@@ -1553,22 +1553,25 @@
           target.isContentEditable);
 
       if (e.key === 'Escape') {
-        /* §7.4：Esc 关闭「当前」浮层——三级子菜单优先，其次二级子菜单、主菜单/气泡 */
+        /* Esc 仅在有打开的菜单/气泡时逐级关闭并吞掉按压与抬起事件；否则透传给被控端 */
         if (activeNestedEl && !activeNestedEl.hidden) {
           e.preventDefault();
+          swallowEscapeKeyup = true;
           closeNestedMenu();
           return;
         }
         if (activeSubmenuEl && !activeSubmenuEl.hidden) {
           e.preventDefault();
+          swallowEscapeKeyup = true;
           closeSubmenu();
           return;
         }
         if (open) {
           e.preventDefault();
+          swallowEscapeKeyup = true;
           closePopover();
+          return;
         }
-        return;
       }
 
       if (typing) return;
@@ -1580,15 +1583,7 @@
         return;
       }
 
-      /* F：进入/退出全屏幕（无修饰键） */
-      if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'f' || e.key === 'F')) {
-        e.preventDefault();
-        if (open) closePopover();
-        toggleFullscreen();
-        return;
-      }
-
-      /* Tauri 真实控制会话：转发键盘按下（T21 U9 / 坑 8） */
+      /* Tauri 真实控制会话：转发键盘按下（含单键 f/F 与未消费的 Esc） */
       if (Bridge && Bridge.isTauri && realSessionActive && !watchMode && !open) {
         e.preventDefault();
         Bridge.sendInputEvent({
@@ -1605,6 +1600,11 @@
 
     if (Bridge && Bridge.isTauri) {
       document.addEventListener('keyup', function (e) {
+        if (e.key === 'Escape' && swallowEscapeKeyup) {
+          swallowEscapeKeyup = false;
+          e.preventDefault();
+          return;
+        }
         if (!realSessionActive || watchMode || open) return;
         var target = e.target;
         var typing =
@@ -1637,6 +1637,15 @@
           height: r.height
         }).catch(function () {});
       }
+      window.__rcScheduleStageRectSync = function () {
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(reportStageRect);
+        } else {
+          reportStageRect();
+        }
+        window.setTimeout(reportStageRect, 120);
+        window.setTimeout(reportStageRect, 350);
+      };
 
       /* 订阅 Rust 侧 session://update 事件流（T21 U5 / §6 / U-M7 / U-M8） */
       var CONNECT_PHASE_TEXT = {
@@ -1959,7 +1968,9 @@
             cancelEndedCloseTimer();
             endedCloseTimer = window.setTimeout(function () {
               endedCloseTimer = 0;
-              closeSessionWindow();
+              if (sessionLifecycleState === 'ended') {
+                closeSessionWindow();
+              }
             }, 2500);
           }
         }

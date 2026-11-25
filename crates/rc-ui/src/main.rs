@@ -39,7 +39,7 @@ use crate::state::{AppGateState, AppState};
 
 /// 后台状态更新轮询粒度（低开销且保证 `Connecting`/`Negotiated`/`Ended` 与审批弹窗实时送达；
 /// HUD 本身在会话线程内已做 1s 节流）。
-const POLLER_INTERVAL: Duration = Duration::from_millis(50);
+const POLLER_INTERVAL: Duration = Duration::from_millis(20);
 
 fn sync_proxy_state_and_emit(
     app: &AppHandle,
@@ -282,6 +282,8 @@ fn start_background_poller(app: AppHandle) {
                                 } => {
                                     *watch_only = active.watch_only;
                                     active.set_video_size(width, height);
+                                    active.meta.width = width;
+                                    active.meta.height = height;
                                     auto_fit_req = Some((width, height));
                                     active.meta.connected = true;
                                     active.meta.transport = Some(transport.clone());
@@ -335,6 +337,8 @@ fn start_background_poller(app: AppHandle) {
                                 {
                                     let prev_size = active.video_size;
                                     active.set_video_size(width, height);
+                                    active.meta.width = width;
+                                    active.meta.height = height;
                                     if let Some((pw, ph)) = prev_size {
                                         if pw > 0 && ph > 0 {
                                             let prev_ratio = f64::from(pw) / f64::from(ph);
@@ -478,60 +482,68 @@ fn start_background_poller(app: AppHandle) {
                 }
 
                 if negotiated_record.is_some() || !wallpaper_updates.is_empty() {
-                    let st = app.state::<AppState>();
-                    let wallpapers_dir = app_prefs::default_wallpapers_dir();
-                    let prefs_path = app_prefs::default_prefs_path();
-                    let _io = st.prefs_io_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let _file_lock =
-                        config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(2));
-                    let now_ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let app_wp = app.clone();
+                    let _ = thread::Builder::new()
+                        .name("rc-snapshot-persist".to_string())
+                        .spawn(move || {
+                            let st = app_wp.state::<AppState>();
+                            let wallpapers_dir = app_prefs::default_wallpapers_dir();
+                            let prefs_path = app_prefs::default_prefs_path();
+                            let _io = st.prefs_io_lock.lock().unwrap_or_else(|e| e.into_inner());
+                            let _file_lock = config_paths::acquire_file_lock(
+                                &prefs_path,
+                                Duration::from_secs(2),
+                            );
+                            let now_ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
 
-                    let mut saved_wallpapers: Vec<(String, String, String)> = Vec::new();
-                    for (key, name, data_url) in wallpaper_updates {
-                        let b64 = data_url
-                            .split_once("base64,")
-                            .map(|(_, rest)| rest)
-                            .unwrap_or(data_url.as_str());
-                        if let Some(bytes) = display_ctrl::base64_decode(b64) {
-                            if let Ok(filename) =
-                                app_prefs::save_device_wallpaper(&wallpapers_dir, &key, &bytes)
-                            {
-                                saved_wallpapers.push((key, name, filename));
+                            let mut saved_wallpapers: Vec<(String, String, String)> = Vec::new();
+                            for (key, name, data_url) in wallpaper_updates {
+                                let b64 = data_url
+                                    .split_once("base64,")
+                                    .map(|(_, rest)| rest)
+                                    .unwrap_or(data_url.as_str());
+                                if let Some(bytes) = display_ctrl::base64_decode(b64) {
+                                    if let Ok(filename) = app_prefs::save_device_wallpaper(
+                                        &wallpapers_dir,
+                                        &key,
+                                        &bytes,
+                                    ) {
+                                        saved_wallpapers.push((key, name, filename));
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    let (next_prefs, views) = {
-                        let mut prefs = st.prefs.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.is_service_proxy() && prefs_path.exists() {
-                            *prefs = app_prefs::load_from_path(&prefs_path);
-                        }
-                        if let Some((key, name)) = negotiated_record {
-                            let rec = prefs.device_snapshots.entry(key).or_default();
-                            if !name.is_empty() {
-                                rec.name = name;
-                            }
-                            rec.last_connected_ts = now_ts;
-                        }
-                        for (key, name, filename) in saved_wallpapers {
-                            let rec = prefs.device_snapshots.entry(key).or_default();
-                            if !name.is_empty() {
-                                rec.name = name;
-                            }
-                            rec.last_connected_ts = rec.last_connected_ts.max(now_ts);
-                            rec.wallpaper_file = Some(filename);
-                        }
-                        let cloned = prefs.clone();
-                        let views = cloned.snapshot_views(&wallpapers_dir);
-                        (cloned, views)
-                    };
-                    let _ = app_prefs::save_to_path(&prefs_path, &next_prefs);
-                    let st_reload = app.state::<AppState>();
-                    commands::notify_background_services_reload(&st_reload, false);
-                    let _ = app.emit("device://snapshots", &views);
+                            let (next_prefs, views) = {
+                                let mut prefs = st.prefs.lock().unwrap_or_else(|e| e.into_inner());
+                                if st.is_service_proxy() && prefs_path.exists() {
+                                    *prefs = app_prefs::load_from_path(&prefs_path);
+                                }
+                                if let Some((key, name)) = negotiated_record {
+                                    let rec = prefs.device_snapshots.entry(key).or_default();
+                                    if !name.is_empty() {
+                                        rec.name = name;
+                                    }
+                                    rec.last_connected_ts = now_ts;
+                                }
+                                for (key, name, filename) in saved_wallpapers {
+                                    let rec = prefs.device_snapshots.entry(key).or_default();
+                                    if !name.is_empty() {
+                                        rec.name = name;
+                                    }
+                                    rec.last_connected_ts = rec.last_connected_ts.max(now_ts);
+                                    rec.wallpaper_file = Some(filename);
+                                }
+                                let cloned = prefs.clone();
+                                let views = cloned.snapshot_views(&wallpapers_dir);
+                                (cloned, views)
+                            };
+                            let _ = app_prefs::save_to_path(&prefs_path, &next_prefs);
+                            commands::notify_background_services_reload(&st, false);
+                            let _ = app_wp.emit("device://snapshots", &views);
+                        });
                 }
 
                 if let Some(old) = ended_session {
@@ -657,6 +669,7 @@ fn start_background_poller(app: AppHandle) {
                                         .spawn(move || {
                                             let s = app_cert.state::<AppState>();
                                             if s.auth.ensure_device_cert(&new_did).is_ok() {
+                                                commands::auto_start_host_if_permitted(&s);
                                                 commands::refresh_host_security_runtime(&s);
                                             }
                                             let _ = app_cert
@@ -664,6 +677,7 @@ fn start_background_poller(app: AppHandle) {
                                         });
                                 }
                             }
+                            commands::auto_start_host_if_permitted(&st);
                             commands::refresh_host_security_runtime(&st);
                         }
                         let _ = app.emit("server://status", &snap);
@@ -986,7 +1000,23 @@ fn main() {
                 }
             }
             WindowEvent::Destroyed => match win.label() {
-                "session" => commands::disconnect_active_session(win.app_handle()),
+                "session" => {
+                    let st = win.app_handle().state::<AppState>();
+                    let cur_epoch = st
+                        .session_open_epoch
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let prog_epoch = st
+                        .programmatic_close_epoch
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let has_session = st
+                        .session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    if has_session || cur_epoch != prog_epoch {
+                        commands::disconnect_active_session(win.app_handle());
+                    }
+                }
                 "terminal" => commands::detach_active_terminals(win.app_handle()),
                 "main" => {
                     let st = win.app_handle().state::<AppState>();
@@ -998,12 +1028,25 @@ fn main() {
                 }
                 _ => {}
             },
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+                if win.label() == "session" =>
+            {
+                let is_fs = win.is_fullscreen().unwrap_or(false);
+                let _ = win.app_handle().emit_to(
+                    "session",
+                    "session://fullscreen-changed",
+                    serde_json::json!({ "fullscreen": is_fs }),
+                );
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             window::open_tool_window,
             window::open_session_window,
             window::fit_session_window,
+            window::is_session_fullscreen,
+            window::set_session_fullscreen,
+            window::toggle_session_fullscreen,
             window::focus_session_window,
             window::close_session_window,
             commands::list_devices,
@@ -1058,8 +1101,12 @@ fn main() {
             commands::test_server_connection,
             commands::file_list_local,
             commands::file_mkdir_local,
+            commands::file_delete_local,
+            commands::file_rename_local,
             commands::file_list_remote,
             commands::file_mkdir_remote,
+            commands::file_delete_remote,
+            commands::file_rename_remote,
             commands::file_upload,
             commands::file_download,
             commands::file_cancel,
@@ -1074,6 +1121,11 @@ fn main() {
             commands::terminal_input,
             commands::terminal_resize,
             commands::terminal_close,
+            commands::terminal_list_local_fonts,
+            commands::terminal_list_remote_fonts,
+            commands::terminal_fetch_remote_font,
+            commands::terminal_get_remote_font_bytes,
+            commands::terminal_set_font_prefs,
             commands::portmap_list,
             commands::portmap_add,
             commands::portmap_toggle,

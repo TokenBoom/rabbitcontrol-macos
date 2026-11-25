@@ -36,15 +36,27 @@ pub(crate) fn start_code_len_at(buf: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// NAL 头字节的低 5 位 = nal_unit_type（H.264 Annex 表 7-1）。
-pub(crate) const fn nal_unit_type(header: u8) -> u8 {
-    header & 0x1f
+/// NAL 头字节的 `nal_unit_type`（H.264：低 5 位；HEVC：`(header >> 1) & 0x3f`）。
+pub(crate) const fn nal_unit_type_for(is_hevc: bool, header: u8) -> u8 {
+    if is_hevc {
+        (header >> 1) & 0x3f
+    } else {
+        header & 0x1f
+    }
 }
 
-/// 扫描 Annex-B 流，返回其中全部 NAL 的 nal_unit_type 序列。
-///
-/// IDR slice = 5；SPS = 7；PPS = 8。空流返回空序列。
-pub(crate) fn nal_unit_types(annexb: &[u8]) -> Vec<u8> {
+/// 判定该 NAL 类型是否为关键帧（IDR / IRAP）。
+#[inline]
+pub(crate) const fn is_keyframe_nal(is_hevc: bool, nal_type: u8) -> bool {
+    if is_hevc {
+        nal_type >= 16 && nal_type <= 21
+    } else {
+        nal_type == 5
+    }
+}
+
+/// 扫描 Annex-B 流，按编解码器规则返回其中全部 NAL 的 `nal_unit_type` 序列。
+pub(crate) fn nal_unit_types_for(is_hevc: bool, annexb: &[u8]) -> Vec<u8> {
     let mut types = Vec::new();
     let mut pos = 0;
     while pos < annexb.len() {
@@ -52,9 +64,8 @@ pub(crate) fn nal_unit_types(annexb: &[u8]) -> Vec<u8> {
             Some(code_len) => {
                 let header_pos = pos + code_len;
                 if let Some(&header) = annexb.get(header_pos) {
-                    types.push(nal_unit_type(header));
+                    types.push(nal_unit_type_for(is_hevc, header));
                 }
-                // 至少越过 NAL 头字节，继续找下一个起始码。
                 pos = header_pos + 1;
             }
             None => {
@@ -69,23 +80,33 @@ pub(crate) fn nal_unit_types(annexb: &[u8]) -> Vec<u8> {
     types
 }
 
-/// 是否含 IDR slice（nal_unit_type == 5）。
-pub(crate) fn is_idr(annexb: &[u8]) -> bool {
-    nal_unit_types(annexb).contains(&5)
+/// 扫描 Annex-B 流，返回其中全部 NAL 的 nal_unit_type 序列（H.264）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn nal_unit_types(annexb: &[u8]) -> Vec<u8> {
+    nal_unit_types_for(false, annexb)
 }
 
-/// 扫描 Annex-B 流，按 `(nal_unit_type, 载荷切片)` 逐 NAL 返回。
-///
-/// 载荷不含起始码（含 NAL 头字节）。E6 解码验证用它提取 SPS/PPS 与
-/// 重建 AVCC。空载荷（紧邻的起始码）与非法位置直接跳过，绝不越界。
-pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
+/// 按编解码器判定 Annex-B 流是否含关键帧 slice。
+pub(crate) fn is_idr_for(is_hevc: bool, annexb: &[u8]) -> bool {
+    nal_unit_types_for(is_hevc, annexb)
+        .into_iter()
+        .any(|t| is_keyframe_nal(is_hevc, t))
+}
+
+/// 是否含 IDR slice（H.264 nal_unit_type == 5）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_idr(annexb: &[u8]) -> bool {
+    is_idr_for(false, annexb)
+}
+
+/// 扫描 Annex-B 流，按编解码器返回 `(nal_unit_type, 载荷切片)` 序列。
+pub(crate) fn nal_payloads_for(is_hevc: bool, annexb: &[u8]) -> Vec<(u8, &[u8])> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < annexb.len() {
         match start_code_len_at(annexb, pos) {
             Some(code_len) => {
                 let payload_start = pos + code_len;
-                // 载荷延伸到下一个起始码（或流尾）。
                 let mut next = payload_start;
                 while next < annexb.len() {
                     if next + 2 < annexb.len() && annexb[next + 2] > 1 {
@@ -98,12 +119,13 @@ pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
                     next += 1;
                 }
                 if let Some((header, payload)) = annexb
-                    .get(payload_start)
-                    .zip(annexb.get(payload_start..next))
+                    .get(payload_start..next)
+                    .and_then(|s| s.split_first().map(|(h, _)| (*h, s)))
                 {
-                    out.push((nal_unit_type(*header), payload));
+                    if !is_hevc || payload.len() >= 2 {
+                        out.push((nal_unit_type_for(is_hevc, header), payload));
+                    }
                 }
-                // next >= payload_start = pos + code_len >= pos + 3：必然前进。
                 pos = next;
             }
             None => {
@@ -116,6 +138,11 @@ pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
         }
     }
     out
+}
+
+/// 扫描 Annex-B 流，按 `(nal_unit_type, 载荷切片)` 逐 NAL 返回（H.264）。
+pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
+    nal_payloads_for(false, annexb)
 }
 
 /// Annex-B → AVCC：每个 NAL 的起始码替换为 `length_size` 字节大端长度前缀。
@@ -147,9 +174,19 @@ pub(crate) fn to_length_prefixed(annexb: &[u8], length_size: usize) -> Option<Ve
 }
 
 /// 是否同时含 SPS（7）与 PPS（8）—— 一帧可独立解码的前提。
+/// Annex-B 流是否同时包含完整参数集（H.264: SPS+PPS；HEVC: VPS+SPS+PPS）。
+pub(crate) fn has_parameter_sets_for(is_hevc: bool, annexb: &[u8]) -> bool {
+    let types = nal_unit_types_for(is_hevc, annexb);
+    if is_hevc {
+        types.contains(&32) && types.contains(&33) && types.contains(&34)
+    } else {
+        types.contains(&7) && types.contains(&8)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn has_parameter_sets(annexb: &[u8]) -> bool {
-    let types = nal_unit_types(annexb);
-    types.contains(&7) && types.contains(&8)
+    has_parameter_sets_for(false, annexb)
 }
 
 /// 把输入裸流规整成 4 字节起始码的 Annex-B。
@@ -240,7 +277,11 @@ fn normalize_annexb(input: &[u8]) -> Option<Vec<u8>> {
 /// 同时返回输出 Annex-B 体（不含外插 SPS/PPS）的精确字节数。
 ///
 /// 与 [`convert_avcc`] 采用完全相同的严格判定规则：不合法或疑似 Annex-B 返回 `None`。
-pub(crate) fn inspect_avcc(input: &[u8], length_size: usize) -> Option<(bool, usize)> {
+pub(crate) fn inspect_avcc_for(
+    is_hevc: bool,
+    input: &[u8],
+    length_size: usize,
+) -> Option<(bool, usize)> {
     if length_size == 0 || length_size > 8 || input.is_empty() {
         return None;
     }
@@ -265,7 +306,7 @@ pub(crate) fn inspect_avcc(input: &[u8], length_size: usize) -> Option<(bool, us
         if end > input.len() {
             return None;
         }
-        if nal_unit_type(header) == 5 {
+        if is_keyframe_nal(is_hevc, nal_unit_type_for(is_hevc, header)) {
             is_idr_frame = true;
         }
         annexb_body_len = annexb_body_len.checked_add(4)?.checked_add(nal_len)?;
@@ -276,6 +317,11 @@ pub(crate) fn inspect_avcc(input: &[u8], length_size: usize) -> Option<(bool, us
     } else {
         Some((is_idr_frame, annexb_body_len))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn inspect_avcc(input: &[u8], length_size: usize) -> Option<(bool, usize)> {
+    inspect_avcc_for(false, input, length_size)
 }
 
 /// 单次分配、单次拷贝把已通过 [`inspect_avcc`] 校验的 AVCC 字节流（及可选前置 SPS/PPS）

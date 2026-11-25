@@ -583,6 +583,163 @@ body {
   font-size: var(--size-secondary);
 }
 
+/* ── 文件管理右键菜单与操作弹窗 ───────────────────────────── */
+
+.tr-ctx-menu[hidden],
+.tr-modal-backdrop[hidden],
+.tr-modal__error[hidden] {
+  display: none;
+}
+
+.tr-ctx-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 156px;
+  padding: 5px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-popover);
+  background: var(--popover-bg);
+  box-shadow: var(--shadow-popover);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tr-ctx-menu__sep {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--divider);
+}
+
+.tr-ctx-menu__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--r-row);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tr-ctx-menu__item:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.tr-ctx-menu__item:disabled {
+  color: var(--text-disabled);
+  cursor: not-allowed;
+}
+
+.tr-ctx-menu__item--danger:not(:disabled) {
+  color: var(--danger);
+}
+
+.tr-ctx-menu__item--danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.tr-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mask);
+}
+
+.tr-modal {
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  padding: 18px 20px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tr-modal__title {
+  margin: 0;
+  font-size: var(--size-h2);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.tr-modal__desc {
+  margin: 0;
+  font-size: var(--size-secondary);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.tr-modal__form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tr-modal__input {
+  width: 100%;
+  height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--stroke-control);
+  border-radius: var(--r-control);
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  outline: none;
+}
+
+.tr-modal__input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2.5px var(--accent-ring);
+}
+
+.tr-modal__error {
+  margin: 0;
+  font-size: var(--size-caption);
+  color: var(--danger);
+}
+
+.tr-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--on-accent);
+}
+
+.btn--danger:hover:not(:disabled) {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .checkbox,
   .tr-path,

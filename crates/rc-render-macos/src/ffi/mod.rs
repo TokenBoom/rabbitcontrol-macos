@@ -275,6 +275,8 @@ pub(crate) struct GpuContext {
     /// 是为了搭 [`GpuContext`] 既有的 Send 声明便车——光标纹理只在本
     /// 上下文内存活，不单独穿越线程边界。
     cursor_plane: Option<CursorPlane>,
+    /// 离屏基准渲染目标纹理（仅 [`MetalOffscreenSink`] 按需创建，复用同一设备与管线）。
+    offscreen_target: Option<MetalTexture>,
     /// 是否已注册真实上屏回调（无回调时热路径跳过 `Mutex` 加锁，仅 `bench-metrics` 启用）。
     #[cfg(feature = "bench-metrics")]
     has_present_sink: AtomicBool,
@@ -345,7 +347,7 @@ impl GpuContext {
         let cache =
             unsafe { CFRetained::from_raw(NonNull::new(cache_out).ok_or("cache 出参为空")?) };
 
-        // layer 配置：BGRA8 后备缓冲、物理像素 drawableSize、2 个 drawable（双缓冲实测锁定 120Hz 高帧率并将 Hitch 减半，同时压低合成器队列深度）、
+        // layer 配置：BGRA8 后备缓冲、物理像素 drawableSize、3 个 drawable（三缓冲支撑 120–380fps 高刷新率平滑吞吐）、
         // framebufferOnly=true（drawable 只作渲染目标，性能更优）、
         // opaque=true（免除合成器与桌面背景的整窗 alpha 混合）、
         // allowsNextDrawableTimeout=true（遮挡/最小化时保证 D6 可恢复返回 None 而非死锁）、
@@ -358,7 +360,7 @@ impl GpuContext {
             width: size.0 as f64,
             height: size.1 as f64,
         });
-        layer.setMaximumDrawableCount(2);
+        layer.setMaximumDrawableCount(3);
         layer.setFramebufferOnly(true);
         layer.setOpaque(true);
         layer.setAllowsNextDrawableTimeout(true);
@@ -389,6 +391,7 @@ impl GpuContext {
             pipelines,
             render_pass,
             cursor_plane: None,
+            offscreen_target: None,
             #[cfg(feature = "bench-metrics")]
             has_present_sink: AtomicBool::new(false),
             #[cfg(feature = "bench-metrics")]
@@ -710,6 +713,46 @@ impl GpuContext {
     ///
     /// 失败（编码器拿不到等 device-lost 类）以 `Err(String)` 上抛，
     /// 由 `renderer.rs` 映射为可恢复错误（D6）。
+    /// 编码并附着释放回调：返回尚未 `commit` 的 `MTLCommandBuffer`（供 drawable 与离屏目标共用）。
+    fn prepare_render_cmd(
+        &mut self,
+        target_tex: &ProtocolObject<dyn MTLTexture>,
+        source: FrameSource,
+        keep: FrameKeepAlive,
+        overlay: Option<CursorDraw>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        // SAFETY: 索引 0 在 colorAttachments 有效范围内（系统固定 4 个槽位）。
+        let att = unsafe {
+            self.render_pass
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        att.setTexture(Some(target_tex));
+        att.setLoadAction(load_action_for_video_quad(true));
+
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| "commandBuffer 创建失败（设备异常）".to_string())?;
+        let enc_opt = cmd.renderCommandEncoderWithDescriptor(&self.render_pass);
+        // 编码器已拷贝通道描述符，立即清除 descriptor 对本帧目标纹理的强引用。
+        att.setTexture(None);
+        let enc = enc_opt.ok_or_else(|| "renderCommandEncoder 创建失败（设备异常）".to_string())?;
+
+        self.encode_frame(&enc, &source, &overlay);
+        enc.endEncoding();
+
+        let release = std::cell::Cell::new(Some((source, keep, overlay)));
+        let block: PresentDoneBlock =
+            RcBlock::new(move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                drop(release.take());
+            });
+        // SAFETY: block 是刚创建的合法 RcBlock，指针在调用期间有效；Metal 按
+        // ObjC 约定拷贝 handler block，随后 RcBlock 的释放不影响回调。
+        unsafe { cmd.addCompletedHandler(NonNull::from(&*block).as_ptr()) };
+        Ok(cmd)
+    }
+
     pub(crate) fn draw_present_commit(
         &mut self,
         drawable: &MetalDrawable,
@@ -718,36 +761,7 @@ impl GpuContext {
         overlay: Option<CursorDraw>,
     ) -> Result<(), String> {
         autoreleasepool(|_| {
-            // 渲染通道：视频 quad 完整覆盖 drawable（[-1, 1]² 且不透明），直接用
-            // MTLLoadAction::DontCare 避免 Apple Silicon TBDR 冗余 tile 清屏；
-            // 若未来引入 letterbox/pillarbox 露出黑边，则切回 MTLLoadAction::Clear。
-            // SAFETY: 索引 0 在 colorAttachments 有效范围内（系统固定 4 个槽位）。
-            let att = unsafe {
-                self.render_pass
-                    .colorAttachments()
-                    .objectAtIndexedSubscript(0)
-            };
-            att.setTexture(Some(&*drawable.texture()));
-            att.setLoadAction(load_action_for_video_quad(true));
-
-            let cmd = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| "commandBuffer 创建失败（设备异常）".to_string())?;
-            let enc_opt = cmd.renderCommandEncoderWithDescriptor(&self.render_pass);
-            // 编码器已拷贝通道描述符，立即清除 descriptor 对本帧 drawable 纹理的强引用，
-            // 防止跨帧滞留导致 drawable 池卡死。
-            att.setTexture(None);
-            let enc =
-                enc_opt.ok_or_else(|| "renderCommandEncoder 创建失败（设备异常）".to_string())?;
-
-            self.encode_frame(&enc, &source, &overlay);
-            // endEncoding 是绑定层安全方法。
-            enc.endEncoding();
-
-            // present 绑定在命令缓冲上：GPU 执行完编码内容后立刻上屏；
-            // displaySyncEnabled=false（D2）时不等待 vblank（等价 Present(0)）。
-            // CAMetalDrawable: MTLDrawable 协议继承，as_ref 做协议对象上转。
+            let cmd = self.prepare_render_cmd(&drawable.texture(), source, keep, overlay)?;
             let drawable_ref: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
             #[cfg(feature = "bench-metrics")]
             if self.has_present_sink.load(Ordering::Acquire) {
@@ -777,22 +791,46 @@ impl GpuContext {
                 }
             }
             cmd.presentDrawable(drawable_ref);
-
-            // 完成回调：释放 keep（CVPixelBuffer retain + CVMetalTexture 包装）、
-            // source（MTLTexture 强引用）与 overlay（光标纹理引用）——
-            // CoreVideo 要求包装活到 GPU 用完。
-            // block 签名要求 Fn（不能 move-out 捕获值），经 Cell<Option> 零开销转移所有权。
-            let release = std::cell::Cell::new(Some((source, keep, overlay)));
-            let block: PresentDoneBlock =
-                RcBlock::new(move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                    // 完成回调恰好触发一次；take 后即释放全部引用。
-                    drop(release.take());
-                });
-            // SAFETY: block 是刚创建的合法 RcBlock，指针在调用期间有效；Metal 按
-            // ObjC 约定拷贝 handler block，随后 RcBlock 的释放不影响回调。
-            unsafe { cmd.addCompletedHandler(NonNull::from(&*block).as_ptr()) };
-
             // commit 立即返回（不等待 GPU）；present 返回后由 renderer.rs 打点（D8）。
+            cmd.commit();
+            Ok(())
+        })
+    }
+
+    /// 初始化或重建私有 GPU 离屏 BGRA8 渲染目标纹理（用于无窗口 VSync 限制的高帧率吞吐基准）。
+    pub(crate) fn ensure_offscreen_target(&mut self, size: (u32, u32)) -> Result<(), String> {
+        let w = size.0.max(1) as usize;
+        let h = size.1.max(1) as usize;
+        // SAFETY: pixel format BGRA8Unorm、非零尺寸、mipmapped=false 均为合法入参。
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                w,
+                h,
+                false,
+            )
+        };
+        desc.setUsage(MTLTextureUsage::RenderTarget);
+        desc.setStorageMode(MTLStorageMode::Private);
+        let tex = self
+            .device
+            .newTextureWithDescriptor(&desc)
+            .ok_or_else(|| "创建离屏 Metal 渲染目标纹理失败".to_string())?;
+        self.offscreen_target = Some(tex);
+        Ok(())
+    }
+
+    /// 零拷贝绘制到私有离屏 `MTLTexture` 并 commit（真实 NV12→BGRA GPU 执行，不经合成器限帧）。
+    pub(crate) fn draw_to_offscreen_target(
+        &mut self,
+        source: FrameSource,
+        keep: FrameKeepAlive,
+    ) -> Result<(), String> {
+        let Some(target) = self.offscreen_target.clone() else {
+            return Err("离屏 Metal 目标纹理未初始化".to_string());
+        };
+        autoreleasepool(|_| {
+            let cmd = self.prepare_render_cmd(&target, source, keep, None)?;
             cmd.commit();
             Ok(())
         })
@@ -888,8 +926,8 @@ mod tests {
         let gpu = GpuContext::new_offscreen((128, 128), false).expect("需要可用 Metal 设备");
         assert_eq!(
             gpu.layer_low_latency_flags(),
-            (2, true, false, true),
-            "应配置 maximumDrawableCount=2, allowsNextDrawableTimeout=true, \
+            (3, true, false, true),
+            "应配置 maximumDrawableCount=3, allowsNextDrawableTimeout=true, \
              presentsWithTransaction=false, isOpaque=true"
         );
         assert!(!gpu.display_sync_enabled());

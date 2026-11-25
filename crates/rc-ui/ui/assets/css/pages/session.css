@@ -84,6 +84,15 @@ body.is-tauri .sn-bar {
   padding-left: 78px;
 }
 
+body.is-tauri .sn-window.is-fullscreen .sn-bar {
+  padding-left: 16px;
+}
+
+body.is-tauri.has-video .sn-window.is-fullscreen,
+body.is-tauri.has-video .sn-window.is-fullscreen .sn-stage {
+  background: transparent;
+}
+
 .sn-window.is-fullscreen {
   position: fixed;
   inset: 0;

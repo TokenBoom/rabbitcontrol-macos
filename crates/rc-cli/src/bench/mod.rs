@@ -9,4 +9,6 @@ pub mod mouse;
 pub mod runner;
 pub mod stats;
 #[cfg(target_os = "macos")]
+pub mod synth;
+#[cfg(target_os = "macos")]
 pub mod system;

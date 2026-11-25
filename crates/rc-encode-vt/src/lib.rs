@@ -65,17 +65,28 @@ use rc_types::{Error, FrameKind, Result, Timestamp};
 /// 调用方在 macOS 的 `VtEncoder` 里；空壳构建同样容忍无调用者。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn caps_for(cfg: &EncoderConfig) -> EncoderCaps {
+    let profiles: &'static [u8] = match cfg.codec {
+        rc_encode::Codec::Hevc => &[1], // HEVC Main
+        rc_encode::Codec::H264 => {
+            let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
+            if pixels > 2_073_600 || cfg.fps > 60 {
+                &[100] // High Profile
+            } else {
+                &[66] // Baseline Profile
+            }
+        }
+        _ => &[],
+    };
     EncoderCaps {
         codec: cfg.codec,
         // 会话创建时显式要求硬件编码器（RequireHardwareAccelerated = true，
         // 见 ffi 模块），无硬件可用会在构造期失败而非静默落回软编。
         hardware: true,
-        // 保守声明 4K：超过它应由上层降分辨率（M9 下采样在采集侧完成）。
+        // 保守声明 4K/5K 兼容上限：超过它应由上层降分辨率。
         max_resolution: Resolution::new(4096, 4096),
         // ffi 侧重排为 Annex-B（见模块文档「输出格式」）。
         bitstream_format: BitstreamFormat::AnnexB,
-        // 与会话属性 ProfileLevel = Baseline_AutoLevel 一致（profile idc 66）。
-        profiles: &[66],
+        profiles,
     }
 }
 
@@ -138,6 +149,7 @@ impl VtEncoder {
     pub fn new(cfg: EncoderConfig) -> Result<Self> {
         validate_supported(&cfg)?;
         let session = ffi::CompressionSession::new(&ffi::SessionParams {
+            codec: cfg.codec,
             width: cfg.resolution.width,
             height: cfg.resolution.height,
             bitrate_bps: cfg.bitrate_bps,
@@ -174,16 +186,19 @@ impl VtEncoder {
             .session
             .encode(buffer.as_opaque_ptr(), true, Duration::from_millis(500))
             .map_err(|e| Error::Encoder(format!("E6 启动自检（编码一帧假数据）失败: {e}")))?;
+        let is_hevc = self.cfg.codec == rc_encode::Codec::Hevc;
         if !output.keyframe
-            || !annexb::has_parameter_sets(&output.data)
-            || annexb::nal_unit_types(&output.data).is_empty()
+            || !annexb::has_parameter_sets_for(is_hevc, &output.data)
+            || annexb::nal_unit_types_for(is_hevc, &output.data).is_empty()
         {
             return Err(Error::Encoder(format!(
-                "E6 启动自检失败：输出（{} 字节）不是带 SPS/PPS 的 Annex-B IDR",
+                "E6 启动自检失败（{:?}）：输出（{} 字节）不是带参数集的 Annex-B IDR",
+                self.cfg.codec,
                 output.data.len()
             )));
         }
-        ffi::decode_verify_annexb(
+        ffi::decode_verify_annexb_for(
+            self.cfg.codec,
             &output.data,
             self.cfg.resolution.width,
             self.cfg.resolution.height,
@@ -199,9 +214,9 @@ impl VtEncoder {
 #[cfg(target_os = "macos")]
 fn validate_supported(cfg: &EncoderConfig) -> Result<()> {
     cfg.validate()?;
-    if cfg.codec != rc_encode::Codec::H264 {
+    if !matches!(cfg.codec, rc_encode::Codec::H264 | rc_encode::Codec::Hevc) {
         return Err(Error::InvalidConfig(format!(
-            "rc-encode-vt 目前只实现 H.264（kCMVideoCodecType_H264），配置的是 {}",
+            "rc-encode-vt 支持 H.264 与 HEVC（H.265），配置的是 {}",
             cfg.codec.as_str()
         )));
     }
@@ -448,18 +463,18 @@ mod tests {
         );
     }
 
-    /// 本后端的支持范围：非 H.264 与奇数分辨率在构造期被拒（同样不碰 FFI）。
+    /// 本后端的支持范围：AV1（非 H.264/HEVC）与奇数分辨率在构造期被拒（同样不碰 FFI）。
     #[cfg(target_os = "macos")]
     #[test]
     fn new_rejects_unsupported_codec_and_odd_resolution() {
-        let hevc = VtEncoder::new(EncoderConfig {
-            codec: Codec::Hevc,
+        let av1 = VtEncoder::new(EncoderConfig {
+            codec: Codec::Av1,
             ..EncoderConfig::default()
         })
         .unwrap_err();
         assert!(
-            matches!(&hevc, Error::InvalidConfig(msg) if msg.contains("H.264")),
-            "HEVC 超出本后端支持范围，实际 {hevc:?}"
+            matches!(&av1, Error::InvalidConfig(msg) if msg.contains("av1") || msg.contains("H.264")),
+            "AV1 超出本后端支持范围，实际 {av1:?}"
         );
 
         let odd = VtEncoder::new(EncoderConfig {

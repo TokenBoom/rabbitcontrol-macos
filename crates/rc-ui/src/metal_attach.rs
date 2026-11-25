@@ -635,6 +635,10 @@ pub unsafe fn attach_layer(
         child.setOpaque(true);
         child.setZPosition(0.0);
         child.setFrame(local_bounds);
+        child.setAutoresizingMask(
+            objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable
+                | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
+        );
         (*host_layer).addSublayer(child);
 
         let subviews: *mut AnyObject = msg_send![view, subviews];

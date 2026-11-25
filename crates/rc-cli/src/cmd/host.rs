@@ -230,6 +230,7 @@ fn build_host_session(
         // 模板默认预算；expect_hello 握手时按 N2 覆盖为 1120
         //（max_media_payload(DEFAULT_SESSION_MTU)）。
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     };
     let approval_timeout_us = u64::try_from(args.approval_timeout.as_micros()).unwrap_or(u64::MAX);
     let cfg = HostSessionConfig {
@@ -902,6 +903,7 @@ mod tests {
             diff: DiffMode::TrustPlatform,
             clock_origin_us: None,
             max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         }
     }
 

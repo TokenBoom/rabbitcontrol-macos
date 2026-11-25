@@ -22,7 +22,11 @@ rc-clipboard-macos = { path = "../rc-clipboard-macos" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rc-capture-macos = { path = "../rc-capture-macos" }
-rc-decode-vt = { path = "../rc-decode-vt" }
+rc-decode-vt = { workspace = true }
 rc-encode-vt = { path = "../rc-encode-vt" }
 rc-input-macos = { path = "../rc-input-macos" }
 rc-render-macos = { path = "../rc-render-macos" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-core-foundation = "0.3"
+objc2-core-video = "0.3"

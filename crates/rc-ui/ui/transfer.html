@@ -71,6 +71,38 @@
     </section>
   </main>
 
+  <div class="tr-ctx-menu" id="tr-ctx-menu" role="menu" hidden>
+    <button type="button" class="tr-ctx-menu__item" data-ctx-action="rename" role="menuitem">重命名</button>
+    <button type="button" class="tr-ctx-menu__item" data-ctx-action="select-all" role="menuitem">全选</button>
+    <div class="tr-ctx-menu__sep" role="separator"></div>
+    <button type="button" class="tr-ctx-menu__item tr-ctx-menu__item--danger" data-ctx-action="delete" role="menuitem">删除</button>
+  </div>
+
+  <div class="tr-modal-backdrop" id="tr-rename-backdrop" hidden>
+    <div class="tr-modal" role="dialog" aria-modal="true" aria-labelledby="tr-rename-title">
+      <h2 class="tr-modal__title" id="tr-rename-title">重命名</h2>
+      <form class="tr-modal__form" id="tr-rename-form">
+        <input type="text" class="tr-modal__input" id="tr-rename-input" maxlength="255" autocomplete="off" placeholder="请输入新名称" />
+        <p class="tr-modal__error" id="tr-rename-error" hidden></p>
+        <div class="tr-modal__actions">
+          <button type="button" class="btn btn--secondary" id="tr-rename-cancel">取消</button>
+          <button type="submit" class="btn btn--primary" id="tr-rename-confirm">确定</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="tr-modal-backdrop" id="tr-delete-backdrop" hidden>
+    <div class="tr-modal" role="dialog" aria-modal="true" aria-labelledby="tr-delete-title">
+      <h2 class="tr-modal__title" id="tr-delete-title">确认删除</h2>
+      <p class="tr-modal__desc" id="tr-delete-desc"></p>
+      <div class="tr-modal__actions">
+        <button type="button" class="btn btn--secondary" id="tr-delete-cancel">取消</button>
+        <button type="button" class="btn btn--danger" id="tr-delete-confirm">删除</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="assets/js/bridge.js"></script>

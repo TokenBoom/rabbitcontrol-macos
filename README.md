@@ -2,18 +2,18 @@
 
 RabbitControl macOS 客户端与硬件适配仓库，基于 [`TokenBoom/rabbitcontrol-core`](https://github.com/TokenBoom/rabbitcontrol-core) 构建，包含全部苹果原生低延迟硬件后端、Tauri 桌面应用与前后台分离系统守护。
 
-## 仓库结构（11 crates）
+## 仓库结构（10 crates）
 
 | 分层 | Crate | 职责 |
 |---|---|---|
-| macOS 硬件与系统后端 | `rc-capture-macos`, `rc-encode-vt`, `rc-decode-vt`, `rc-render-macos`, `rc-input-macos`, `rc-audio-macos`, `rc-clipboard-macos` | ScreenCaptureKit 视频/音频、VideoToolbox 软硬一体零拷贝 H.264、Metal 零拷贝渲染、CGEventTap 输入捕获/注入、AudioQueue 播放、Carbon Pasteboard |
+| macOS 硬件与系统后端 | `rc-capture-macos`, `rc-encode-vt`, `rc-render-macos`, `rc-input-macos`, `rc-audio-macos`, `rc-clipboard-macos` | ScreenCaptureKit 视频/音频、VideoToolbox 零拷贝 H.264/HEVC 编码（解码 `rc-decode-vt` 来自 `TokenBoom/rabbitcontrol-apple-media` `tag = "v0.1.7"`）、Metal 零拷贝渲染、CGEventTap 输入捕获/注入、AudioQueue 播放、Carbon Pasteboard |
 | 被控驻留与平台总成 | `rc-host-macos`, `rc-platform-macos` | AppKit 状态栏托盘/审批窗，以及将全部 macOS 提供者统一注入 `rabbitcontrol-core` 的注册总入口 |
 | 桌面端与后台守护 | `rc-ui` (`rc-daemon`, `rc-host-agent`) | Tauri v2 桌面端（纯静态 HTML/CSS/JS）、`CAMetalLayer` 主线程桥接、TCC 权限检查向导、`LaunchDaemon` / 双会话 `LaunchAgent` |
 | 诊断命令行 | `rc-cli` | 硬件/回环探测、性能 Gate 压测与独立双端运行 |
 
 ## 本地联合调试 `rabbitcontrol-core`
 
-默认 `Cargo.toml` 从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.0"`。若本地同时修改了相邻的 `../rabbitcontrol-core`，在本地未跟踪的 `.cargo/config.toml` 中加入：
+默认 `Cargo.toml` 从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.13"`（另 `rc-decode-vt` 来自 `TokenBoom/rabbitcontrol-apple-media` `tag = "v0.1.7"`）。若本地同时修改了相邻的 `../rabbitcontrol-core`，在本地未跟踪的 `.cargo/config.toml` 中加入：
 
 ```toml
 [patch."https://github.com/TokenBoom/rabbitcontrol-core.git"]

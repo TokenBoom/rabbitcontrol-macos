@@ -136,6 +136,7 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
         clock_origin_us: None,
         // 模板默认预算；控制端不分片，此字段对 client 侧无效。
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     };
     let session_id = derive_session_id();
     let cfg = ClientSessionConfig {
@@ -600,6 +601,7 @@ mod tests {
             diff: DiffMode::TrustPlatform,
             clock_origin_us: None,
             max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         };
         let params = SessionParams {
             width: 64,

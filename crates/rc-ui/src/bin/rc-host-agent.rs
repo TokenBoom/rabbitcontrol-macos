@@ -320,7 +320,7 @@ impl AgentInner {
     }
 
     fn build_owner_verifier(&self) -> Option<Arc<dyn OwnerTicketVerifier>> {
-        if !self.is_authenticated() || !self.prefs.allow_owner_self_control {
+        if !self.is_authenticated() {
             return None;
         }
         let pubkey_hex = self
@@ -484,8 +484,8 @@ impl AgentInner {
         self.permissions = permissions::check_permissions();
         let owner_verifier = self.build_owner_verifier();
         let allow_remote_assist = self.effective_allow_remote_assist();
-        let want_host =
-            self.is_authenticated() && (allow_remote_assist || owner_verifier.is_some());
+        let _ = (owner_verifier.is_some(), allow_remote_assist);
+        let want_host = self.is_authenticated();
 
         if !want_host {
             let old = self.host.take();

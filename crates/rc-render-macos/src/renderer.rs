@@ -327,6 +327,86 @@ impl MetalRenderer {
     }
 }
 
+/// 零拷贝离屏 Metal 渲染接收端：将解码输出的 `CVPixelBuffer` 经 `CVMetalTextureCache`
+/// 采样绘制到私有离屏 `MTLTexture` 并 `commit` 到 GPU 命令队列（不走 `CAMetalLayer::nextDrawable` /
+/// 合成器 120Hz 节拍，专为高于显示刷新率（120/240/380fps）的真实 GPU 全链路吞吐测量设计）。
+pub struct MetalOffscreenSink {
+    gpu: GpuContext,
+    size: (u32, u32),
+    session_start: Instant,
+    presents: u64,
+}
+
+impl MetalOffscreenSink {
+    /// 创建离屏 GPU 渲染接收端。
+    pub fn new(size: (u32, u32), session_start: Option<Instant>) -> Result<Self> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(Error::InvalidConfig(
+                "offscreen sink: size must be non-zero".to_string(),
+            ));
+        }
+        let mut gpu = GpuContext::new_offscreen(size, false).map_err(Error::InvalidConfig)?;
+        gpu.ensure_offscreen_target(size)
+            .map_err(Error::InvalidConfig)?;
+        Ok(Self {
+            gpu,
+            size,
+            session_start: session_start.unwrap_or_else(Instant::now),
+            presents: 0,
+        })
+    }
+
+    /// 累计已提交 GPU 绘制的帧数。
+    pub fn presents(&self) -> u64 {
+        self.presents
+    }
+}
+
+impl Renderer for MetalOffscreenSink {
+    fn present(&mut self, frame: DecodedFrame) -> Result<Timestamp> {
+        let FrameTexture::CVPixelBuffer(ptr) = frame.texture else {
+            return Err(Error::InvalidFrame(format!(
+                "MetalOffscreenSink 只支持 CVPixelBuffer 零拷贝路径，收到 {:?}",
+                frame.texture
+            )));
+        };
+        if (frame.width, frame.height) != self.size && frame.width > 0 && frame.height > 0 {
+            self.resize((frame.width, frame.height))?;
+        }
+        let (source, keep) = self
+            .gpu
+            .wrap_buffer(ptr, (frame.width, frame.height))
+            .map_err(Error::InvalidFrame)?;
+        self.gpu
+            .draw_to_offscreen_target(source, keep)
+            .map_err(|msg| Error::Capture {
+                recoverable: true,
+                msg: format!("offscreen present: {msg}"),
+            })?;
+        self.presents += 1;
+        Ok(Timestamp::since(self.session_start, Instant::now()))
+    }
+
+    fn resize(&mut self, size: (u32, u32)) -> Result<()> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(Error::InvalidConfig(
+                "offscreen sink: size must be non-zero".to_string(),
+            ));
+        }
+        if size != self.size {
+            self.gpu
+                .ensure_offscreen_target(size)
+                .map_err(Error::InvalidConfig)?;
+            self.size = size;
+        }
+        Ok(())
+    }
+
+    fn set_vsync(&mut self, _on: bool) {}
+
+    fn set_cursor(&mut self, _pos: (i32, i32), _visible: bool) {}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 测试
 // ─────────────────────────────────────────────────────────────────────────────

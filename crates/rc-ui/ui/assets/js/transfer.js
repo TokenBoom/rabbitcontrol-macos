@@ -918,6 +918,24 @@
       }
       return;
     }
+    if (ev.type === 'deleteResult') {
+      if (ev.ok) {
+        toast('已删除远端项目');
+        if (panes.remote.dir) loadRemoteDir(panes.remote.dir, false);
+      } else {
+        toast('删除失败：' + String(ev.error || '未知错误'));
+      }
+      return;
+    }
+    if (ev.type === 'renameResult') {
+      if (ev.ok) {
+        toast('重命名成功');
+        if (panes.remote.dir) loadRemoteDir(panes.remote.dir, false);
+      } else {
+        toast('重命名失败：' + String(ev.error || '未知错误'));
+      }
+      return;
+    }
     if (ev.type === 'transferUpdated') {
       upsertTransfer(ev.item || ev);
     }
@@ -1235,11 +1253,285 @@
         syncSendState();
       }
     });
+
+    paneEl.addEventListener('contextmenu', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (pane.side === 'remote' && IS_TAURI && !isRemoteReady()) {
+        return;
+      }
+      var row = event.target.closest('.tr-file-row');
+      if (row) {
+        var box = row.querySelector('.checkbox');
+        if (box && !box.checked) {
+          clearPaneChecks(paneEl);
+          box.checked = true;
+          syncSendState();
+        }
+      }
+      if (typeof openPaneContextMenu === 'function') {
+        openPaneContextMenu(pane, event.clientX, event.clientY);
+      }
+    });
+  }
+
+  /* ── 文件面板自定义右键菜单（删除 / 重命名 / 全选，禁用 WKWebView 重新加载） ── */
+
+  var openPaneContextMenu = null;
+
+  function setupContextMenu() {
+    var ctxMenuEl = document.getElementById('tr-ctx-menu');
+    var renameBackdropEl = document.getElementById('tr-rename-backdrop');
+    var renameFormEl = document.getElementById('tr-rename-form');
+    var renameInputEl = document.getElementById('tr-rename-input');
+    var renameErrorEl = document.getElementById('tr-rename-error');
+    var renameCancelBtn = document.getElementById('tr-rename-cancel');
+    var deleteBackdropEl = document.getElementById('tr-delete-backdrop');
+    var deleteDescEl = document.getElementById('tr-delete-desc');
+    var deleteCancelBtn = document.getElementById('tr-delete-cancel');
+    var deleteConfirmBtn = document.getElementById('tr-delete-confirm');
+
+    var activeCtxPane = null;
+    var renameTarget = null;
+    var deleteTargets = null;
+
+    window.addEventListener(
+      'contextmenu',
+      function (event) {
+        event.preventDefault();
+      },
+      true
+    );
+
+    function closeCtxMenu() {
+      if (ctxMenuEl) ctxMenuEl.hidden = true;
+      activeCtxPane = null;
+    }
+
+    function selectedEntries(pane) {
+      if (!pane || !pane.el) return [];
+      var indices = checkedFiles(pane.el);
+      var out = [];
+      indices.forEach(function (idx) {
+        var f = pane.files[idx];
+        if (f && f.name !== '..' && f.name !== '.') {
+          out.push({ index: idx, entry: f });
+        }
+      });
+      return out;
+    }
+
+    openPaneContextMenu = function (pane, clientX, clientY) {
+      if (!ctxMenuEl || !pane) return;
+      activeCtxPane = pane;
+      var selected = selectedEntries(pane);
+      var hasFiles = Array.isArray(pane.files) && pane.files.length > 0;
+      var renameBtn = ctxMenuEl.querySelector('[data-ctx-action="rename"]');
+      var selectAllBtn = ctxMenuEl.querySelector('[data-ctx-action="select-all"]');
+      var deleteBtn = ctxMenuEl.querySelector('[data-ctx-action="delete"]');
+      if (renameBtn) renameBtn.disabled = selected.length !== 1;
+      if (selectAllBtn) selectAllBtn.disabled = !hasFiles;
+      if (deleteBtn) deleteBtn.disabled = selected.length === 0;
+
+      ctxMenuEl.hidden = false;
+      ctxMenuEl.style.left = '0px';
+      ctxMenuEl.style.top = '0px';
+      var rect = ctxMenuEl.getBoundingClientRect();
+      var left = Math.min(clientX, Math.max(8, window.innerWidth - rect.width - 8));
+      var top = Math.min(clientY, Math.max(8, window.innerHeight - rect.height - 8));
+      ctxMenuEl.style.left = Math.round(left) + 'px';
+      ctxMenuEl.style.top = Math.round(top) + 'px';
+    };
+
+    function closeRenameModal() {
+      renameTarget = null;
+      if (renameBackdropEl) renameBackdropEl.hidden = true;
+      if (renameErrorEl) {
+        renameErrorEl.textContent = '';
+        renameErrorEl.hidden = true;
+      }
+    }
+
+    function openRenameModal(pane, item) {
+      if (!renameBackdropEl || !renameInputEl) return;
+      renameTarget = { pane: pane, entry: item.entry, index: item.index };
+      renameInputEl.value = item.entry.name || '';
+      if (renameErrorEl) {
+        renameErrorEl.textContent = '';
+        renameErrorEl.hidden = true;
+      }
+      renameBackdropEl.hidden = false;
+      window.setTimeout(function () {
+        renameInputEl.focus();
+        renameInputEl.select();
+      }, 0);
+    }
+
+    function closeDeleteModal() {
+      deleteTargets = null;
+      if (deleteBackdropEl) deleteBackdropEl.hidden = true;
+    }
+
+    function openDeleteModal(pane, items) {
+      if (!deleteBackdropEl || !deleteDescEl || !items.length) return;
+      deleteTargets = { pane: pane, items: items };
+      if (items.length === 1) {
+        deleteDescEl.textContent = '确定永久删除「' + items[0].entry.name + '」吗？此操作不可撤销。';
+      } else {
+        deleteDescEl.textContent =
+          '确定永久删除选中的 ' + items.length + ' 个文件/文件夹吗？此操作不可撤销。';
+      }
+      deleteBackdropEl.hidden = false;
+    }
+
+    if (ctxMenuEl) {
+      ctxMenuEl.addEventListener('click', function (event) {
+        var btn = event.target.closest('[data-ctx-action]');
+        if (!btn || btn.disabled || !activeCtxPane) return;
+        var pane = activeCtxPane;
+        var action = btn.getAttribute('data-ctx-action');
+        closeCtxMenu();
+
+        if (action === 'select-all') {
+          Array.prototype.forEach.call(pane.el.querySelectorAll('.tr-file-row .checkbox'), function (box) {
+            box.checked = true;
+          });
+          syncSendState();
+          return;
+        }
+        var selected = selectedEntries(pane);
+        if (!selected.length) return;
+        if (action === 'rename' && selected.length === 1) {
+          openRenameModal(pane, selected[0]);
+          return;
+        }
+        if (action === 'delete') {
+          openDeleteModal(pane, selected);
+        }
+      });
+    }
+
+    if (renameCancelBtn) renameCancelBtn.addEventListener('click', closeRenameModal);
+    if (renameBackdropEl) {
+      renameBackdropEl.addEventListener('click', function (event) {
+        if (event.target === renameBackdropEl) closeRenameModal();
+      });
+    }
+    if (renameFormEl) {
+      renameFormEl.addEventListener('submit', function (event) {
+        event.preventDefault();
+        if (!renameTarget || !renameInputEl) return;
+        var nextName = renameInputEl.value.trim();
+        if (!nextName || nextName === '.' || nextName === '..' || nextName.indexOf('/') !== -1 || nextName.indexOf('\\') !== -1) {
+          if (renameErrorEl) {
+            renameErrorEl.textContent = '文件名不能为空，且不能包含斜杠或 . / ..';
+            renameErrorEl.hidden = false;
+          }
+          return;
+        }
+        var pane = renameTarget.pane;
+        var entry = renameTarget.entry;
+        var idx = renameTarget.index;
+        if (nextName === entry.name) {
+          closeRenameModal();
+          return;
+        }
+        closeRenameModal();
+        if (!IS_TAURI) {
+          if (pane.files[idx]) pane.files[idx].name = nextName;
+          renderPane(pane);
+          toast('已重命名（预览）');
+          return;
+        }
+        if (pane.side === 'local') {
+          Bridge.fileRenameLocal(entry.path, nextName).then(
+            function () {
+              toast('重命名成功');
+              loadLocalDir(pane.dir, false);
+            },
+            function (err) {
+              toast('重命名失败：' + errMessage(err));
+            }
+          );
+        } else {
+          Bridge.fileRenameRemote(entry.path, nextName).catch(function (err) {
+            toast('重命名失败：' + errMessage(err));
+          });
+        }
+      });
+    }
+
+    if (deleteCancelBtn) deleteCancelBtn.addEventListener('click', closeDeleteModal);
+    if (deleteBackdropEl) {
+      deleteBackdropEl.addEventListener('click', function (event) {
+        if (event.target === deleteBackdropEl) closeDeleteModal();
+      });
+    }
+    if (deleteConfirmBtn) {
+      deleteConfirmBtn.addEventListener('click', function () {
+        if (!deleteTargets || !deleteTargets.items.length) return;
+        var pane = deleteTargets.pane;
+        var items = deleteTargets.items;
+        closeDeleteModal();
+        clearPaneChecks(pane.el);
+        if (!IS_TAURI) {
+          var removedSet = Object.create(null);
+          items.forEach(function (it) {
+            removedSet[it.index] = true;
+          });
+          pane.files = pane.files.filter(function (_, i) {
+            return !removedSet[i];
+          });
+          renderPane(pane);
+          toast('已删除（预览）');
+          return;
+        }
+        if (pane.side === 'local') {
+          settleAll(
+            items.map(function (it) {
+              return Bridge.fileDeleteLocal(it.entry.path);
+            })
+          ).then(function (results) {
+            var errs = results
+              .filter(function (r) { return r.status === 'rejected'; })
+              .map(function (r) { return errMessage(r.reason); });
+            if (errs.length) toast('部分删除失败：' + errs[0]);
+            else toast('已删除本机项目');
+            loadLocalDir(pane.dir, false);
+          });
+        } else {
+          settleAll(
+            items.map(function (it) {
+              return Bridge.fileDeleteRemote(it.entry.path);
+            })
+          ).then(function (results) {
+            var failed = results.find(function (r) { return r.status === 'rejected'; });
+            if (failed) toast('删除请求失败：' + errMessage(failed.reason));
+          });
+        }
+      });
+    }
+
+    document.addEventListener('mousedown', function (event) {
+      if (ctxMenuEl && !ctxMenuEl.hidden && !ctxMenuEl.contains(event.target)) {
+        closeCtxMenu();
+      }
+    });
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') {
+        if (ctxMenuEl && !ctxMenuEl.hidden) closeCtxMenu();
+        if (renameBackdropEl && !renameBackdropEl.hidden) closeRenameModal();
+        if (deleteBackdropEl && !deleteBackdropEl.hidden) closeDeleteModal();
+      }
+    });
+    window.addEventListener('blur', closeCtxMenu);
+    window.addEventListener('resize', closeCtxMenu);
   }
 
   /* ── 启动 ───────────────────────────────────────────────── */
 
   function init() {
+    setupContextMenu();
     panes.local.el = document.getElementById('pane-local');
     panes.remote.el = document.getElementById('pane-remote');
 

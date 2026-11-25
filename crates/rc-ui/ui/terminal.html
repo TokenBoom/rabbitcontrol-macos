@@ -61,6 +61,7 @@
         </div>
         <div class="tm-status-bar__right" id="terminal-status-right">
           <span class="tm-timer" id="terminal-timer" role="timer" aria-live="off">00:00:00</span>
+          <button type="button" class="tm-btn" id="tm-font-btn" aria-label="设置终端字体">字体</button>
           <button type="button" class="tm-btn tm-btn--icon" id="tm-live-more" aria-label="会话操作">…</button>
           <button type="button" class="tm-btn" id="terminal-reconnect" hidden>重新连接</button>
         </div>
@@ -106,6 +107,41 @@
           <button type="submit" class="tm-btn-light tm-btn-light--primary" id="tm-rename-confirm">确定</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- 终端字体选择弹窗（本机 / 远程机器字体 + 字号） -->
+  <div class="tm-modal-backdrop" id="tm-font-backdrop" hidden>
+    <div class="tm-modal tm-font-modal" role="dialog" aria-modal="true" aria-labelledby="tm-font-title">
+      <div class="tm-font-modal__head">
+        <h2 class="tm-modal__title" id="tm-font-title">终端字体设置</h2>
+        <div class="tm-font-tabs" role="tablist" aria-label="字体来源">
+          <button type="button" class="tm-font-tab" id="tm-font-tab-local" role="tab" aria-selected="true" data-font-source="local">本机字体</button>
+          <button type="button" class="tm-font-tab" id="tm-font-tab-remote" role="tab" aria-selected="false" data-font-source="remote">远程机器字体</button>
+        </div>
+      </div>
+      <div class="tm-font-controls">
+        <input type="text" class="tm-modal__input tm-font-search" id="tm-font-search" maxlength="64" autocomplete="off" placeholder="搜索字体名称…" />
+        <label class="tm-font-mono-label">
+          <input type="checkbox" id="tm-font-mono-only" checked />
+          <span>仅等宽字体</span>
+        </label>
+        <button type="button" class="tm-btn-light" id="tm-font-refresh">刷新</button>
+      </div>
+      <div class="tm-font-list" id="tm-font-list" role="listbox" aria-label="可用字体列表"></div>
+      <div class="tm-font-size-row">
+        <label class="tm-font-size-label" for="tm-font-size">字号</label>
+        <input type="range" id="tm-font-size" min="11" max="24" step="1" value="13" />
+        <span class="tm-font-size-val" id="tm-font-size-val">13 px</span>
+      </div>
+      <div class="tm-font-preview" id="tm-font-preview">rabbit@host:~/work$ echo "0O 1lI [] {} -&gt; ~/"</div>
+      <p class="tm-font-status" id="tm-font-status"></p>
+      <div class="tm-modal__actions tm-font-actions">
+        <button type="button" class="tm-btn-light" id="tm-font-reset">恢复默认</button>
+        <span class="tm-font-spacer"></span>
+        <button type="button" class="tm-btn-light" id="tm-font-cancel">取消</button>
+        <button type="button" class="tm-btn-light tm-btn-light--primary" id="tm-font-apply">应用</button>
+      </div>
     </div>
   </div>
 

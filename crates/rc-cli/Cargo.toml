@@ -14,6 +14,7 @@ bench-metrics = [
     "dep:serde",
     "dep:serde_json",
     "dep:rc-net",
+    "dep:rc-trace",
     "dep:rc-client-core",
     "dep:rc-audio",
     "dep:rc-clipboard-macos",
@@ -22,6 +23,8 @@ bench-metrics = [
     "dep:rc-render-macos",
     "dep:objc2",
     "dep:objc2-app-kit",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-video",
     "rc-capture-macos/bench-metrics",
     "rc-render-macos/bench-metrics",
     "rc-render-macos/window-bench",
@@ -32,6 +35,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rc-net = { workspace = true, optional = true }
+rc-trace = { workspace = true, optional = true }
 rc-client-core = { workspace = true, optional = true }
 rc-audio = { workspace = true, optional = true }
 rc-clipboard-macos = { path = "../rc-clipboard-macos", optional = true }
@@ -50,10 +54,12 @@ rc-platform-macos = { path = "../rc-platform-macos" }
 [target.'cfg(target_os = "macos")'.dependencies]
 rc-capture-macos = { path = "../rc-capture-macos" }
 rc-encode-vt = { path = "../rc-encode-vt", optional = true }
-rc-decode-vt = { path = "../rc-decode-vt", optional = true }
+rc-decode-vt = { workspace = true, optional = true }
 rc-render-macos = { path = "../rc-render-macos", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", default-features = false, optional = true, features = ["std", "NSApplication"] }
+objc2-core-foundation = { version = "0.3", optional = true, features = ["CFDictionary", "CFNumber", "CFString"] }
+objc2-core-video = { version = "0.3", optional = true }
 # host --inject-mode real / client --input-mode real（CGEvent 桥，需权限）
 rc-input-macos = { path = "../rc-input-macos" }
 # host --tray（macOS 菜单栏托盘 + 连接审批弹窗；T22）

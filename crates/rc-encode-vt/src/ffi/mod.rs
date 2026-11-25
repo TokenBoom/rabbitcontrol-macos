@@ -49,7 +49,9 @@ use objc2_core_foundation::{
 use objc2_core_media::{
     kCMBlockBufferAlwaysCopyDataFlag, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
     CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets,
     CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
+    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
 };
 use objc2_core_video::CVPixelBufferCreate;
 use objc2_core_video::{
@@ -69,11 +71,8 @@ pub(crate) type OSStatus = i32;
 
 /// `QOS_CLASS_USER_INTERACTIVE`（pthread/qos.h：`0x21`）。
 const QOS_CLASS_USER_INTERACTIVE: i32 = 0x21;
-/// `QOS_CLASS_UNSPECIFIED`（pthread/qos.h：`0x00`）——只由 getter 返回，
-/// 不是 set 的合法入参，恢复时映射为语义等价的 [`QOS_CLASS_DEFAULT`]。
+/// `QOS_CLASS_UNSPECIFIED`（pthread/qos.h：`0x00`）。
 const QOS_CLASS_UNSPECIFIED: i32 = 0x00;
-/// `QOS_CLASS_DEFAULT`（pthread/qos.h：`0x15`）。
-const QOS_CLASS_DEFAULT: i32 = 0x15;
 
 /// pthread QoS C API 声明（pthread/qos.h）。
 mod qos_raw {
@@ -92,63 +91,37 @@ mod qos_raw {
     }
 }
 
-/// 把当前线程的 QoS 抬到 USER_INTERACTIVE，drop 时恢复原值（RAII）。
-///
-/// VideoToolbox C API **没有**回调队列 QoS 的设置入口：编码工作与输出回调
-/// 的调度优先级继承提交线程的 QoS（GCD 工作传播）。默认 QoS
-///（UNSPECIFIED/DEFAULT/UTILITY）在系统负载下让提交与回调排队，直接抬高
-/// 输入→输出延迟——而低延迟编码本身就是 USER_INTERACTIVE 级的工作。
-/// 抬升只覆盖一次 [`CompressionSession::encode`]（提交 → 等待 → 提取），
-/// 任何退出路径都经 Drop 恢复原值，不向调用方泄漏副作用。任何一步失败
-/// 都保持现状（QoS 不动，编码照常进行）。
-struct QosBump {
-    /// 恢复用的 `(class, priority)`；None = 无需恢复（读取/设置失败，或
-    /// 本就不低于目标——本就不动）。
-    restore: Option<(i32, i32)>,
-}
-
-impl QosBump {
-    fn new() -> Self {
+/// 每个编码线程仅抬升一次 QoS 到 `USER_INTERACTIVE`（消除每帧 3 次 pthread 系统调用开销）。
+fn promote_thread_qos_once() {
+    use std::cell::Cell;
+    thread_local! {
+        static PROMOTED: Cell<bool> = const { Cell::new(false) };
+    }
+    PROMOTED.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        flag.set(true);
         let mut class: i32 = QOS_CLASS_UNSPECIFIED;
         let mut priority: i32 = 0;
-        // SAFETY: 两个出参指向本栈帧合法内存；pthread_self 返回当前线程
-        // 句柄，getter 是同步只读调用。
+        // SAFETY: 两个出参指向本栈帧合法内存；pthread_self 返回当前线程句柄。
         let ok = unsafe {
             qos_raw::pthread_get_qos_class_np(qos_raw::pthread_self(), &mut class, &mut priority)
         };
-        if ok != 0 || class >= QOS_CLASS_USER_INTERACTIVE {
-            return Self { restore: None };
+        if ok == 0 && class >= QOS_CLASS_USER_INTERACTIVE {
+            return;
         }
         // SAFETY: 只作用于当前线程；USER_INTERACTIVE 与 priority 0 是合法入参。
-        let ok = unsafe { qos_raw::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
-        if ok != 0 {
-            return Self { restore: None };
+        unsafe {
+            qos_raw::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         }
-        Self {
-            restore: Some((class, priority)),
-        }
-    }
-}
-
-impl Drop for QosBump {
-    fn drop(&mut self) {
-        let Some((class, priority)) = self.restore else {
-            return;
-        };
-        // UNSPECIFIED 是 getter 专属值，不能回设，映射为语义等价的 DEFAULT。
-        let class = if class == QOS_CLASS_UNSPECIFIED {
-            QOS_CLASS_DEFAULT
-        } else {
-            class
-        };
-        // SAFETY: 只作用于当前线程；class 来自本线程 getter 的原值（或
-        // DEFAULT），priority 同理，均为合法入参。
-        unsafe { qos_raw::pthread_set_qos_class_self_np(class, priority) };
-    }
+    });
 }
 
 /// `kCMVideoCodecType_H264`（'avc1'，CMFormatDescription.h）。FourCharCode = u32。
 const K_CM_VIDEO_CODEC_TYPE_H264: u32 = 0x61766331;
+/// `kCMVideoCodecType_HEVC`（'hvc1'，CMFormatDescription.h）。FourCharCode = u32。
+const K_CM_VIDEO_CODEC_TYPE_HEVC: u32 = 0x68766331;
 
 /// `kVTEncodeInfo_FrameDropped`（VTErrors.h：`1UL << 1`）。
 const K_VTENCODE_INFO_FRAME_DROPPED: u32 = 1 << 1;
@@ -220,6 +193,8 @@ mod raw {
         pub static kVTCompressionPropertyKey_RealTime: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_ProfileLevel: Option<&'static CFString>;
         pub static kVTProfileLevel_H264_Baseline_AutoLevel: Option<&'static CFString>;
+        pub static kVTProfileLevel_H264_High_AutoLevel: Option<&'static CFString>;
+        pub static kVTProfileLevel_HEVC_Main_AutoLevel: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_AllowFrameReordering: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: Option<&'static CFString>;
@@ -302,6 +277,10 @@ enum VtKey {
     ProfileLevel,
     /// H.264 Baseline AutoLevel 档位值。
     ProfileLevelH264BaselineAutoLevel,
+    /// H.264 High AutoLevel 档位值。
+    ProfileLevelH264HighAutoLevel,
+    /// HEVC Main AutoLevel 档位值。
+    ProfileLevelHevcMainAutoLevel,
     /// AllowFrameReordering（E1）。
     AllowFrameReordering,
     /// MaxKeyFrameInterval（无限 GOP）。
@@ -329,6 +308,8 @@ impl VtKey {
             VtKey::RealTime => "kVTCompressionPropertyKey_RealTime",
             VtKey::ProfileLevel => "kVTCompressionPropertyKey_ProfileLevel",
             VtKey::ProfileLevelH264BaselineAutoLevel => "kVTProfileLevel_H264_Baseline_AutoLevel",
+            VtKey::ProfileLevelH264HighAutoLevel => "kVTProfileLevel_H264_High_AutoLevel",
+            VtKey::ProfileLevelHevcMainAutoLevel => "kVTProfileLevel_HEVC_Main_AutoLevel",
             VtKey::AllowFrameReordering => "kVTCompressionPropertyKey_AllowFrameReordering",
             VtKey::MaxKeyFrameInterval => "kVTCompressionPropertyKey_MaxKeyFrameInterval",
             VtKey::MaxKeyFrameIntervalDuration => {
@@ -358,6 +339,8 @@ impl VtKey {
                 VtKey::ProfileLevelH264BaselineAutoLevel => {
                     raw::kVTProfileLevel_H264_Baseline_AutoLevel
                 }
+                VtKey::ProfileLevelH264HighAutoLevel => raw::kVTProfileLevel_H264_High_AutoLevel,
+                VtKey::ProfileLevelHevcMainAutoLevel => raw::kVTProfileLevel_HEVC_Main_AutoLevel,
                 VtKey::AllowFrameReordering => raw::kVTCompressionPropertyKey_AllowFrameReordering,
                 VtKey::MaxKeyFrameInterval => raw::kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 VtKey::MaxKeyFrameIntervalDuration => {
@@ -549,8 +532,8 @@ pub(crate) fn pixel_buffer_info(ptr: *mut c_void) -> (u32, u32, u32) {
     )
 }
 
-/// 2-deep 异步流水线编码最大在途帧数（铁律 1）。
-const MAX_PIPELINED_IN_FLIGHT: usize = 2;
+/// 高帧率流水线编码最大在途帧数（60fps 以下兼容，120/240/380fps 充分利用双媒体引擎并行）。
+const MAX_PIPELINED_IN_FLIGHT: usize = 4;
 
 /// 异步流水线单帧提交元数据：保活 SCK `resource_guard` 直到回调输出提取/丢弃。
 struct InFlightMeta {
@@ -589,6 +572,8 @@ pub(crate) struct CompressionSession {
     frame_index: u64,
     /// PTS timescale = fps * 1000，帧间隔恰为 1/fps 秒。
     timescale: i32,
+    /// 当前会话是否为 HEVC 编码。
+    is_hevc: bool,
     /// 非连续 `CMBlockBuffer` 时的可复用提取暂存区（常规连续缓冲走零拷贝切片）。
     extract_scratch: Vec<u8>,
 }
@@ -631,6 +616,7 @@ pub(crate) fn vt_keyframe_interval_params(gop_len: u32) -> VtKeyframeInterval {
 
 /// 构造参数（lib.rs 从 EncoderConfig 映射而来）。
 pub(crate) struct SessionParams {
+    pub codec: rc_encode::Codec,
     pub width: u32,
     pub height: u32,
     pub bitrate_bps: u32,
@@ -674,12 +660,20 @@ impl CompressionSession {
         // SAFETY: 出参 session_out 合法；encoder_spec 指向栈上存活的
         // CFDictionary（Create 同步读取）；其余可空参数传 null = 系统默认；
         // refcon 指向 shared 的稳定堆分配。
+        let is_hevc = params.codec == rc_encode::Codec::Hevc;
+        let codec_type = if is_hevc {
+            K_CM_VIDEO_CODEC_TYPE_HEVC
+        } else {
+            K_CM_VIDEO_CODEC_TYPE_H264
+        };
+        // SAFETY: `encoder_spec` 指向本栈上存活的 CFDictionary，`shared` 堆地址由 Arc 保活，
+        // `session_out` 为本栈帧合法出参。
         let status = unsafe {
             raw::VTCompressionSessionCreate(
                 std::ptr::null(),
                 params.width as i32,
                 params.height as i32,
-                K_CM_VIDEO_CODEC_TYPE_H264,
+                codec_type,
                 &*encoder_spec as *const CFDictionary as *const c_void,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -690,8 +684,8 @@ impl CompressionSession {
         };
         if status != 0 {
             return Err(format!(
-                "VTCompressionSessionCreate({}x{}) 失败: OSStatus {status}",
-                params.width, params.height
+                "VTCompressionSessionCreate({:?} {}x{}) 失败: OSStatus {status}",
+                params.codec, params.width, params.height
             ));
         }
         let session = NonNull::new(session_out)
@@ -705,6 +699,7 @@ impl CompressionSession {
             shared,
             frame_index: 0,
             timescale,
+            is_hevc,
             extract_scratch: Vec::new(),
         };
 
@@ -756,9 +751,16 @@ impl CompressionSession {
             CFNumber::new_i32(params.fps as i32),
             "",
         )?;
-        // Baseline（CAVLC）：与 caps 声明的 profiles=[66] 一致，兼容性最好。
-        let baseline = VtKey::ProfileLevelH264BaselineAutoLevel.get()?;
-        s.set_value(VtKey::ProfileLevel, baseline, " (Baseline_AutoLevel)")?;
+        let profile_key = if is_hevc {
+            VtKey::ProfileLevelHevcMainAutoLevel
+        } else if u64::from(params.width) * u64::from(params.height) > 2_073_600 || params.fps > 60
+        {
+            VtKey::ProfileLevelH264HighAutoLevel
+        } else {
+            VtKey::ProfileLevelH264BaselineAutoLevel
+        };
+        let profile = profile_key.get()?;
+        s.set_value(VtKey::ProfileLevel, profile, " (ProfileLevel)")?;
 
         // 预设微调（速度优先）：不是延迟红线（RealTime 已经保证延迟），
         // 个别编码器可能不支持（头文件标注 Optional），失败容忍。
@@ -864,9 +866,7 @@ impl CompressionSession {
         force_idr: bool,
         wait: Duration,
     ) -> Result<EncodedOutput, EncodeError> {
-        // 编码提交/等待/提取按 USER_INTERACTIVE 调度（回调队列 QoS 继承
-        // 提交线程，见 QosBump 文档）；guard 在任何退出路径恢复原值。
-        let _qos = QosBump::new();
+        promote_thread_qos_once();
         // 清空上一帧的迟到输出（超时丢弃策略：迟到帧弃用，调用方已请求 IDR 恢复）。
         {
             let mut guard = lock(&self.shared.state);
@@ -980,7 +980,7 @@ impl CompressionSession {
                 "pipelined in_flight limit ({MAX_PIPELINED_IN_FLIGHT}) reached"
             )));
         }
-        let _qos = QosBump::new();
+        promote_thread_qos_once();
         let frame_props = if force_idr {
             Some(force_keyframe_dictionary()?)
         } else {
@@ -1043,7 +1043,7 @@ impl CompressionSession {
         if self.in_flight.is_empty() {
             return None;
         }
-        let _qos = QosBump::new();
+        promote_thread_qos_once();
         let deadline = if timeout.is_zero() {
             None
         } else {
@@ -1185,21 +1185,34 @@ impl CompressionSession {
             let mut nal_header_len: c_int = 0;
             // SAFETY: 全部出参指向本栈帧合法内存，`desc` 在此调用期间存活。
             let status = unsafe {
-                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                    desc,
-                    0,
-                    std::ptr::addr_of_mut!(ptr),
-                    std::ptr::addr_of_mut!(size),
-                    std::ptr::addr_of_mut!(count_out),
-                    std::ptr::addr_of_mut!(nal_header_len),
-                )
+                if self.is_hevc {
+                    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                        desc,
+                        0,
+                        std::ptr::addr_of_mut!(ptr),
+                        std::ptr::addr_of_mut!(size),
+                        std::ptr::addr_of_mut!(count_out),
+                        std::ptr::addr_of_mut!(nal_header_len),
+                    )
+                } else {
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        desc,
+                        0,
+                        std::ptr::addr_of_mut!(ptr),
+                        std::ptr::addr_of_mut!(size),
+                        std::ptr::addr_of_mut!(count_out),
+                        std::ptr::addr_of_mut!(nal_header_len),
+                    )
+                }
             };
             if status == 0 && nal_header_len > 0 {
                 length_size = nal_header_len as usize;
             }
         }
 
-        if let Some((keyframe, body_len)) = annexb::inspect_avcc(raw_bytes, length_size) {
+        if let Some((keyframe, body_len)) =
+            annexb::inspect_avcc_for(self.is_hevc, raw_bytes, length_size)
+        {
             let mut ps_slices: [&[u8]; 16] = [&[]; 16];
             let mut ps_count = 0usize;
             if keyframe {
@@ -1213,14 +1226,25 @@ impl CompressionSession {
                         // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在整个循环与随后的
                         // `write_avcc_as_annexb` 调用期间保持存活，参数集指针只读有效。
                         let status = unsafe {
-                            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                                desc,
-                                index,
-                                std::ptr::addr_of_mut!(ptr),
-                                std::ptr::addr_of_mut!(size),
-                                std::ptr::addr_of_mut!(count_out),
-                                std::ptr::addr_of_mut!(nal_header_len),
-                            )
+                            if self.is_hevc {
+                                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                                    desc,
+                                    index,
+                                    std::ptr::addr_of_mut!(ptr),
+                                    std::ptr::addr_of_mut!(size),
+                                    std::ptr::addr_of_mut!(count_out),
+                                    std::ptr::addr_of_mut!(nal_header_len),
+                                )
+                            } else {
+                                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                                    desc,
+                                    index,
+                                    std::ptr::addr_of_mut!(ptr),
+                                    std::ptr::addr_of_mut!(size),
+                                    std::ptr::addr_of_mut!(count_out),
+                                    std::ptr::addr_of_mut!(nal_header_len),
+                                )
+                            }
                         };
                         if status != 0 {
                             break;
@@ -1252,7 +1276,7 @@ impl CompressionSession {
         // 防御性回退：若输入本身已是 Annex-B 形态，走原有规整与参数集检测逻辑。
         let (data, _source) = annexb::normalize_to_annexb(raw_bytes, length_size)
             .ok_or_else(|| EncodeError::Failed("输出码流既非合法 AVCC 也非 Annex-B".to_string()))?;
-        let keyframe = annexb::is_idr(&data);
+        let keyframe = annexb::is_idr_for(self.is_hevc, &data);
         Ok(EncodedOutput { data, keyframe })
     }
 }
@@ -1470,20 +1494,32 @@ impl Drop for DecodeSessionGuard {
 /// 步骤：提取 SPS/PPS 建 `CMVideoFormatDescription` → Annex-B 重排回
 /// AVCC → `CMBlockBuffer` → `CMSampleBuffer` → 解码 + 有界等待回调 →
 /// 校验输出尺寸。
-pub(crate) fn decode_verify_annexb(
+pub(crate) fn decode_verify_annexb_for(
+    codec: rc_encode::Codec,
     data: &[u8],
     expected_width: u32,
     expected_height: u32,
     wait: Duration,
 ) -> Result<(), String> {
-    // 1. 提取参数集（SPS=7 / PPS=8），建格式描述。
-    let parameter_sets: Vec<&[u8]> = annexb::nal_payloads(data)
+    let is_hevc = codec == rc_encode::Codec::Hevc;
+    // 1. 提取参数集，建格式描述。
+    let parameter_sets: Vec<&[u8]> = annexb::nal_payloads_for(is_hevc, data)
         .into_iter()
-        .filter(|(kind, _)| *kind == 7 || *kind == 8)
+        .filter(|(kind, _)| {
+            if is_hevc {
+                matches!(*kind, 32..=34)
+            } else {
+                *kind == 7 || *kind == 8
+            }
+        })
         .map(|(_, payload)| payload)
         .collect();
     if parameter_sets.is_empty() {
-        return Err("自检码流里找不到 SPS/PPS（nal_unit_type 7/8）".to_string());
+        return Err(if is_hevc {
+            "自检码流里找不到 HEVC VPS/SPS/PPS（nal_unit_type 32/33/34）".to_string()
+        } else {
+            "自检码流里找不到 SPS/PPS（nal_unit_type 7/8）".to_string()
+        });
     }
     let mut pointers: Vec<NonNull<u8>> = parameter_sets
         .iter()
@@ -1493,20 +1529,32 @@ pub(crate) fn decode_verify_annexb(
     let mut desc_out: *const CMFormatDescription = std::ptr::null();
     // SAFETY: pointers/sizes 指向栈上 Vec（调用期间存活），参数集切片由
     // parameter_sets 保活；desc_out 是本栈帧的合法出参。nal 头长度 4 =
-    // 我们生成的 AVCC 长度前缀宽度，两者必须一致。
+    // 我们生成的 AVCC/HVCC 长度前缀宽度，两者必须一致。
     let status = unsafe {
-        CMVideoFormatDescriptionCreateFromH264ParameterSets(
-            None,
-            pointers.len(),
-            NonNull::from(pointers.as_mut_slice()).cast(),
-            NonNull::from(sizes.as_slice()).cast(),
-            4,
-            NonNull::from(&mut desc_out),
-        )
+        if is_hevc {
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                None,
+                pointers.len(),
+                NonNull::from(pointers.as_mut_slice()).cast(),
+                NonNull::from(sizes.as_slice()).cast(),
+                4,
+                None,
+                NonNull::from(&mut desc_out),
+            )
+        } else {
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                None,
+                pointers.len(),
+                NonNull::from(pointers.as_mut_slice()).cast(),
+                NonNull::from(sizes.as_slice()).cast(),
+                4,
+                NonNull::from(&mut desc_out),
+            )
+        }
     };
     if status != 0 {
         return Err(format!(
-            "CMVideoFormatDescriptionCreateFromH264ParameterSets 失败: OSStatus {status}"
+            "CMVideoFormatDescriptionCreateFromParameterSets({codec:?}) 失败: OSStatus {status}"
         ));
     }
     // SAFETY: Create 成功（status==0）时 desc_out 是 +1 所有权引用

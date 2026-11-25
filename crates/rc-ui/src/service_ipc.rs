@@ -424,7 +424,7 @@ mod imp {
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(25));
+                                thread::sleep(Duration::from_millis(4));
                             }
                             Err(_) => {
                                 thread::sleep(Duration::from_millis(50));

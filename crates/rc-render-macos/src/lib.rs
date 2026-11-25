@@ -65,7 +65,7 @@ mod shader;
 #[cfg(all(target_os = "macos", feature = "bench-metrics"))]
 pub use ffi::{PresentTimingSample, PresentTimingSink};
 #[cfg(target_os = "macos")]
-pub use renderer::{MetalRenderer, MetalRendererConfig};
+pub use renderer::{MetalOffscreenSink, MetalRenderer, MetalRendererConfig};
 
 /// 读取与 ScreenCaptureKit PTS / `MTLDrawable::presentedTime()` 同域的单调时钟（微秒，仅 `bench-metrics`）。
 #[cfg(all(target_os = "macos", feature = "bench-metrics"))]

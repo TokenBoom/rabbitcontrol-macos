@@ -554,20 +554,43 @@ pub(crate) fn close_session_and_tool_windows(app: &AppHandle) {
     });
 }
 
-/// IPC 命令：断开当前远控会话、销毁 S1 窗口并将焦点交回主窗口（解决 WKWebView `window.close()` 不生效问题）。
+/// 在主线程异步销毁仍属于 `expected_epoch` 且当前无活动会话的 S1 窗口，并将焦点交回主窗口（避免同步 IPC 回调自销毁死锁或早期连接失败残留空白窗口）。
+pub(crate) fn destroy_session_window_if_epoch(app: &AppHandle, expected_epoch: u64) {
+    let st = app.state::<AppState>();
+    st.programmatic_close_epoch
+        .store(expected_epoch, std::sync::atomic::Ordering::Release);
+    let app_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let st = app_main.state::<AppState>();
+        let still_same_epoch = st
+            .session_open_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            == expected_epoch;
+        let has_session = st
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if still_same_epoch && !has_session {
+            if let Some(win) = app_main.get_webview_window(ToolWindow::Session.label()) {
+                let _ = win.destroy();
+            }
+            if let Some(main_win) = app_main.get_webview_window("main") {
+                let _ = main_win.unminimize();
+                let _ = main_win.show();
+                let _ = main_win.set_focus();
+            }
+        }
+    });
+}
+
+/// IPC 命令：断开当前远控会话、异步在主线程销毁 S1 窗口并将焦点交回主窗口（避免在同步 IPC 回调中自销毁 WKWebView 触发死锁）。
 #[allow(dead_code)]
 #[tauri::command]
 pub fn close_session_window(lock_remote: Option<bool>, app: AppHandle) -> Result<(), String> {
     app.state::<AppState>().require_authenticated()?;
-    crate::commands::disconnect_active_session_with_lock(&app, lock_remote);
-    if let Some(win) = app.get_webview_window(ToolWindow::Session.label()) {
-        let _ = win.destroy();
-    }
-    if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.unminimize();
-        let _ = main_win.show();
-        let _ = main_win.set_focus();
-    }
+    let close_epoch = crate::commands::disconnect_active_session_with_lock(&app, lock_remote);
+    destroy_session_window_if_epoch(&app, close_epoch);
     Ok(())
 }
 
@@ -585,6 +608,48 @@ pub fn fit_session_window(app: AppHandle, state: State<'_, AppState>) -> Result<
     };
     fit_session_window_to_video(&app, vw, vh, true)?;
     Ok(())
+}
+
+/// 查询 S1 会话窗口当前是否处于 macOS 原生全屏状态。
+#[allow(dead_code)]
+#[tauri::command]
+pub fn is_session_fullscreen(app: AppHandle) -> Result<bool, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let Some(win) = app.get_webview_window(ToolWindow::Session.label()) else {
+        return Ok(false);
+    };
+    win.is_fullscreen()
+        .map_err(|e| format!("查询会话窗口全屏状态失败: {e}"))
+}
+
+/// 设置 S1 会话窗口原生全屏状态（保持同一 NSWindow 与 sibling CAMetalLayer 可见）。
+#[allow(dead_code)]
+#[tauri::command]
+pub fn set_session_fullscreen(fullscreen: bool, app: AppHandle) -> Result<bool, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let Some(win) = app.get_webview_window(ToolWindow::Session.label()) else {
+        return Err("会话窗口未打开".to_string());
+    };
+    win.set_fullscreen(fullscreen)
+        .map_err(|e| format!("切换会话窗口全屏失败: {e}"))?;
+    Ok(fullscreen)
+}
+
+/// 切换 S1 会话窗口原生全屏状态并返回切换后的目标状态。
+#[allow(dead_code)]
+#[tauri::command]
+pub fn toggle_session_fullscreen(app: AppHandle) -> Result<bool, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let Some(win) = app.get_webview_window(ToolWindow::Session.label()) else {
+        return Err("会话窗口未打开".to_string());
+    };
+    let current = win
+        .is_fullscreen()
+        .map_err(|e| format!("查询会话窗口全屏状态失败: {e}"))?;
+    let next = !current;
+    win.set_fullscreen(next)
+        .map_err(|e| format!("切换会话窗口全屏失败: {e}"))?;
+    Ok(next)
 }
 
 #[cfg(test)]
