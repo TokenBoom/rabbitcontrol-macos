@@ -373,6 +373,18 @@
       <span>30 帧</span>
     </button>
     <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
+    <div class="sn-submenu__title">视频编码器</div>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-group="codec" data-value="hevc" id="opt-codec-hevc" aria-checked="true">
+      <span class="sn-check"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span class="sn-res-label">HEVC (H.265)</span>
+      <span class="sn-res-badge">高刷推荐</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-group="codec" data-value="h264" id="opt-codec-h264" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span class="sn-res-label">H.264 (兼容)</span>
+    </button>
+    <p class="sn-submenu__hint sn-submenu__hint--warn" id="quality-advisory-hint" hidden></p>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
     <div class="sn-submenu__row">
       <span>使用安全中转连接</span>
       <label class="sn-switch">
@@ -387,6 +399,7 @@
   <section class="sn-popover sn-submenu sn-submenu--res" id="screen-menu" role="menu"
            aria-label="显示屏分辨率" hidden>
     <div class="sn-res-list" id="screen-main-res-list"></div>
+    <p class="sn-submenu__hint sn-submenu__hint--warn" id="screen-advisory-hint" hidden></p>
   </section>
 
   <!-- ── S3 其他分辨率二级悬浮菜单 ── -->
@@ -472,6 +485,7 @@
   <section class="sn-popover sn-submenu sn-submenu--res" id="screen-res-menu" role="menu"
            aria-label="切换分辨率" hidden>
     <div class="sn-res-list" id="screen-res-list"></div>
+    <p class="sn-submenu__hint sn-submenu__hint--warn" id="screen-res-advisory-hint" hidden></p>
     <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
     <button type="button" class="sn-submenu__item" role="menuitem" id="btn-tab-fit-window">
       <svg class="sn-ico" width="16" height="16" aria-hidden="true"><use href="#i-app-window" /></svg>

@@ -5414,6 +5414,24 @@ mod tests {
         let g: SessionCommandArg =
             serde_json::from_str(r#"{"type":null,"kind":"set_audio_muted","muted":true}"#).unwrap();
         assert_eq!(g.0, SessionCommand::SetAudioMuted { muted: true });
+
+        let h: SessionCommandArg =
+            serde_json::from_str(r#"{"type":"set_codec","codec":"hevc"}"#).unwrap();
+        assert_eq!(
+            h.0,
+            SessionCommand::SetCodec {
+                codec: rc_ui::display_ctrl::StreamCodec::Hevc
+            }
+        );
+
+        let i: SessionCommandArg =
+            serde_json::from_str(r#"{"kind":"set_codec","codec":"h264"}"#).unwrap();
+        assert_eq!(
+            i.0,
+            SessionCommand::SetCodec {
+                codec: rc_ui::display_ctrl::StreamCodec::H264
+            }
+        );
     }
 
     #[test]

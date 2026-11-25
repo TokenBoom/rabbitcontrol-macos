@@ -152,6 +152,11 @@
     var screenMoreResListEl = document.getElementById('screen-more-res-list');
     var qualityEl = document.getElementById('quality-menu');
     var qualityItem = document.getElementById('menu-quality');
+    var codecHevcBtn = document.getElementById('opt-codec-hevc');
+    var codecH264Btn = document.getElementById('opt-codec-h264');
+    var qualityAdvisoryHintEl = document.getElementById('quality-advisory-hint');
+    var screenAdvisoryHintEl = document.getElementById('screen-advisory-hint');
+    var screenResAdvisoryHintEl = document.getElementById('screen-res-advisory-hint');
     var windowEl = document.getElementById('window-menu');
     var windowItem = document.getElementById('menu-window');
     var soundEl = document.getElementById('sound-menu');
@@ -433,17 +438,23 @@
             : '-- ms frm.';
         hudRows[6].textContent =
           (isFinite(snap.loss_pct) ? snap.loss_pct.toFixed(1) : '0.0') + '% loss';
-        if (snap.resolution) hudRows[7].textContent = String(snap.resolution);
+        if (snap.resolution) hudRows[7].textContent = formatHudResolution(String(snap.resolution));
       }
     }
 
-    /* ── 流参数与分辨率预设状态（Item #4 / #5）──────────────────── */
+    /* ── 流参数与分辨率预设状态（Item #4 / #5 + 高刷甜点/HEVC 引导）── */
     var SVG_NS = 'http://www.w3.org/2000/svg';
+    var HIGH_REFRESH_FPS_THRESHOLD = 90;
+    var HEVC_HIGH_REFRESH_MAX_PIXEL_RATE = 600000000;
+    var H264_HIGH_REFRESH_MAX_PIXEL_RATE = 280000000;
     var DEFAULT_MOCK_PRESETS = [
-      { width: 1512, height: 982, label: '1512 × 982', is_native: true },
-      { width: 1386, height: 900, label: '1386 × 900', is_native: false },
-      { width: 1110, height: 720, label: '1110 × 720', is_native: false },
-      { width: 832, height: 540, label: '832 × 540', is_native: false }
+      { width: 3024, height: 1964, label: '3024 × 1964', is_native: false, is_hidpi: false },
+      { width: 2560, height: 1600, label: '2560 × 1600', is_native: false, is_hidpi: false },
+      { width: 1920, height: 1200, label: '1920 × 1200', is_native: false, is_hidpi: false },
+      { width: 1512, height: 982, label: '1512 × 982 (HiDPI)', is_native: true, is_hidpi: true },
+      { width: 1386, height: 900, label: '1386 × 900', is_native: false, is_hidpi: false },
+      { width: 1110, height: 720, label: '1110 × 720', is_native: false, is_hidpi: false },
+      { width: 832, height: 540, label: '832 × 540', is_native: false, is_hidpi: false }
     ];
     var streamState = {
       width: IS_TAURI ? 0 : 1512,
@@ -452,9 +463,333 @@
       nativeWidth: IS_TAURI ? 0 : 1512,
       nativeHeight: IS_TAURI ? 0 : 982,
       maxFps: 144,
+      codec: IS_TAURI ? '' : 'hevc',
+      supportedCodecs: IS_TAURI ? [] : ['hevc', 'h264'],
+      clientSupportsHevc: !IS_TAURI,
+      advisory: null,
       hasServerPresets: false,
       presets: DEFAULT_MOCK_PRESETS.slice()
     };
+    var pendingUserCodecTarget = null;
+    var userPinnedCodec = null;
+
+    function normalizeCodec(raw) {
+      if (typeof raw !== 'string') return '';
+      var s = raw.trim().toLowerCase();
+      if (s === 'hevc' || s === 'h265') return 'hevc';
+      if (s === 'h264' || s === 'avc') return 'h264';
+      return '';
+    }
+
+    function effectiveCodec() {
+      return normalizeCodec(streamState.codec) || 'h264';
+    }
+
+    function hostSupportsHevc() {
+      if (normalizeCodec(streamState.codec) === 'hevc') return true;
+      return (
+        Array.isArray(streamState.supportedCodecs) &&
+        streamState.supportedCodecs.some(function (c) {
+          return normalizeCodec(c) === 'hevc';
+        })
+      );
+    }
+
+    function canUseHevc() {
+      return hostSupportsHevc() && Boolean(streamState.clientSupportsHevc);
+    }
+
+    function codecMaxPixelRate(codec) {
+      return normalizeCodec(codec) === 'hevc'
+        ? HEVC_HIGH_REFRESH_MAX_PIXEL_RATE
+        : H264_HIGH_REFRESH_MAX_PIXEL_RATE;
+    }
+
+    function isWithinHighRefreshSweetSpot(w, h, fps, codec) {
+      var wn = Number(w) || 0;
+      var hn = Number(h) || 0;
+      var fn = Number(fps) || 0;
+      if (fn < HIGH_REFRESH_FPS_THRESHOLD || wn <= 0 || hn <= 0) return true;
+      return wn * hn * fn <= codecMaxPixelRate(codec);
+    }
+
+    function selectRecommendedPreset(presets, fps, codec) {
+      if (!Array.isArray(presets) || !presets.length) return null;
+      var best = null;
+      var bestPixels = -1;
+      var minPreset = null;
+      var minPixels = Infinity;
+      presets.forEach(function (p) {
+        var pw = Number(p && p.width) || 0;
+        var ph = Number(p && p.height) || 0;
+        if (pw <= 0 || ph <= 0) return;
+        var px = pw * ph;
+        var pNative = p.is_native ? 1 : 0;
+        var pHidpi = p.is_hidpi ? 1 : 0;
+        if (
+          !minPreset ||
+          px < minPixels ||
+          (px === minPixels &&
+            (pNative > (minPreset.is_native ? 1 : 0) ||
+              (pNative === (minPreset.is_native ? 1 : 0) &&
+                pHidpi > (minPreset.is_hidpi ? 1 : 0))))
+        ) {
+          minPreset = p;
+          minPixels = px;
+        }
+        if (!isWithinHighRefreshSweetSpot(pw, ph, fps, codec)) return;
+        var bNative = best && best.is_native ? 1 : 0;
+        var bHidpi = best && best.is_hidpi ? 1 : 0;
+        if (
+          !best ||
+          px > bestPixels ||
+          (px === bestPixels &&
+            (pNative > bNative || (pNative === bNative && pHidpi >= bHidpi)))
+        ) {
+          best = p;
+          bestPixels = px;
+        }
+      });
+      if (best) return { width: Number(best.width), height: Number(best.height) };
+      if (minPreset) return { width: Number(minPreset.width), height: Number(minPreset.height) };
+      return null;
+    }
+
+    function evaluateHighRefreshAdvisoryLocal(w, h, fps, codec) {
+      var wn = Number(w) || 0;
+      var hn = Number(h) || 0;
+      var fn = Number(fps) || 0;
+      var c = normalizeCodec(codec) || 'h264';
+      if (fn < HIGH_REFRESH_FPS_THRESHOLD || wn <= 0 || hn <= 0) {
+        return { level: 'optimal', reason: 'optimal', can_enable_hevc: false };
+      }
+      var rate = wn * hn * fn;
+      var presets = Array.isArray(streamState.presets) ? streamState.presets : [];
+      if (c === 'hevc') {
+        if (rate <= HEVC_HIGH_REFRESH_MAX_PIXEL_RATE) {
+          return { level: 'optimal', reason: 'optimal', can_enable_hevc: false };
+        }
+        var recHevc = selectRecommendedPreset(presets, fn, 'hevc');
+        return {
+          level: 'above_sweet_spot',
+          reason: 'hevc_over_budget',
+          can_enable_hevc: false,
+          recommended_width: recHevc ? recHevc.width : null,
+          recommended_height: recHevc ? recHevc.height : null
+        };
+      }
+      if (rate <= H264_HIGH_REFRESH_MAX_PIXEL_RATE) {
+        return { level: 'optimal', reason: 'optimal', can_enable_hevc: false };
+      }
+      if (canUseHevc()) {
+        var recUp = selectRecommendedPreset(presets, fn, 'hevc');
+        return {
+          level: rate <= HEVC_HIGH_REFRESH_MAX_PIXEL_RATE ? 'suggest_hevc' : 'above_sweet_spot',
+          reason: 'h264_suggest_hevc',
+          can_enable_hevc: true,
+          recommended_width: recUp ? recUp.width : null,
+          recommended_height: recUp ? recUp.height : null
+        };
+      }
+      var recH264 = selectRecommendedPreset(presets, fn, 'h264');
+      return {
+        level: 'above_sweet_spot',
+        reason: 'h264_no_hevc',
+        can_enable_hevc: false,
+        recommended_width: recH264 ? recH264.width : null,
+        recommended_height: recH264 ? recH264.height : null
+      };
+    }
+
+    function formatRecommendedTarget(adv) {
+      var rw = adv && Number(adv.recommended_width);
+      var rh = adv && Number(adv.recommended_height);
+      var targetCodec = adv && adv.can_enable_hevc ? 'hevc' : effectiveCodec();
+      var nativeInSweetSpot =
+        streamState.nativeWidth > 0 &&
+        streamState.nativeHeight > 0 &&
+        isWithinHighRefreshSweetSpot(
+          streamState.nativeWidth,
+          streamState.nativeHeight,
+          streamState.fps,
+          targetCodec
+        );
+      if (isFinite(rw) && rw > 0 && isFinite(rh) && rh > 0) {
+        if (
+          streamState.nativeWidth > 0 &&
+          Math.abs(rw - streamState.nativeWidth) <= 2 &&
+          Math.abs(rh - streamState.nativeHeight) <= 2
+        ) {
+          return '原生 ' + rw + '×' + rh;
+        }
+        return nativeInSweetSpot ? rw + '×' + rh + ' 或原生分辨率' : rw + '×' + rh;
+      }
+      if (nativeInSweetSpot) {
+        return '原生 ' + streamState.nativeWidth + '×' + streamState.nativeHeight;
+      }
+      return '较低分辨率';
+    }
+
+    function formatHudResolution(resText) {
+      var clean = String(resText || '').trim();
+      if (!clean) return '';
+      var c = normalizeCodec(streamState.codec);
+      if (!c) return clean;
+      var tag = c === 'hevc' ? 'HEVC' : 'H.264';
+      return clean + ' · ' + tag;
+    }
+
+    function syncCodecMenuUi() {
+      var cur = effectiveCodec();
+      var hevcAllowed = !IS_TAURI || !hasDisplayConfig || canUseHevc();
+      if (codecHevcBtn) {
+        var isHevc = cur === 'hevc';
+        codecHevcBtn.setAttribute('aria-checked', isHevc ? 'true' : 'false');
+        codecHevcBtn.setAttribute('aria-disabled', hevcAllowed ? 'false' : 'true');
+        codecHevcBtn.title = hevcAllowed
+          ? 'HEVC (H.265) 硬件编码：高分辨率与 120Hz+ 高刷推荐'
+          : '当前主机或本机解码端不支持 HEVC 硬件编解码';
+        var hc = codecHevcBtn.querySelector('.sn-check');
+        if (hc) hc.hidden = !isHevc;
+      }
+      if (codecH264Btn) {
+        var isH264 = cur !== 'hevc';
+        codecH264Btn.setAttribute('aria-checked', isH264 ? 'true' : 'false');
+        var ac = codecH264Btn.querySelector('.sn-check');
+        if (ac) ac.hidden = !isH264;
+      }
+    }
+
+    function syncAdvisoryHints() {
+      var msg = '';
+      if (!IS_TAURI || hasDisplayConfig) {
+        var adv = evaluateHighRefreshAdvisoryLocal(
+          streamState.width,
+          streamState.height,
+          streamState.fps,
+          effectiveCodec()
+        );
+        if (adv && adv.level !== 'optimal') {
+          var recText = formatRecommendedTarget(adv);
+          if (adv.reason === 'h264_suggest_hevc') {
+            if (adv.level === 'suggest_hevc') {
+              msg = '当前 H.264 超出高刷甜点，开启 HEVC 即可跑满高刷帧率。';
+            } else {
+              msg =
+                '当前 H.264 在此分辨率高刷下受硬编限制（约 60fps），建议开启 HEVC，满帧推荐 ' +
+                recText +
+                '。';
+            }
+          } else if (adv.reason === 'h264_no_hevc') {
+            msg =
+              '当前 H.264 在此分辨率高刷下受硬编限制，追求满帧建议切至 ' + recText + '。';
+          } else if (adv.reason === 'hevc_over_budget') {
+            msg =
+              '当前分辨率超过高刷满帧甜点，动态画面可能低于目标帧率；满帧推荐 ' + recText + '。';
+          }
+        }
+      }
+      [qualityAdvisoryHintEl, screenAdvisoryHintEl, screenResAdvisoryHintEl].forEach(function (
+        el
+      ) {
+        if (!el) return;
+        if (msg) {
+          el.textContent = msg;
+          el.hidden = false;
+        } else {
+          el.textContent = '';
+          el.hidden = true;
+        }
+      });
+    }
+
+    function partitionPresetsForMenu(presets, primaryLimit) {
+      var list = Array.isArray(presets) ? presets : [];
+      var limit = Math.max(1, Number(primaryLimit) || 5);
+      if (list.length <= limit + 1) {
+        var smallPrimary = list.slice();
+        smallPrimary.sort(function (a, b) {
+          if (Boolean(a.is_native) !== Boolean(b.is_native)) {
+            return a.is_native ? -1 : 1;
+          }
+          var dh = (Number(b.height) || 0) - (Number(a.height) || 0);
+          if (dh !== 0) return dh;
+          return (Number(b.width) || 0) - (Number(a.width) || 0);
+        });
+        return { primary: smallPrimary, rest: [] };
+      }
+      var chosen = new Array(list.length);
+      var primary = [];
+      function pick(idx) {
+        if (primary.length < limit && idx >= 0 && idx < list.length && !chosen[idx]) {
+          chosen[idx] = true;
+          primary.push(list[idx]);
+        }
+      }
+      var nativeIdx = -1;
+      for (var i = 0; i < list.length; i += 1) {
+        if (list[i] && list[i].is_native) {
+          nativeIdx = i;
+          break;
+        }
+      }
+      if (nativeIdx >= 0) pick(nativeIdx);
+
+      if (streamState.width > 0 && streamState.height > 0) {
+        for (var j = 0; j < list.length; j += 1) {
+          if (isPresetActive(list[j])) {
+            pick(j);
+            break;
+          }
+        }
+      }
+
+      var rec = selectRecommendedPreset(list, streamState.fps, effectiveCodec());
+      if (rec) {
+        for (var k = 0; k < list.length; k += 1) {
+          if (Number(list[k].width) === rec.width && Number(list[k].height) === rec.height) {
+            pick(k);
+            break;
+          }
+        }
+      }
+
+      var maxIdx = -1;
+      var maxW = -1;
+      var maxH = -1;
+      for (var m = 0; m < list.length; m += 1) {
+        var pw = Number(list[m] && list[m].width) || 0;
+        var ph = Number(list[m] && list[m].height) || 0;
+        if (pw > maxW || (pw === maxW && ph > maxH)) {
+          maxW = pw;
+          maxH = ph;
+          maxIdx = m;
+        }
+      }
+      if (maxIdx >= 0) pick(maxIdx);
+
+      for (var hIdx = 0; hIdx < list.length && primary.length < limit; hIdx += 1) {
+        if (list[hIdx] && list[hIdx].is_hidpi) pick(hIdx);
+      }
+      for (var fIdx = 0; fIdx < list.length && primary.length < limit; fIdx += 1) {
+        pick(fIdx);
+      }
+
+      primary.sort(function (a, b) {
+        if (Boolean(a.is_native) !== Boolean(b.is_native)) {
+          return a.is_native ? -1 : 1;
+        }
+        var dh = (Number(b.height) || 0) - (Number(a.height) || 0);
+        if (dh !== 0) return dh;
+        return (Number(b.width) || 0) - (Number(a.width) || 0);
+      });
+
+      var rest = [];
+      for (var rIdx = 0; rIdx < list.length; rIdx += 1) {
+        if (!chosen[rIdx]) rest.push(list[rIdx]);
+      }
+      return { primary: primary, rest: rest };
+    }
 
     function createSvgIcon(symbolId, size) {
       var svg = document.createElementNS(SVG_NS, 'svg');
@@ -537,14 +872,77 @@
       autoAppliedSavedRes = true;
     }
 
+    function buildHighRefreshSwitchToast(targetW, targetH, targetFps, prevCodec, actionLabel) {
+      var autoUpgradedHevc =
+        prevCodec === 'h264' &&
+        userPinnedCodec !== 'h264' &&
+        canUseHevc() &&
+        !isWithinHighRefreshSweetSpot(targetW, targetH, targetFps, 'h264');
+      var nextCodec = autoUpgradedHevc ? 'hevc' : prevCodec;
+      var adv = evaluateHighRefreshAdvisoryLocal(targetW, targetH, targetFps, nextCodec);
+      var recText = formatRecommendedTarget(adv);
+      if (autoUpgradedHevc) {
+        if (adv.level === 'above_sweet_spot') {
+          return {
+            autoHevc: true,
+            text:
+              actionLabel +
+              '并已自动开启 HEVC；超过高刷满帧甜点，满帧推荐 ' +
+              recText
+          };
+        }
+        return {
+          autoHevc: true,
+          text: actionLabel + '，已自动开启 HEVC 以保障高刷流畅度'
+        };
+      }
+      if (adv.level === 'above_sweet_spot') {
+        if (adv.reason === 'h264_no_hevc') {
+          return {
+            autoHevc: false,
+            text:
+              actionLabel +
+              '；当前 H.264 受硬编限制（约 60fps），满帧建议选 ' +
+              recText
+          };
+        }
+        return {
+          autoHevc: false,
+          text:
+            actionLabel +
+            '；超过高刷满帧甜点（实测约 80fps），满帧建议选 ' +
+            recText
+        };
+      }
+      return { autoHevc: false, text: '' };
+    }
+
     function selectResolutionPreset(w, h) {
       var targetW = Number(w);
       var targetH = Number(h);
+      var targetFps = Number(streamState.fps || 144);
+      var prevWidth = streamState.width;
+      var prevHeight = streamState.height;
+      var prevRawCodec = streamState.codec;
+      var prevPreferred = preferredResolution;
+      var prevCodec = effectiveCodec();
+      var feedback = buildHighRefreshSwitchToast(
+        targetW,
+        targetH,
+        targetFps,
+        prevCodec,
+        '已切换至 ' + targetW + '×' + targetH
+      );
       streamState.width = targetW;
       streamState.height = targetH;
+      if (feedback.autoHevc) {
+        streamState.codec = 'hevc';
+        syncCodecMenuUi();
+      }
       renderAllResolutionLists();
+      syncAdvisoryHints();
       if (hudRows.length >= 8) {
-        hudRows[7].textContent = targetW + 'x' + targetH;
+        hudRows[7].textContent = formatHudResolution(targetW + 'x' + targetH);
       }
       preferredResolution = { width: targetW, height: targetH };
       closePopover();
@@ -555,23 +953,36 @@
             resolutionHeight: targetH
           }).catch(function () {});
         }
-        pendingUserResTarget = { width: targetW, height: targetH };
+        pendingUserResTarget = {
+          width: targetW,
+          height: targetH,
+          suppressConfirmToast: Boolean(feedback.text)
+        };
         Bridge.sessionCommand({
           type: 'set_stream_params',
           width: targetW,
           height: targetH,
-          fps: Number(streamState.fps || 144)
+          fps: targetFps
         }).catch(function (err) {
           pendingUserResTarget = null;
+          streamState.width = prevWidth;
+          streamState.height = prevHeight;
+          streamState.codec = prevRawCodec;
+          preferredResolution = prevPreferred;
+          syncCodecMenuUi();
+          renderAllResolutionLists();
+          if (hudRows.length >= 8 && prevWidth > 0 && prevHeight > 0) {
+            hudRows[7].textContent = formatHudResolution(prevWidth + 'x' + prevHeight);
+          }
           toast('切换分辨率失败：' + String(err || '未知错误'));
         });
-        toast('正在切换分辨率至 ' + targetW + '×' + targetH + '…');
+        toast(feedback.text || '正在切换分辨率至 ' + targetW + '×' + targetH + '…');
       } else {
-        toast('已切换分辨率至 ' + targetW + '×' + targetH);
+        toast(feedback.text || '已切换分辨率至 ' + targetW + '×' + targetH);
       }
     }
 
-    function appendResolutionButton(container, preset, isNestedItem) {
+    function appendResolutionButton(container, preset, isNestedItem, recSweetSpot) {
       var w = Number(preset.width) || 0;
       var h = Number(preset.height) || 0;
       if (!(w > 0 && h > 0)) return;
@@ -596,6 +1007,37 @@
       label.textContent = formatPresetLabel(preset, w, h);
       btn.appendChild(label);
 
+      var badgeText = '';
+      var badgeClass = 'sn-res-badge';
+      var curFps = Number(streamState.fps) || 0;
+      var curCodec = effectiveCodec();
+      if (preset.is_native) {
+        badgeText = '原生';
+      } else if (curFps >= HIGH_REFRESH_FPS_THRESHOLD) {
+        if (
+          recSweetSpot &&
+          recSweetSpot.width === w &&
+          recSweetSpot.height === h &&
+          isWithinHighRefreshSweetSpot(w, h, curFps, curCodec)
+        ) {
+          badgeText = '高刷推荐';
+        } else if (!isWithinHighRefreshSweetSpot(w, h, curFps, curCodec)) {
+          badgeText =
+            curCodec === 'h264' &&
+            canUseHevc() &&
+            isWithinHighRefreshSweetSpot(w, h, curFps, 'hevc')
+              ? '建议 HEVC'
+              : '高负载';
+          badgeClass = 'sn-res-badge sn-res-badge--warn';
+        }
+      }
+      if (badgeText) {
+        var badge = document.createElement('span');
+        badge.className = badgeClass;
+        badge.textContent = badgeText;
+        btn.appendChild(badge);
+      }
+
       if (!isNestedItem) {
         btn.addEventListener('pointerenter', function () {
           if (typeof scheduleNestedClose === 'function') scheduleNestedClose();
@@ -609,13 +1051,13 @@
       container.appendChild(btn);
     }
 
-    function renderMoreResolutionList(presets) {
+    function renderMoreResolutionList(presets, recSweetSpot) {
       if (!screenMoreResListEl) return;
       while (screenMoreResListEl.firstChild) {
         screenMoreResListEl.removeChild(screenMoreResListEl.firstChild);
       }
       presets.forEach(function (preset) {
-        appendResolutionButton(screenMoreResListEl, preset, true);
+        appendResolutionButton(screenMoreResListEl, preset, true, recSweetSpot);
       });
     }
 
@@ -625,17 +1067,19 @@
         container.removeChild(container.firstChild);
       }
       var presets = Array.isArray(streamState.presets) ? streamState.presets : [];
-      if (presets.length <= 6) {
-        presets.forEach(function (preset) {
-          appendResolutionButton(container, preset, false);
+      var recSweetSpot = selectRecommendedPreset(presets, streamState.fps, effectiveCodec());
+      var split = partitionPresetsForMenu(presets, 5);
+      var primary = split.primary;
+      var rest = split.rest;
+      if (!rest.length) {
+        primary.forEach(function (preset) {
+          appendResolutionButton(container, preset, false, recSweetSpot);
         });
         return;
       }
 
-      var primary = presets.slice(0, 5);
-      var rest = presets.slice(5);
       primary.forEach(function (preset) {
-        appendResolutionButton(container, preset, false);
+        appendResolutionButton(container, preset, false, recSweetSpot);
       });
 
       var moreActive = rest.some(isPresetActive);
@@ -664,7 +1108,7 @@
 
       var openMore = function () {
         if (typeof cancelNestedClose === 'function') cancelNestedClose();
-        renderMoreResolutionList(rest);
+        renderMoreResolutionList(rest, recSweetSpot);
         if (typeof openNestedMenu === 'function' && screenMoreEl) {
           openNestedMenu(moreBtn, screenMoreEl);
         }
@@ -682,14 +1126,17 @@
     function renderAllResolutionLists() {
       renderResolutionList(screenMainResListEl);
       renderResolutionList(screenResListEl);
-      if (
-        screenMoreEl &&
-        !screenMoreEl.hidden &&
-        Array.isArray(streamState.presets) &&
-        streamState.presets.length > 6
-      ) {
-        renderMoreResolutionList(streamState.presets.slice(5));
+      if (screenMoreEl && !screenMoreEl.hidden) {
+        var presets = Array.isArray(streamState.presets) ? streamState.presets : [];
+        var recSweetSpot = selectRecommendedPreset(presets, streamState.fps, effectiveCodec());
+        var split = partitionPresetsForMenu(presets, 5);
+        if (split.rest.length) {
+          renderMoreResolutionList(split.rest, recSweetSpot);
+        } else if (typeof closeNestedMenu === 'function') {
+          closeNestedMenu();
+        }
       }
+      syncAdvisoryHints();
     }
 
     function handleFitSessionWindow(e) {
@@ -708,6 +1155,7 @@
       toast('已适配窗口比例，消除黑边');
     }
 
+    syncCodecMenuUi();
     renderAllResolutionLists();
 
     /* ── S4 HUD 显隐（控制中心 → 更多 → 显示网络状态）─────────────── */
@@ -1350,6 +1798,12 @@
         opt.addEventListener('click', function () {
           var group = opt.getAttribute('data-group');
           var val = opt.getAttribute('data-value');
+          if (opt.getAttribute('aria-disabled') === 'true') {
+            if (group === 'codec' && val === 'hevc') {
+              toast('当前主机或本机解码端暂不支持 HEVC 硬件编解码');
+            }
+            return;
+          }
           options.forEach(function (other) {
             if (other.getAttribute('data-group') !== group) return;
             var checked = other === opt;
@@ -1357,11 +1811,87 @@
             var check = other.querySelector('.sn-check');
             if (check) check.hidden = !checked;
           });
+          if (group === 'codec') {
+            var targetCodec = normalizeCodec(val) || 'h264';
+            if (hasDisplayConfig && normalizeCodec(streamState.codec) === targetCodec) {
+              syncCodecMenuUi();
+              return;
+            }
+            var prevRawCodecChoice = streamState.codec;
+            var prevPinnedCodec = userPinnedCodec;
+            userPinnedCodec = targetCodec;
+            streamState.codec = targetCodec;
+            syncCodecMenuUi();
+            renderAllResolutionLists();
+            if (hudRows.length >= 8 && streamState.width > 0 && streamState.height > 0) {
+              hudRows[7].textContent = formatHudResolution(
+                streamState.width + 'x' + streamState.height
+              );
+            }
+            if (IS_TAURI) {
+              pendingUserCodecTarget = targetCodec;
+              Bridge.sessionCommand({
+                type: 'set_codec',
+                codec: targetCodec
+              }).catch(function (err) {
+                pendingUserCodecTarget = null;
+                streamState.codec = prevRawCodecChoice;
+                userPinnedCodec = prevPinnedCodec;
+                syncCodecMenuUi();
+                renderAllResolutionLists();
+                if (hudRows.length >= 8 && streamState.width > 0 && streamState.height > 0) {
+                  hudRows[7].textContent = formatHudResolution(
+                    streamState.width + 'x' + streamState.height
+                  );
+                }
+                toast('切换编码器失败：' + String(err || '未知错误'));
+              });
+            }
+            var advAfterCodec = evaluateHighRefreshAdvisoryLocal(
+              streamState.width,
+              streamState.height,
+              streamState.fps,
+              targetCodec
+            );
+            var codecLabel = targetCodec === 'hevc' ? 'HEVC (H.265)' : 'H.264';
+            if (targetCodec === 'h264' && advAfterCodec.level !== 'optimal') {
+              toast(
+                advAfterCodec.can_enable_hevc
+                  ? '已切换至 H.264；当前高分高刷可能受硬编限制，满帧建议开启 HEVC 或切至 ' +
+                      formatRecommendedTarget(advAfterCodec)
+                  : '已切换至 H.264；当前高分高刷可能受硬编限制，满帧建议切至 ' +
+                      formatRecommendedTarget(advAfterCodec)
+              );
+            } else {
+              toast('已切换视频编码器至 ' + codecLabel);
+            }
+            return;
+          }
           if (group === 'fps') {
             var fpsNum = Number(val);
+            var prevFpsVal = streamState.fps;
+            var prevFpsRawCodec = streamState.codec;
+            var prevCodec = effectiveCodec();
             if (isFinite(fpsNum) && fpsNum > 0) {
               streamState.fps = fpsNum;
             }
+            var fpsFeedback = buildHighRefreshSwitchToast(
+              streamState.width,
+              streamState.height,
+              fpsNum,
+              prevCodec,
+              '已切换目标帧率至 ' + val + ' fps'
+            );
+            if (fpsFeedback.autoHevc) {
+              streamState.codec = 'hevc';
+              syncCodecMenuUi();
+              if (hudRows.length >= 8 && streamState.width > 0 && streamState.height > 0) {
+                hudRows[7].textContent = formatHudResolution(
+                  streamState.width + 'x' + streamState.height
+                );
+              }
+            }
+            renderAllResolutionLists();
             if (IS_TAURI) {
               if (typeof Bridge.saveStreamPrefs === 'function' && isFinite(fpsNum) && fpsNum > 0) {
                 Bridge.saveStreamPrefs({ fps: fpsNum }).catch(function () {});
@@ -1372,10 +1902,20 @@
                 height: Number(streamState.height || 0),
                 fps: Number(val)
               }).catch(function (err) {
+                streamState.fps = prevFpsVal;
+                streamState.codec = prevFpsRawCodec;
+                syncFpsMenuUi(prevFpsVal);
+                syncCodecMenuUi();
+                renderAllResolutionLists();
+                if (hudRows.length >= 8 && streamState.width > 0 && streamState.height > 0) {
+                  hudRows[7].textContent = formatHudResolution(
+                    streamState.width + 'x' + streamState.height
+                  );
+                }
                 toast('切换帧率失败：' + String(err || '未知错误'));
               });
             }
-            toast('已切换目标帧率至 ' + val + ' fps');
+            toast(fpsFeedback.text || '已切换目标帧率至 ' + val + ' fps');
             return;
           }
           if (IS_TAURI && group === 'bitrate' && BITRATE_BPS[val]) {
@@ -1726,6 +2266,7 @@
         autoAppliedSavedRes = false;
         hasDisplayConfig = false;
         pendingUserResTarget = null;
+        pendingUserCodecTarget = null;
         prevDisplayWidth = 0;
         prevDisplayHeight = 0;
         if (!relaySwitching && relayEl) {
@@ -1737,8 +2278,13 @@
         streamState.height = 0;
         streamState.nativeWidth = 0;
         streamState.nativeHeight = 0;
+        streamState.codec = '';
+        streamState.supportedCodecs = [];
+        streamState.clientSupportsHevc = false;
+        streamState.advisory = null;
         streamState.hasServerPresets = false;
         streamState.presets = DEFAULT_MOCK_PRESETS.slice();
+        syncCodecMenuUi();
         renderAllResolutionLists();
       }
 
@@ -1818,7 +2364,7 @@
           }
           renderAllResolutionLists();
           if (hudRows.length >= 8 && data.width && data.height) {
-            hudRows[7].textContent = data.width + 'x' + data.height;
+            hudRows[7].textContent = formatHudResolution(data.width + 'x' + data.height);
           }
           reportStageRect();
           return;
@@ -1860,6 +2406,17 @@
           if (isFinite(natW) && natW > 0) streamState.nativeWidth = natW;
           if (isFinite(natH) && natH > 0) streamState.nativeHeight = natH;
           if (isFinite(maxFps) && maxFps > 0) streamState.maxFps = maxFps;
+          var cfgCodec = normalizeCodec(data.codec);
+          streamState.codec = cfgCodec;
+          streamState.supportedCodecs = Array.isArray(data.supported_codecs)
+            ? data.supported_codecs.slice()
+            : [];
+          if (typeof data.client_supports_hevc === 'boolean') {
+            streamState.clientSupportsHevc = data.client_supports_hevc;
+          }
+          if (data.advisory && typeof data.advisory === 'object') {
+            streamState.advisory = data.advisory;
+          }
           if (Array.isArray(data.presets) && data.presets.length > 0) {
             streamState.presets = data.presets;
             streamState.hasServerPresets = true;
@@ -1871,18 +2428,42 @@
             }
           }
           if (hudRows.length >= 8 && streamState.width > 0 && streamState.height > 0) {
-            hudRows[7].textContent = streamState.width + 'x' + streamState.height;
+            hudRows[7].textContent = formatHudResolution(
+              streamState.width + 'x' + streamState.height
+            );
           }
-          renderAllResolutionLists();
           hasDisplayConfig = true;
+          syncCodecMenuUi();
+          renderAllResolutionLists();
           maybeAutoApplySavedResolution();
+          if (pendingUserCodecTarget) {
+            var wantedCodec = pendingUserCodecTarget;
+            var authoritativeCodec = cfgCodec || 'h264';
+            pendingUserCodecTarget = null;
+            if (authoritativeCodec !== wantedCodec) {
+              toast(
+                '被控端保持 ' +
+                  (authoritativeCodec === 'hevc' ? 'HEVC (H.265)' : 'H.264') +
+                  ' 编码'
+              );
+            }
+          }
           if (pendingUserResTarget && hasValidCfgDims) {
             var matchedTarget =
               Math.abs(cfgW - pendingUserResTarget.width) <= 2 &&
               Math.abs(cfgH - pendingUserResTarget.height) <= 2;
+            var suppressConfirm = Boolean(pendingUserResTarget.suppressConfirmToast);
             if (matchedTarget || dimsChanged) {
               pendingUserResTarget = null;
-              toast('当前分辨率：' + cfgW + '×' + cfgH);
+              var confirmedAdv = evaluateHighRefreshAdvisoryLocal(
+                cfgW,
+                cfgH,
+                streamState.fps,
+                effectiveCodec()
+              );
+              if (confirmedAdv.level === 'optimal' && !(matchedTarget && suppressConfirm)) {
+                toast('当前分辨率：' + cfgW + '×' + cfgH);
+              }
             }
           }
           return;
