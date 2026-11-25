@@ -400,6 +400,112 @@
     );
   }
 
+  /* ── 关于弹窗（O2「关于」出口）───────────────────────────────── */
+  function openAbout(info) {
+    if (document.querySelector(".rc-about")) return;
+    closePopover();
+
+    var data = info && typeof info === "object" ? info : {};
+    var name = String(data.name || "RabbitControl");
+    var version = String(data.version || "0.1.7");
+    var build = data.build ? String(data.build) : "";
+    var description = String(data.description || "低延迟远程桌面控制软件");
+    var os = String(data.os || "macOS");
+    var arch = String(data.arch || "");
+    var bundleId = String(data.bundleId || "com.rabbitcontrol.dev");
+    var license = String(data.license || "AGPL-3.0-only");
+
+    var versionText = "版本 " + version;
+    if (build && build !== version) {
+      versionText += " (" + build + ")";
+    }
+    var platformText = arch ? os + " · " + arch : os;
+    var copySummary = name + " " + version +
+      (build && build !== version ? " (" + build + ")" : "") +
+      " · " + (arch ? os + " " + arch : os);
+
+    var layer = document.createElement("div");
+    layer.className = "rc-layer";
+    layer.innerHTML =
+      '<div class="rc-about" role="dialog" aria-modal="true" aria-labelledby="rc-about-title">' +
+      '<div class="rc-about__header">' +
+      '<img class="rc-about__icon" src="assets/img/app-icon.png" alt="' + escapeHtml(name) + '">' +
+      '<h2 class="rc-about__title" id="rc-about-title">' + escapeHtml(name) + "</h2>" +
+      '<div class="rc-about__version">' + escapeHtml(versionText) + "</div>" +
+      '<p class="rc-about__desc">' + escapeHtml(description) + "</p>" +
+      "</div>" +
+      '<div class="rc-about__meta">' +
+      '<div class="rc-about__row"><span class="rc-about__key">运行平台</span><span class="rc-about__val">' + escapeHtml(platformText) + "</span></div>" +
+      '<div class="rc-about__row"><span class="rc-about__key">应用标识</span><span class="rc-about__val">' + escapeHtml(bundleId) + "</span></div>" +
+      '<div class="rc-about__row"><span class="rc-about__key">开源协议</span><span class="rc-about__val">' + escapeHtml(license) + "</span></div>" +
+      "</div>" +
+      '<div class="rc-about__footer">' +
+      '<button type="button" class="rc-btn rc-btn--secondary" data-action="copy">复制版本信息</button>' +
+      '<button type="button" class="rc-btn rc-btn--primary" data-action="close">关闭</button>' +
+      "</div>" +
+      "</div>";
+
+    var card = layer.querySelector(".rc-about");
+    card.tabIndex = -1;
+
+    card.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-action]");
+      if (!btn) return;
+      var action = btn.getAttribute("data-action");
+      if (action === "copy") {
+        if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.copyText === "function") {
+          window.RCBridge.copyText(copySummary)
+            .then(function () {
+              toast("已复制版本信息");
+            })
+            .catch(function () {
+              toast("复制失败");
+            });
+        } else if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          navigator.clipboard.writeText(copySummary)
+            .then(function () {
+              toast("已复制版本信息");
+            })
+            .catch(function () {
+              toast("复制失败");
+            });
+        } else {
+          toast("复制失败");
+        }
+        return;
+      }
+      if (action === "close") {
+        popModal(layer);
+      }
+    });
+
+    pushModal(
+      layer,
+      function () {
+        popModal(layer);
+      },
+      card.querySelector('[data-action="close"]')
+    );
+  }
+
+  function triggerAbout() {
+    if (typeof api.onOpenAbout === "function") {
+      api.onOpenAbout();
+      return;
+    }
+    if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.getAppInfo === "function") {
+      window.RCBridge.getAppInfo()
+        .then(function (info) {
+          openAbout(info);
+        })
+        .catch(function () {
+          openAbout(null);
+        });
+      return;
+    }
+    openAbout(null);
+  }
+
   /* ── O2 右上下拉菜单（§6 O2：宽 200 / 行高 40 / SIZE_BODY / 左 20px 图标）── */
   function buildO2() {
     var el = document.createElement("div");
@@ -412,7 +518,7 @@
       { icon: "settings", label: "设置", act: function () { openSettings(); } },
       { icon: "circle-help", label: "帮助与反馈", act: function () { toast("功能开发中"); } },
       { icon: "headphones", label: "在线客服", act: function () { toast("功能开发中"); } },
-      { icon: "info", label: "关于", act: function () { toast("功能开发中"); } },
+      { icon: "info", label: "关于", act: function () { triggerAbout(); } },
       { sep: true },
       { icon: "rotate-cw", label: "检查更新", act: function () { toast("当前已是最新版本"); } }
     ];
@@ -697,11 +803,13 @@
     openO1: openO1,
     openO2: openO2,
     openO3: openO3,
+    openAbout: openAbout,
     closeAll: closeAll,
     wireAnchors: wireAnchors,
     setAccount: setAccount,
     mock: MOCK,
     onOpenSettings: null,
+    onOpenAbout: null,
     onOpenTool: null,
     onLogout: null,
     onChangePassword: null

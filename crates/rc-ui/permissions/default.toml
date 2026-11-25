@@ -71,6 +71,7 @@ commands.allow = [
   "focus_session_window",
   "close_session_window",
   "get_app_prefs",
+  "get_app_info",
   "save_stream_prefs",
   "get_device_snapshots",
   "get_active_session_info",

@@ -672,10 +672,17 @@ fn build_signal_client_options(state: &AppState) -> SignalClientOptions {
     let auth = Arc::clone(&state.auth);
     let token_provider: rc_ui::signal_client::TokenProvider =
         Arc::new(move || auth.ensure_valid_access_token().map_err(format_auth_error));
+    let auth_refresh = Arc::clone(&state.auth);
+    let token_refresher: rc_ui::signal_client::TokenRefresher = Arc::new(move |stale| {
+        auth_refresh
+            .refresh_after_unauthorized(stale)
+            .map_err(format_auth_error)
+    });
     let device_pubkey = Some(state.auth.cert_manager().device_pubkey_hex());
     let allow_remote_assist = sync_prefs_from_disk_if_proxy(state).allow_remote_assist;
     SignalClientOptions {
         token_provider: Some(token_provider),
+        token_refresher: Some(token_refresher),
         device_pubkey,
         allow_remote_assist,
         dynamic_lan_discovery: true,
@@ -4487,6 +4494,153 @@ pub async fn get_service_status() -> Result<ServiceStatusReport, String> {
         .map_err(|e| format!("查询后台服务状态任务异常：{e}"))
 }
 
+/// 解析后的应用版本与构建元信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppVersionInfo {
+    /// 展示用语义版本号（优先取自 `.app/Contents/Info.plist` 的 `CFBundleShortVersionString`）。
+    pub version: String,
+    /// 包内构建号（优先取自 `CFBundleVersion`，未配置时回退至 `version`）。
+    pub bundle_version: String,
+    /// 构建标识（优先取自编译期 `RC_GIT_SHA`，空时在 `bundle_version != version` 场景回退至 `bundle_version`）。
+    pub build: String,
+}
+
+/// 返回给前端「关于」弹窗的应用元信息（IPC `camelCase`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    /// 应用名称（如 `"RabbitControl"`）。
+    pub name: String,
+    /// 应用版本号（如 `"0.1.7"`）。
+    pub version: String,
+    /// 构建号或 Git 短 SHA（如 `"dbc3df3"`）。
+    pub build: String,
+    /// 应用 Bundle Identifier（如 `"com.rabbitcontrol.dev"`）。
+    pub bundle_id: String,
+    /// 操作系统名称（macOS 上展示 `"macOS"`）。
+    pub os: String,
+    /// CPU 架构（如 `"aarch64"` / `"x86_64"`）。
+    pub arch: String,
+    /// 开源许可证（如 `"AGPL-3.0-only"`）。
+    pub license: String,
+    /// 应用简介。
+    pub description: String,
+}
+
+fn normalize_version_candidate(raw: &str) -> String {
+    raw.trim().trim_start_matches('v').trim().to_string()
+}
+
+/// 从 `Info.plist` XML 文本中提取指定 `<key>` 对应的 `<string>` 值。
+fn parse_plist_string_value(plist_xml: &str, key: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_idx = plist_xml.find(&key_tag)?;
+    let after_key = &plist_xml[key_idx + key_tag.len()..];
+    let trimmed = after_key.trim_start();
+    let after_open = trimmed.strip_prefix("<string>")?;
+    let end_idx = after_open.find("</string>")?;
+    let val = after_open[..end_idx].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+/// 按 `Info.plist` → 编译期 `RC_APP_VERSION` → `CARGO_PKG_VERSION` 优先级解析版本信息。
+fn resolve_app_version_from_sources(
+    plist_xml: Option<&str>,
+    compile_version: &str,
+    pkg_version: &str,
+    git_sha: &str,
+) -> AppVersionInfo {
+    let plist_short = plist_xml
+        .and_then(|xml| parse_plist_string_value(xml, "CFBundleShortVersionString"))
+        .map(|s| normalize_version_candidate(&s))
+        .filter(|s| !s.is_empty());
+    let plist_bundle = plist_xml
+        .and_then(|xml| parse_plist_string_value(xml, "CFBundleVersion"))
+        .map(|s| normalize_version_candidate(&s))
+        .filter(|s| !s.is_empty());
+    let compile_ver = {
+        let v = normalize_version_candidate(compile_version);
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    let pkg_ver = normalize_version_candidate(pkg_version);
+
+    let version = plist_short
+        .or(compile_ver)
+        .unwrap_or_else(|| pkg_ver.clone());
+    let bundle_version = plist_bundle.unwrap_or_else(|| version.clone());
+    let clean_sha = git_sha.trim().to_string();
+    let build = if !clean_sha.is_empty() {
+        clean_sha
+    } else if bundle_version != version {
+        bundle_version.clone()
+    } else {
+        String::new()
+    };
+
+    AppVersionInfo {
+        version,
+        bundle_version,
+        build,
+    }
+}
+
+/// 解析当前运行进程所属应用包的真实版本与构建号。
+pub fn resolve_app_version_info() -> AppVersionInfo {
+    let plist_xml = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()?
+                .parent()
+                .map(|contents| contents.join("Info.plist"))
+        })
+        .and_then(|plist_path| std::fs::read_to_string(plist_path).ok());
+
+    resolve_app_version_from_sources(
+        plist_xml.as_deref(),
+        env!("RC_APP_VERSION"),
+        env!("CARGO_PKG_VERSION"),
+        env!("RC_GIT_SHA"),
+    )
+}
+
+/// IPC 命令：获取当前应用名称、真实版本号、构建信息与运行环境元数据。
+#[tauri::command]
+pub fn get_app_info(app: AppHandle) -> AppInfo {
+    let ver = resolve_app_version_info();
+    let pkg_info = app.package_info();
+    let config = app.config();
+    let os = if cfg!(target_os = "macos") {
+        "macOS".to_string()
+    } else {
+        std::env::consts::OS.to_string()
+    };
+    let description = config
+        .bundle
+        .short_description
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "低延迟远程桌面控制软件".to_string());
+
+    AppInfo {
+        name: pkg_info.name.clone(),
+        version: ver.version,
+        build: ver.build,
+        bundle_id: config.identifier.clone(),
+        os,
+        arch: std::env::consts::ARCH.to_string(),
+        license: env!("CARGO_PKG_LICENSE").to_string(),
+        description,
+    }
+}
+
 /// 显示并前置 `"main"` 控制端主窗口。
 pub(crate) fn show_and_focus_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -5848,6 +6002,90 @@ mod tests {
         assert_eq!(
             local_device_id_snapshot(&state).as_deref(),
             Some("604928235")
+        );
+    }
+
+    #[test]
+    fn parse_plist_string_value_extracts_versions() {
+        let plist = r#"
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>RabbitControl</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.7</string>
+    <key>CFBundleVersion</key>
+    <string> 245 </string>
+    <key>EmptyKey</key>
+    <string>   </string>
+</dict>
+</plist>
+"#;
+        assert_eq!(
+            parse_plist_string_value(plist, "CFBundleShortVersionString").as_deref(),
+            Some("0.1.7")
+        );
+        assert_eq!(
+            parse_plist_string_value(plist, "CFBundleVersion").as_deref(),
+            Some("245")
+        );
+        assert_eq!(parse_plist_string_value(plist, "EmptyKey"), None);
+        assert_eq!(parse_plist_string_value(plist, "MissingKey"), None);
+    }
+
+    #[test]
+    fn resolve_app_version_prefers_plist_then_compile_env_then_pkg() {
+        let plist = r#"
+<dict>
+    <key>CFBundleShortVersionString</key>
+    <string>v0.1.9</string>
+    <key>CFBundleVersion</key>
+    <string>900</string>
+</dict>
+"#;
+        // 1) Info.plist 优先，且 git_sha 非空时作为 build。
+        let from_plist = resolve_app_version_from_sources(Some(plist), "0.1.7", "0.1.0", "abc1234");
+        assert_eq!(
+            from_plist,
+            AppVersionInfo {
+                version: "0.1.9".to_string(),
+                bundle_version: "900".to_string(),
+                build: "abc1234".to_string(),
+            }
+        );
+
+        // 2) Info.plist 优先且 git_sha 为空时，若 bundle_version != version 则回退至 bundle_version。
+        let from_plist_no_sha = resolve_app_version_from_sources(Some(plist), "0.1.7", "0.1.0", "");
+        assert_eq!(
+            from_plist_no_sha,
+            AppVersionInfo {
+                version: "0.1.9".to_string(),
+                bundle_version: "900".to_string(),
+                build: "900".to_string(),
+            }
+        );
+
+        // 3) 无 Info.plist 时回退到编译期 RC_APP_VERSION（自动去 v 前缀）。
+        let from_compile = resolve_app_version_from_sources(None, "v0.1.8", "0.1.0", "def5678");
+        assert_eq!(
+            from_compile,
+            AppVersionInfo {
+                version: "0.1.8".to_string(),
+                bundle_version: "0.1.8".to_string(),
+                build: "def5678".to_string(),
+            }
+        );
+
+        // 4) 编译期 RC_APP_VERSION 与 git_sha 均为空时回退 CARGO_PKG_VERSION，build 置空。
+        let from_pkg = resolve_app_version_from_sources(None, "", "v0.1.7", "");
+        assert_eq!(
+            from_pkg,
+            AppVersionInfo {
+                version: "0.1.7".to_string(),
+                bundle_version: "0.1.7".to_string(),
+                build: String::new(),
+            }
         );
     }
 }

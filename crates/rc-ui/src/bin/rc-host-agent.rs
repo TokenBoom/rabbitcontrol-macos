@@ -12,7 +12,7 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rand::rngs::OsRng;
@@ -116,6 +116,73 @@ fn detect_session_type() -> ServiceSessionType {
     {
         ServiceSessionType::Standalone
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalIdentityKey {
+    authenticated: bool,
+    enabled: bool,
+    server_host: String,
+    signal_port: u16,
+    relay_port: u16,
+    use_https: bool,
+    ca_cert_pem: Option<String>,
+    ca_fingerprint_sha256: Option<String>,
+    device_key: String,
+    user_id: Option<String>,
+    device_pubkey_hex: String,
+}
+
+fn fetch_access_token(
+    auth_slot: &RwLock<Arc<AuthSessionManager>>,
+    failed_token: Option<&str>,
+) -> Result<String, String> {
+    let auth = auth_slot.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let daemon_sock = config_paths::daemon_socket_path();
+    let secret_path = config_paths::ipc_secret_path();
+    if daemon_sock.exists() {
+        match IpcClient::call(
+            &daemon_sock,
+            &secret_path,
+            ServiceRequest::EnsureAccessToken {
+                failed_token: failed_token.map(str::to_string),
+            },
+            Duration::from_secs(5),
+        ) {
+            Ok(ServiceResponse::AuthSession(sess)) => {
+                let token = sess.access_token.clone();
+                auth.apply_external_session(*sess);
+                return Ok(token);
+            }
+            Ok(ServiceResponse::ReloginRequired { message }) => {
+                let _ = auth.reload_from_disk();
+                return Err(message);
+            }
+            Ok(ServiceResponse::Error { message }) => {
+                return Err(message);
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    match failed_token {
+        Some(stale) => auth
+            .refresh_after_unauthorized(stale)
+            .map_err(|e| format!("{e:?}")),
+        None => auth
+            .ensure_valid_access_token()
+            .map_err(|e| format!("{e:?}")),
+    }
+}
+
+fn should_restart_signal(
+    authenticated: bool,
+    prev_key: &SignalIdentityKey,
+    next_key: &SignalIdentityKey,
+    signal_state: Option<ServerConnectionState>,
+) -> bool {
+    !authenticated
+        || prev_key != next_key
+        || matches!(signal_state, None | Some(ServerConnectionState::Error))
 }
 
 #[derive(Default)]
@@ -232,7 +299,8 @@ struct AgentInner {
     ipc_secret: String,
     server_cfg: ServerConfig,
     prefs: AppPrefs,
-    auth: Arc<AuthSessionManager>,
+    /// 使用 RwLock 包装以便保活信令连接时，token_provider 闭包能动态读取刷新后的最新 AuthSessionManager。
+    auth: Arc<RwLock<Arc<AuthSessionManager>>>,
     signal: Option<Arc<SignalClientHandle>>,
     lan: Option<LanDiscoveryHandle>,
     host: Option<HostHandle>,
@@ -273,7 +341,7 @@ impl AgentInner {
             ipc_secret,
             server_cfg: cfg,
             prefs,
-            auth,
+            auth: Arc::new(RwLock::new(auth)),
             signal: None,
             lan: None,
             host: None,
@@ -301,10 +369,18 @@ impl AgentInner {
         }
     }
 
+    fn current_auth(&self) -> Arc<AuthSessionManager> {
+        self.auth.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn replace_auth(&self, next: Arc<AuthSessionManager>) {
+        *self.auth.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
     fn is_authenticated(&self) -> bool {
         self.server_cfg.is_configured()
             && self
-                .auth
+                .current_auth()
                 .current_session()
                 .is_some_and(|s| !s.must_change_password)
     }
@@ -323,12 +399,13 @@ impl AgentInner {
         if !self.is_authenticated() {
             return None;
         }
+        let auth = self.current_auth();
         let pubkey_hex = self
             .server_cfg
             .server_auth_pubkey_hex
             .clone()
-            .or_else(|| self.auth.server_config().server_auth_pubkey_hex)?;
-        let user_id = self.auth.current_session()?.user_id;
+            .or_else(|| auth.server_config().server_auth_pubkey_hex)?;
+        let user_id = auth.current_session()?.user_id;
         let did = self
             .device_id
             .clone()
@@ -342,13 +419,14 @@ impl AgentInner {
         if !self.is_authenticated() {
             return None;
         }
+        let auth = self.current_auth();
         let ca_cert_pem = self
             .server_cfg
             .ca_cert_pem
             .clone()
-            .or_else(|| self.auth.server_config().ca_cert_pem)?;
-        let user_id = self.auth.current_session()?.user_id;
-        let cert_mgr = self.auth.cert_manager();
+            .or_else(|| auth.server_config().ca_cert_pem)?;
+        let user_id = auth.current_session()?.user_id;
+        let cert_mgr = auth.cert_manager();
         let (cert_pem, meta) = cert_mgr.load_device_cert()?;
         if !meta.user_id.eq_ignore_ascii_case(user_id.trim()) {
             return None;
@@ -417,38 +495,16 @@ impl AgentInner {
             return old;
         }
 
-        let auth = Arc::clone(&self.auth);
-        let token_provider: rc_ui::signal_client::TokenProvider = Arc::new(move || {
-            let daemon_sock = config_paths::daemon_socket_path();
-            let secret_path = config_paths::ipc_secret_path();
-            if daemon_sock.exists() {
-                match IpcClient::call(
-                    &daemon_sock,
-                    &secret_path,
-                    ServiceRequest::EnsureAccessToken { failed_token: None },
-                    Duration::from_secs(5),
-                ) {
-                    Ok(ServiceResponse::AuthSession(sess)) => {
-                        let token = sess.access_token.clone();
-                        auth.apply_external_session(*sess);
-                        return Ok(token);
-                    }
-                    Ok(ServiceResponse::ReloginRequired { message }) => {
-                        let _ = auth.reload_from_disk();
-                        return Err(message);
-                    }
-                    Ok(ServiceResponse::Error { message }) => {
-                        return Err(message);
-                    }
-                    Ok(_) | Err(_) => {}
-                }
-            }
-            auth.ensure_valid_access_token()
-                .map_err(|e| format!("{e:?}"))
-        });
+        let auth_slot_provider = Arc::clone(&self.auth);
+        let token_provider: rc_ui::signal_client::TokenProvider =
+            Arc::new(move || fetch_access_token(&auth_slot_provider, None));
+        let auth_slot_refresher = Arc::clone(&self.auth);
+        let token_refresher: rc_ui::signal_client::TokenRefresher =
+            Arc::new(move |stale| fetch_access_token(&auth_slot_refresher, Some(stale)));
         let options = SignalClientOptions {
             token_provider: Some(token_provider),
-            device_pubkey: Some(self.auth.cert_manager().device_pubkey_hex()),
+            token_refresher: Some(token_refresher),
+            device_pubkey: Some(self.current_auth().cert_manager().device_pubkey_hex()),
             allow_remote_assist: self.signal_allow_remote_assist(),
             dynamic_lan_discovery: true,
         };
@@ -578,12 +634,33 @@ impl AgentInner {
         }
     }
 
+    fn signal_identity_key(&self) -> SignalIdentityKey {
+        let auth = self.current_auth();
+        SignalIdentityKey {
+            authenticated: self.is_authenticated(),
+            enabled: self.server_cfg.enabled,
+            server_host: self.server_cfg.server_host.clone(),
+            signal_port: self.server_cfg.signal_port,
+            relay_port: self.server_cfg.relay_port,
+            use_https: self.server_cfg.use_https,
+            ca_cert_pem: self.server_cfg.ca_cert_pem.clone(),
+            ca_fingerprint_sha256: self.server_cfg.ca_fingerprint_sha256.clone(),
+            device_key: self.server_cfg.device_key.clone(),
+            user_id: auth.current_session().map(|s| s.user_id),
+            device_pubkey_hex: auth.cert_manager().device_pubkey_hex(),
+        }
+    }
+
     #[must_use]
     fn apply_reloaded_context(&mut self, ctx: ReloadedContext) -> RetiredHandles {
+        let prev_sig_key = self.signal_identity_key();
         self.server_cfg = ctx.server_cfg;
         self.prefs = ctx.prefs;
         if let Some(auth) = ctx.auth {
-            self.auth = auth;
+            self.replace_auth(auth);
+        } else {
+            self.current_auth()
+                .update_server_config(self.server_cfg.clone());
         }
         let (pw, custom) = resolve_host_password_mode(
             self.session_type,
@@ -620,7 +697,19 @@ impl AgentInner {
                 self.session_type != ServiceSessionType::LoginWindow && !self.custom_password,
             );
         }
-        let signal = self.start_signal();
+        let next_sig_key = self.signal_identity_key();
+        let signal_state = self.signal.as_ref().map(|s| s.status().state);
+        let signal = if should_restart_signal(
+            self.is_authenticated(),
+            &prev_sig_key,
+            &next_sig_key,
+            signal_state,
+        ) {
+            self.start_signal()
+        } else {
+            self.sync_signal_allow_assist();
+            None
+        };
         self.sync_lan_advertising();
         RetiredHandles { host, signal, lan }
     }
@@ -747,7 +836,7 @@ impl AgentInner {
 
         if let Some(reason) = revoked_reason {
             eprintln!("[rc-host-agent] 收到服务端强制下线通知 ({reason})，清空本地凭据");
-            self.auth.wipe_local_credentials();
+            self.current_auth().wipe_local_credentials();
             let secret = self.ipc_secret.clone();
             let _ = std::thread::Builder::new()
                 .name("rc-agent-daemon-kick".to_string())
@@ -793,13 +882,14 @@ impl AgentInner {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if let Some(sess) = auth_client::load_auth_session(&self.auth.auth_path()) {
+            let auth = self.current_auth();
+            if let Some(sess) = auth_client::load_auth_session(&auth.auth_path()) {
                 if !sess.must_change_password && sess.access_expires_at_unix_sec > now_sec + 90 {
                     self.server_cfg =
                         server_config::load_from_path(&server_config::default_config_path());
                     self.prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
-                    self.auth.update_server_config(self.server_cfg.clone());
-                    self.auth.apply_external_session(sess);
+                    auth.update_server_config(self.server_cfg.clone());
+                    auth.apply_external_session(sess);
                     let (pw, custom) = resolve_host_password_mode(
                         self.session_type,
                         self.prefs.custom_host_password.clone(),
@@ -1393,4 +1483,72 @@ fn main() {
         .take_all_handles();
     retired.stop_all(exit_reason);
     ipc_server.stop();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_identity() -> SignalIdentityKey {
+        SignalIdentityKey {
+            authenticated: true,
+            enabled: true,
+            server_host: "example.com".to_string(),
+            signal_port: 21116,
+            relay_port: 21117,
+            use_https: true,
+            ca_cert_pem: Some(
+                "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----".to_string(),
+            ),
+            ca_fingerprint_sha256: None,
+            device_key: "dev-key".to_string(),
+            user_id: Some("user-1".to_string()),
+            device_pubkey_hex: "pub-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn should_restart_signal_preserves_healthy_connection_and_revives_error_state() {
+        let key = sample_identity();
+        assert!(!should_restart_signal(
+            true,
+            &key,
+            &key,
+            Some(ServerConnectionState::Connected)
+        ));
+        assert!(!should_restart_signal(
+            true,
+            &key,
+            &key,
+            Some(ServerConnectionState::Connecting)
+        ));
+        // 终态退出或错误态时，即便 identity 未变也必须触发重建复活。
+        assert!(should_restart_signal(
+            true,
+            &key,
+            &key,
+            Some(ServerConnectionState::Error)
+        ));
+        assert!(should_restart_signal(true, &key, &key, None));
+        assert!(should_restart_signal(
+            false,
+            &key,
+            &key,
+            Some(ServerConnectionState::Connected)
+        ));
+    }
+
+    #[test]
+    fn signal_identity_key_detects_ca_cert_pem_change_without_fingerprint() {
+        let prev = sample_identity();
+        let mut next = prev.clone();
+        next.ca_cert_pem =
+            Some("-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----".to_string());
+        assert!(should_restart_signal(
+            true,
+            &prev,
+            &next,
+            Some(ServerConnectionState::Connected)
+        ));
+    }
 }

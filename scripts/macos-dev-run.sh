@@ -48,6 +48,19 @@ package_and_sign() {
     cp "$src_bin" "$APP_DIR/Contents/MacOS/$EXEC_NAME"
     chmod +x "$APP_DIR/Contents/MacOS/$EXEC_NAME"
 
+    local dev_version="0.1.7"
+    if [[ -f "$REPO_ROOT/crates/rc-ui/tauri.conf.json" ]]; then
+        dev_version="$(python3 -c '
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+    v = str(cfg.get("version", "")).strip().lstrip("v")
+    print(v or "0.1.7")
+except Exception:
+    print("0.1.7")
+' "$REPO_ROOT/crates/rc-ui/tauri.conf.json")"
+    fi
+
     cat > "$APP_DIR/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,9 +75,9 @@ package_and_sign() {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${dev_version}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${dev_version}</string>
     <key>LSUIElement</key>
     <true/>
 </dict>

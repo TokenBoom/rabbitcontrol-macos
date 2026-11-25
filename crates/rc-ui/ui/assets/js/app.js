@@ -3106,6 +3106,19 @@
       Overlay.onOpenSettings = function () {
         openWindow("settings");
       };
+      Overlay.onOpenAbout = function () {
+        if (IS_TAURI && typeof Bridge.getAppInfo === "function") {
+          Bridge.getAppInfo()
+            .then(function (info) {
+              Overlay.openAbout(info);
+            })
+            .catch(function () {
+              Overlay.openAbout(null);
+            });
+          return;
+        }
+        Overlay.openAbout(null);
+      };
       Overlay.onChangePassword = function () {
         if (!IS_TAURI) {
           toast("功能开发中");

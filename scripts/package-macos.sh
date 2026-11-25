@@ -128,6 +128,7 @@ if [[ -z "$SIGN_ID" ]]; then
 fi
 
 echo "==> 构建 $PRODUCT_NAME v$APP_VERSION ($PROFILE, $ARCH)"
+GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
 BUILD_ARGS=(-p rc-ui --bin rc-ui --bin rc-daemon --bin rc-host-agent)
 if [[ -n "$TARGET_TRIPLE" ]]; then
     BUILD_ARGS+=(--target "$TARGET_TRIPLE")
@@ -135,7 +136,7 @@ fi
 if [[ "$PROFILE" == "release" ]]; then
     BUILD_ARGS+=(--release)
 fi
-(cd "$REPO_ROOT" && cargo build "${BUILD_ARGS[@]}")
+(cd "$REPO_ROOT" && RC_APP_VERSION="$APP_VERSION" RC_GIT_SHA="$GIT_SHA" cargo build "${BUILD_ARGS[@]}")
 
 if [[ -n "$TARGET_TRIPLE" ]]; then
     BIN_DIR="$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE"
@@ -303,9 +304,9 @@ CODESIGN_KEYCHAIN_ARGS=()
 if [[ -n "$SIGN_KEYCHAIN" ]]; then
     CODESIGN_KEYCHAIN_ARGS=(--keychain "$SIGN_KEYCHAIN")
 fi
-codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.daemon" "$APP_BUNDLE/Contents/MacOS/rc-daemon"
-codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.agent" "$APP_BUNDLE/Contents/MacOS/rc-host-agent"
-codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_BUNDLE"
+codesign --force ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.daemon" "$APP_BUNDLE/Contents/MacOS/rc-daemon"
+codesign --force ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.agent" "$APP_BUNDLE/Contents/MacOS/rc-host-agent"
+codesign --force ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
 DMG_PATH=""

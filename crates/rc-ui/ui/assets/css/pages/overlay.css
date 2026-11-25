@@ -449,6 +449,109 @@
 }
 
 /* ────────────────────────────────────────────────────────────────
+ * 关于弹窗（O2「关于」出口）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-about {
+  width: 340px;
+  padding: 24px 22px 20px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  outline: none;
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-about__header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.rc-about__icon {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--r-hero);
+  box-shadow: var(--shadow-card);
+  object-fit: cover;
+}
+
+.rc-about__title {
+  margin: 12px 0 0;
+  color: var(--text-primary);
+  font-size: var(--size-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: 24px;
+}
+
+.rc-about__version {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 6px;
+  padding: 2px 10px;
+  border-radius: var(--r-pill);
+  background: var(--local-pill-bg);
+  color: var(--local-pill-fg);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+
+.rc-about__desc {
+  margin: 10px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--size-secondary);
+  line-height: 18px;
+}
+
+.rc-about__meta {
+  margin-top: 16px;
+  padding: 4px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-row);
+  background: var(--bg-card);
+}
+
+.rc-about__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 30px;
+  font-size: var(--size-caption);
+  line-height: 18px;
+}
+
+.rc-about__row + .rc-about__row {
+  border-top: 1px solid var(--divider);
+}
+
+.rc-about__key {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.rc-about__val {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rc-about__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+/* ────────────────────────────────────────────────────────────────
  * 开发预览台（仅 ?preview=o1|o2|o3 / #o1|#o2|#o3 时注入）
  * ──────────────────────────────────────────────────────────────── */
 .rc-preview {
@@ -540,7 +643,8 @@ body.rc-preview-mode > #app {
 @media (prefers-reduced-motion: reduce) {
   .rc-popover,
   .rc-tools,
-  .rc-confirm {
+  .rc-confirm,
+  .rc-about {
     animation: none;
   }
 

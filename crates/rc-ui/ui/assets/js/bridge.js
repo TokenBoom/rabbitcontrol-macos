@@ -258,6 +258,9 @@
     getAppPrefs: function () {
       return invoke("get_app_prefs");
     },
+    getAppInfo: function () {
+      return invoke("get_app_info");
+    },
     saveStreamPrefs: function (patch) {
       return invoke("save_stream_prefs", { patch: patch || {} });
     },
