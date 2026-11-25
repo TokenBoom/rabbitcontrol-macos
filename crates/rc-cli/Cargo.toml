@@ -9,6 +9,7 @@ build = "build.rs"
 
 [features]
 default = []
+ios-acceptance = ["dep:rc-client-core", "dep:core-foundation"]
 # 编译期基准命令开关：默认关闭，生产构建零额外代码与依赖。
 bench-metrics = [
     "dep:serde",
@@ -52,6 +53,7 @@ rc-render = { workspace = true }
 rc-platform-macos = { path = "../rc-platform-macos" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10", optional = true }
 rc-capture-macos = { path = "../rc-capture-macos" }
 rc-encode-vt = { path = "../rc-encode-vt", optional = true }
 rc-decode-vt = { workspace = true, optional = true }
@@ -68,3 +70,7 @@ rc-host-macos = { path = "../rc-host-macos" }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+
+[[example]]
+name = "ios_accept_local"
+required-features = ["ios-acceptance"]
