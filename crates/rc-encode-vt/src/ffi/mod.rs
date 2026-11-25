@@ -1133,6 +1133,68 @@ impl CompressionSession {
         }
     }
 
+    /// 从 `CMFormatDescription` 提取全部参数集切片（H.264 为 SPS/PPS，HEVC 为 VPS/SPS/PPS），
+    /// 并返回有效的 `NALUnitHeaderLength`（范围 `1..=8`）。
+    ///
+    /// # Safety
+    /// `desc` 必须在返回切片被使用期间保持存活。
+    unsafe fn extract_parameter_sets<'a>(
+        is_hevc: bool,
+        desc: &'a CMFormatDescription,
+        out: &mut [&'a [u8]; 16],
+    ) -> (usize, Option<usize>) {
+        let mut ps_count = 0usize;
+        let mut nal_len_out = None;
+        let mut total = 0usize;
+        for index in 0..out.len() {
+            let mut ptr: *const u8 = std::ptr::null();
+            let mut size = 0usize;
+            let mut count_out = 0usize;
+            let mut nal_header_len: c_int = 0;
+            // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在调用与返回切片存活期内有效。
+            let status = unsafe {
+                if is_hevc {
+                    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                        desc,
+                        index,
+                        std::ptr::addr_of_mut!(ptr),
+                        std::ptr::addr_of_mut!(size),
+                        std::ptr::addr_of_mut!(count_out),
+                        std::ptr::addr_of_mut!(nal_header_len),
+                    )
+                } else {
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        desc,
+                        index,
+                        std::ptr::addr_of_mut!(ptr),
+                        std::ptr::addr_of_mut!(size),
+                        std::ptr::addr_of_mut!(count_out),
+                        std::ptr::addr_of_mut!(nal_header_len),
+                    )
+                }
+            };
+            if status != 0 {
+                break;
+            }
+            if index == 0 {
+                total = count_out;
+                if (1..=8).contains(&nal_header_len) {
+                    nal_len_out = Some(nal_header_len as usize);
+                }
+            }
+            if !ptr.is_null() && size > 0 {
+                // SAFETY: `Get*ParameterSetAtIndex` 成功且非空时 `[ptr, ptr+size)`
+                // 指向 `desc` 内部只读内存，存活期绑定于 `&'a CMFormatDescription`。
+                out[ps_count] = unsafe { std::slice::from_raw_parts(ptr, size) };
+                ps_count += 1;
+            }
+            if total != 0 && index + 1 >= total {
+                break;
+            }
+        }
+        (ps_count, nal_len_out)
+    }
+
     /// 从 sample buffer 提取 Annex-B 码流：优先直接借用连续 `CMBlockBuffer` 内存
     /// （零额外拷贝），再单遍校验并重排为 Annex-B；仅在 IDR 帧从格式描述借用 SPS/PPS
     /// 一次性拼入输出缓冲（P 帧零参数集分配、零全帧字节扫描）。
@@ -1191,76 +1253,40 @@ impl CompressionSession {
 
         // 热路径：P 帧直接使用缓存的 `cached_length_size`（默认 4），完全跳过
         // `sample.format_description()`（CFRetain/CFRelease）与参数集索引查询；
-        // 仅在 IDR 帧或结构预检未命中时才查询格式描述并刷新 `cached_length_size`。
+        // 仅在 IDR 帧或结构预检未命中时才查询一次格式描述并刷新 `cached_length_size`。
         let inspected_len_size = self.cached_length_size;
-        if let Some((keyframe, body_len)) =
-            annexb::inspect_avcc_for(self.is_hevc, raw_bytes, inspected_len_size)
-        {
-            if !keyframe {
-                let data =
-                    annexb::write_avcc_as_annexb(raw_bytes, inspected_len_size, &[], body_len);
-                return Ok(EncodedOutput {
-                    data,
-                    keyframe: false,
-                });
-            }
-            // IDR 帧：读取格式描述以提取 SPS/PPS/VPS，并确认 length_size。
-            // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
-            let desc_opt = unsafe { sample.format_description() };
-            let mut ps_slices: [&[u8]; 16] = [&[]; 16];
-            let mut ps_count = 0usize;
-            let mut actual_len_size = inspected_len_size;
-            if let Some(ref desc) = desc_opt {
-                let mut total = 0usize;
-                for index in 0..16usize {
-                    let mut ptr: *const u8 = std::ptr::null();
-                    let mut size = 0usize;
-                    let mut count_out = 0usize;
-                    let mut nal_header_len: c_int = 0;
-                    // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在整个循环与随后的
-                    // `write_avcc_as_annexb` 调用期间保持存活，参数集指针只读有效。
-                    let status = unsafe {
-                        if self.is_hevc {
-                            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                                desc,
-                                index,
-                                std::ptr::addr_of_mut!(ptr),
-                                std::ptr::addr_of_mut!(size),
-                                std::ptr::addr_of_mut!(count_out),
-                                std::ptr::addr_of_mut!(nal_header_len),
-                            )
-                        } else {
-                            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                                desc,
-                                index,
-                                std::ptr::addr_of_mut!(ptr),
-                                std::ptr::addr_of_mut!(size),
-                                std::ptr::addr_of_mut!(count_out),
-                                std::ptr::addr_of_mut!(nal_header_len),
-                            )
-                        }
-                    };
-                    if status != 0 {
-                        break;
-                    }
-                    if index == 0 {
-                        total = count_out;
-                        if nal_header_len > 0 {
-                            actual_len_size = nal_header_len as usize;
-                            self.cached_length_size = actual_len_size;
-                        }
-                    }
-                    if size > 0 {
-                        // SAFETY: `Get*ParameterSetAtIndex` 成功时 `[ptr, ptr+size)`
-                        // 指向 `desc` 内部只读内存，`desc` 存活至本函数末尾。
-                        ps_slices[ps_count] = unsafe { std::slice::from_raw_parts(ptr, size) };
-                        ps_count += 1;
-                    }
-                    if total != 0 && index + 1 >= total {
-                        break;
-                    }
+        let fast_idr_body_len =
+            match annexb::inspect_avcc_for(self.is_hevc, raw_bytes, inspected_len_size) {
+                Some((false, body_len)) => {
+                    let data =
+                        annexb::write_avcc_as_annexb(raw_bytes, inspected_len_size, &[], body_len);
+                    return Ok(EncodedOutput {
+                        data,
+                        keyframe: false,
+                    });
                 }
+                Some((true, body_len)) => Some(body_len),
+                None => None,
+            };
+
+        // IDR 帧或回退路径：统一查询一次格式描述，提取参数集与权威 `NALUnitHeaderLength`。
+        // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
+        let desc_opt = unsafe { sample.format_description() };
+        let mut ps_slices: [&[u8]; 16] = [&[]; 16];
+        let mut ps_count = 0usize;
+        let mut actual_len_size = inspected_len_size;
+        if let Some(ref desc) = desc_opt {
+            // SAFETY: `desc` 存活至本函数末尾，返回的参数集切片只读有效。
+            let (cnt, nal_len) =
+                unsafe { Self::extract_parameter_sets(self.is_hevc, desc, &mut ps_slices) };
+            ps_count = cnt;
+            if let Some(l) = nal_len {
+                actual_len_size = l;
+                self.cached_length_size = l;
             }
+        }
+
+        if let Some(body_len) = fast_idr_body_len {
             if actual_len_size == inspected_len_size {
                 let data = annexb::write_avcc_as_annexb(
                     raw_bytes,
@@ -1275,45 +1301,32 @@ impl CompressionSession {
             }
         }
 
-        // 回退路径：若非 4 字节长度前缀或输入本身已是 Annex-B，查询格式描述后按实际宽度规整。
-        let mut length_size = self.cached_length_size;
-        // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
-        let desc_opt = unsafe { sample.format_description() };
-        if let Some(ref desc) = desc_opt {
-            let mut ptr: *const u8 = std::ptr::null();
-            let mut size = 0usize;
-            let mut count_out = 0usize;
-            let mut nal_header_len: c_int = 0;
-            // SAFETY: 全部出参指向本栈帧合法内存，`desc` 在此调用期间存活。
-            let status = unsafe {
-                if self.is_hevc {
-                    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                        desc,
-                        0,
-                        std::ptr::addr_of_mut!(ptr),
-                        std::ptr::addr_of_mut!(size),
-                        std::ptr::addr_of_mut!(count_out),
-                        std::ptr::addr_of_mut!(nal_header_len),
-                    )
-                } else {
-                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        desc,
-                        0,
-                        std::ptr::addr_of_mut!(ptr),
-                        std::ptr::addr_of_mut!(size),
-                        std::ptr::addr_of_mut!(count_out),
-                        std::ptr::addr_of_mut!(nal_header_len),
-                    )
-                }
+        // 回退路径：按实际 `length_size` 重新解析 AVCC/HVCC 或兼容原始 Annex-B，IDR 保证携带参数集。
+        let length_size = actual_len_size;
+        if let Some((keyframe, body_len)) =
+            annexb::inspect_avcc_for(self.is_hevc, raw_bytes, length_size)
+        {
+            let ps = if keyframe {
+                &ps_slices[..ps_count]
+            } else {
+                &[]
             };
-            if status == 0 && nal_header_len > 0 {
-                length_size = nal_header_len as usize;
-                self.cached_length_size = length_size;
-            }
+            let data = annexb::write_avcc_as_annexb(raw_bytes, length_size, ps, body_len);
+            return Ok(EncodedOutput { data, keyframe });
         }
-        let (data, _source) = annexb::normalize_to_annexb(raw_bytes, length_size)
+        let (mut data, _source) = annexb::normalize_to_annexb(raw_bytes, length_size)
             .ok_or_else(|| EncodeError::Failed("输出码流既非合法 AVCC 也非 Annex-B".to_string()))?;
         let keyframe = annexb::is_idr_for(self.is_hevc, &data);
+        if keyframe && ps_count > 0 && !annexb::has_parameter_sets_for(self.is_hevc, &data) {
+            let ps_bytes: usize = ps_slices[..ps_count].iter().map(|s| 4 + s.len()).sum();
+            let mut with_ps = Vec::with_capacity(ps_bytes + data.len());
+            for ps in &ps_slices[..ps_count] {
+                with_ps.extend_from_slice(&[0, 0, 0, 1]);
+                with_ps.extend_from_slice(ps);
+            }
+            with_ps.extend_from_slice(&data);
+            data = with_ps;
+        }
         Ok(EncodedOutput { data, keyframe })
     }
 }

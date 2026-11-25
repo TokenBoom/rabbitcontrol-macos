@@ -416,7 +416,7 @@ fn bench_encode_pipelined(
                 }
                 out_frames.push(ef);
             }
-            Ok(None) => break,
+            Ok(None) => return Err("recv_encoded 排空超时".to_string()),
             Err(rc_types::Error::EncoderDroppedFrame { .. }) => {
                 dropped += 1;
                 let _ = submitted.pop_front();
@@ -454,10 +454,17 @@ struct DecodeBenchOut {
     lat: LatStats,
 }
 
+fn decoder_max_resolution_for(codec: Codec) -> Resolution {
+    match codec {
+        Codec::Hevc => Resolution::new(8192, 4320),
+        _ => Resolution::new(4096, 4096),
+    }
+}
+
 fn bench_decode_vt(codec: Codec, frames: &[EncodedFrame]) -> Result<DecodeBenchOut, String> {
     let mut dec = VtDecoder::new(VtDecoderConfig {
         codec,
-        max_resolution: Resolution::new(4096, 4096),
+        max_resolution: decoder_max_resolution_for(codec),
         ..VtDecoderConfig::default()
     })
     .map_err(|e| format!("VtDecoder::new 失败: {e}"))?;
@@ -500,7 +507,7 @@ fn bench_decode_vt_pipelined(
 ) -> Result<DecodeBenchOut, String> {
     let mut dec = VtDecoder::new(VtDecoderConfig {
         codec,
-        max_resolution: Resolution::new(4096, 4096),
+        max_resolution: decoder_max_resolution_for(codec),
         ..VtDecoderConfig::default()
     })
     .map_err(|e| format!("VtDecoder::new 失败: {e}"))?;
@@ -531,14 +538,17 @@ fn bench_decode_vt_pipelined(
 
         while dec.in_flight_count() >= depth {
             match dec.recv_decoded(Duration::from_millis(200)) {
-                Ok(Some((done_tok, DecodeOutput::Frame(_)))) => {
+                Ok(Some((done_tok, Ok(DecodeOutput::Frame(_))))) => {
                     if let Some(pos) = submitted.iter().position(|(t, _)| *t == done_tok) {
                         let (_, st_t) = submitted.remove(pos).unwrap();
                         lat_ms.push(st_t.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                Ok(Some((done_tok, other))) => {
+                Ok(Some((done_tok, Ok(other)))) => {
                     return Err(format!("recv_decoded 帧 {done_tok} 非 Frame: {other:?}"));
+                }
+                Ok(Some((done_tok, Err(e)))) => {
+                    return Err(format!("recv_decoded 帧 {done_tok} 失败: {e}"));
                 }
                 Ok(None) => return Err("recv_decoded 超时".to_string()),
                 Err(e) => return Err(format!("recv_decoded 失败: {e}")),
@@ -547,18 +557,21 @@ fn bench_decode_vt_pipelined(
     }
     while dec.in_flight_count() > 0 {
         match dec.recv_decoded(Duration::from_millis(200)) {
-            Ok(Some((done_tok, DecodeOutput::Frame(_)))) => {
+            Ok(Some((done_tok, Ok(DecodeOutput::Frame(_))))) => {
                 if let Some(pos) = submitted.iter().position(|(t, _)| *t == done_tok) {
                     let (_, st_t) = submitted.remove(pos).unwrap();
                     lat_ms.push(st_t.elapsed().as_secs_f64() * 1000.0);
                 }
             }
-            Ok(Some((done_tok, other))) => {
+            Ok(Some((done_tok, Ok(other)))) => {
                 return Err(format!(
                     "recv_decoded 排空帧 {done_tok} 非 Frame: {other:?}"
                 ));
             }
-            Ok(None) => break,
+            Ok(Some((done_tok, Err(e)))) => {
+                return Err(format!("recv_decoded 排空帧 {done_tok} 失败: {e}"));
+            }
+            Ok(None) => return Err("recv_decoded 排空超时".to_string()),
             Err(e) => return Err(format!("recv_decoded 排空失败: {e}")),
         }
     }
@@ -681,134 +694,137 @@ pub fn execute_codec_bench(cfg: CodecBenchCfg) -> Result<(), String> {
         }));
     }
 
-    // 额外 A/B：Preset::Fastest vs Preset::Balanced，以及稳态定频（paced 60/120fps）对比
-    println!("\n=== 编码器 Preset / 定频稳态专项对照（3840x2160@120 & 1920x1080@60）===");
+    // 额外 A/B：仅在 --matrix 模式下执行 Preset（speed_over_quality 开关对照）与稳态定频专项对比
     let mut ab_rows = Vec::new();
-    for &(w, h, fps, bps, codec, preset, paced) in &[
-        (
-            1920u32,
-            1080u32,
-            60u32,
-            12_000_000u32,
-            Codec::H264,
-            Preset::Balanced,
-            true,
-        ),
-        (
-            1920,
-            1080,
-            60,
-            12_000_000,
-            Codec::H264,
-            Preset::Fastest,
-            true,
-        ),
-        (
-            1920,
-            1080,
-            60,
-            12_000_000,
-            Codec::Hevc,
-            Preset::Balanced,
-            true,
-        ),
-        (
-            1920,
-            1080,
-            60,
-            12_000_000,
-            Codec::Hevc,
-            Preset::Fastest,
-            true,
-        ),
-        (
-            3840,
-            2160,
-            120,
-            80_000_000,
-            Codec::Hevc,
-            Preset::Balanced,
-            false,
-        ),
-        (
-            3840,
-            2160,
-            120,
-            80_000_000,
-            Codec::Hevc,
-            Preset::Fastest,
-            false,
-        ),
-        (
-            3840,
-            2160,
-            120,
-            80_000_000,
-            Codec::H264,
-            Preset::Balanced,
-            false,
-        ),
-        (
-            3840,
-            2160,
-            120,
-            80_000_000,
-            Codec::H264,
-            Preset::Fastest,
-            false,
-        ),
-    ] {
-        let even = Resolution::new(w, h).to_even();
-        if even != cached_res {
-            cached_pool = pool::build_desktop_pool(even.width, even.height, 16)?;
-            cached_res = even;
+    if cfg.matrix {
+        println!("\n=== 编码器 Preset / 定频稳态专项对照（3840x2160@120 & 1920x1080@60）===");
+        for &(w, h, fps, bps, codec, preset, paced) in &[
+            (
+                1920u32,
+                1080u32,
+                60u32,
+                12_000_000u32,
+                Codec::H264,
+                Preset::HighQuality,
+                true,
+            ),
+            (
+                1920,
+                1080,
+                60,
+                12_000_000,
+                Codec::H264,
+                Preset::Balanced,
+                true,
+            ),
+            (
+                1920,
+                1080,
+                60,
+                12_000_000,
+                Codec::Hevc,
+                Preset::Balanced,
+                true,
+            ),
+            (
+                1920,
+                1080,
+                60,
+                12_000_000,
+                Codec::Hevc,
+                Preset::Fastest,
+                true,
+            ),
+            (
+                3840,
+                2160,
+                120,
+                80_000_000,
+                Codec::Hevc,
+                Preset::Balanced,
+                false,
+            ),
+            (
+                3840,
+                2160,
+                120,
+                80_000_000,
+                Codec::Hevc,
+                Preset::Fastest,
+                false,
+            ),
+            (
+                3840,
+                2160,
+                120,
+                80_000_000,
+                Codec::H264,
+                Preset::HighQuality,
+                false,
+            ),
+            (
+                3840,
+                2160,
+                120,
+                80_000_000,
+                Codec::H264,
+                Preset::Balanced,
+                false,
+            ),
+        ] {
+            let even = Resolution::new(w, h).to_even();
+            if even != cached_res {
+                cached_pool = pool::build_desktop_pool(even.width, even.height, 16)?;
+                cached_res = even;
+            }
+            let enc_cfg = EncoderConfig {
+                codec,
+                resolution: even,
+                fps,
+                bitrate_bps: bps,
+                preset,
+                low_latency: true,
+                gop_len: 0,
+                b_frames: 0,
+            };
+            let n = if paced {
+                cfg.frames.min(90)
+            } else {
+                cfg.frames
+            };
+            let res = bench_encode_sync(enc_cfg, &cached_pool, n, paced)?;
+            let preset_name = match preset {
+                Preset::Fastest => "fastest",
+                Preset::Balanced => "balanced",
+                Preset::HighQuality => "high_quality",
+                _ => "other",
+            };
+            println!(
+                "  {w}x{h}@{fps:<3} {:<4} {:<12} {:<7} | P50={:>5.2}ms P95={:>5.2}ms P99={:>5.2}ms | {:>6.1}fps | P_avg={:>5.1}KB ({:>5.1} Mbps) drops={}",
+                codec.as_str(),
+                preset_name,
+                if paced { "paced" } else { "unpaced" },
+                res.lat.p50_ms,
+                res.lat.p95_ms,
+                res.lat.p99_ms,
+                res.max_fps,
+                res.p_avg_kb,
+                res.actual_mbps,
+                res.dropped,
+            );
+            ab_rows.push(serde_json::json!({
+                "resolution": format!("{w}x{h}"),
+                "fps": fps,
+                "codec": codec.as_str(),
+                "preset": preset_name,
+                "paced": paced,
+                "max_fps": r2(res.max_fps),
+                "p_avg_kb": r2(res.p_avg_kb),
+                "actual_mbps": r2(res.actual_mbps),
+                "dropped": res.dropped,
+                "latency": res.lat.to_json(),
+            }));
         }
-        let enc_cfg = EncoderConfig {
-            codec,
-            resolution: even,
-            fps,
-            bitrate_bps: bps,
-            preset,
-            low_latency: true,
-            gop_len: 0,
-            b_frames: 0,
-        };
-        let n = if paced {
-            cfg.frames.min(90)
-        } else {
-            cfg.frames
-        };
-        let res = bench_encode_sync(enc_cfg, &cached_pool, n, paced)?;
-        let preset_name = match preset {
-            Preset::Fastest => "fastest",
-            Preset::Balanced => "balanced",
-            _ => "other",
-        };
-        println!(
-            "  {w}x{h}@{fps:<3} {:<4} {:<8} {:<7} | P50={:>5.2}ms P95={:>5.2}ms P99={:>5.2}ms | {:>6.1}fps | P_avg={:>5.1}KB ({:>5.1} Mbps) drops={}",
-            codec.as_str(),
-            preset_name,
-            if paced { "paced" } else { "unpaced" },
-            res.lat.p50_ms,
-            res.lat.p95_ms,
-            res.lat.p99_ms,
-            res.max_fps,
-            res.p_avg_kb,
-            res.actual_mbps,
-            res.dropped,
-        );
-        ab_rows.push(serde_json::json!({
-            "resolution": format!("{w}x{h}"),
-            "fps": fps,
-            "codec": codec.as_str(),
-            "preset": preset_name,
-            "paced": paced,
-            "max_fps": r2(res.max_fps),
-            "p_avg_kb": r2(res.p_avg_kb),
-            "actual_mbps": r2(res.actual_mbps),
-            "dropped": res.dropped,
-            "latency": res.lat.to_json(),
-        }));
     }
 
     if let Some(path) = cfg.report_path {

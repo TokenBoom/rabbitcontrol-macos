@@ -52,7 +52,7 @@ use rc_types::Resolution;
 #[cfg(target_os = "macos")]
 use std::fmt;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
@@ -79,13 +79,17 @@ fn caps_for(cfg: &EncoderConfig) -> EncoderCaps {
         }
         _ => &[],
     };
+    let max_resolution = match cfg.codec {
+        // Apple Silicon HEVC 硬件编码支持 5K (5120x2880) / 8K；H.264 硬件编码上限为 4096x4096。
+        rc_encode::Codec::Hevc => Resolution::new(8192, 4320),
+        _ => Resolution::new(4096, 4096),
+    };
     EncoderCaps {
         codec: cfg.codec,
         // 会话创建时显式要求硬件编码器（RequireHardwareAccelerated = true，
         // 见 ffi 模块），无硬件可用会在构造期失败而非静默落回软编。
         hardware: true,
-        // 保守声明 4K/5K 兼容上限：超过它应由上层降分辨率。
-        max_resolution: Resolution::new(4096, 4096),
+        max_resolution,
         // ffi 侧重排为 Annex-B（见模块文档「输出格式」）。
         bitstream_format: BitstreamFormat::AnnexB,
         profiles,
@@ -143,46 +147,84 @@ impl fmt::Debug for VtEncoder {
     }
 }
 
-/// 进程级 E6 自检缓存位掩码（按 `(codec, profile)` 记录已通过完整编解码闭环校验的档位，
-/// 消除同一进程内重连/切分辨率时每次重建编码器重复创建临时解码会话带来的 30–70ms 冷启动开销）。
+/// 真机基准实证（Apple M1 Pro 1080p@60 定频）：H.264 开启 PrioritizeEncodingSpeedOverQuality
+/// 在同码率（12.2 Mbps）下把 P95/P99 从 10.55/11.08ms 压低至 6.33/6.84ms（-40%）；
+/// HEVC 在 Balanced 默认档位表现更优，故仅在 Fastest/Fast 显式开启。
 #[cfg(target_os = "macos")]
-static E6_VERIFIED_PROFILES: AtomicU8 = AtomicU8::new(0);
+fn speed_over_quality_for(cfg: &EncoderConfig) -> bool {
+    match cfg.codec {
+        rc_encode::Codec::H264 => {
+            matches!(
+                cfg.preset,
+                Preset::Fastest | Preset::Fast | Preset::Balanced
+            )
+        }
+        _ => matches!(cfg.preset, Preset::Fastest | Preset::Fast),
+    }
+}
+
+/// 进程级 E6 自检缓存键：按 `(codec, high_profile, llrc, speed_over_quality, width, height)`
+/// 精确区分不同编码器规格与分辨率，消除同配置热重连时重复创建临时解码会话带来的 30–70ms 开销。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct E6CacheKey {
+    codec: rc_encode::Codec,
+    high_profile: bool,
+    llrc: bool,
+    speed_over_quality: bool,
+    width: u32,
+    height: u32,
+}
 
 #[cfg(target_os = "macos")]
-fn e6_profile_bit(cfg: &EncoderConfig) -> u8 {
-    match cfg.codec {
-        rc_encode::Codec::Hevc => 1 << 2,
-        rc_encode::Codec::H264 => {
-            let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
-            if pixels > 2_073_600 || cfg.fps > 60 {
-                1 << 1 // H.264 High
-            } else {
-                1 << 0 // H.264 Baseline
-            }
+const MAX_E6_CACHE_ENTRIES: usize = 64;
+
+#[cfg(target_os = "macos")]
+static E6_VERIFIED_KEYS: OnceLock<Mutex<Vec<E6CacheKey>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn e6_cache_key(cfg: &EncoderConfig) -> E6CacheKey {
+    let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
+    let high_profile = cfg.codec == rc_encode::Codec::H264 && (pixels > 2_073_600 || cfg.fps > 60);
+    E6CacheKey {
+        codec: cfg.codec,
+        high_profile,
+        llrc: ffi::use_low_latency_rate_control(cfg.fps),
+        speed_over_quality: speed_over_quality_for(cfg),
+        width: cfg.resolution.width,
+        height: cfg.resolution.height,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn e6_cache_contains(key: E6CacheKey) -> bool {
+    let cache = E6_VERIFIED_KEYS.get_or_init(|| Mutex::new(Vec::new()));
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
+#[cfg(target_os = "macos")]
+fn e6_cache_insert(key: E6CacheKey) {
+    let cache = E6_VERIFIED_KEYS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.contains(&key) {
+        if guard.len() >= MAX_E6_CACHE_ENTRIES {
+            guard.remove(0);
         }
-        _ => 0,
+        guard.push(key);
     }
 }
 
 #[cfg(target_os = "macos")]
 impl VtEncoder {
-    /// 创建编码器：配置校验 → 建会话（属性逐条落死）→ E6 启动自检（同进程按档位缓存）。
+    /// 创建编码器：配置校验 → 建会话（属性逐条落死）→ E6 启动自检（同进程按配置键缓存）。
     ///
     /// 任何一步失败都返回 `Err`（花屏问题在构造期暴露，而不是运行期）。
     pub fn new(cfg: EncoderConfig) -> Result<Self> {
         validate_supported(&cfg)?;
-        // 真机基准实证（Apple M1 Pro 1080p@60 定频）：H.264 开启 PrioritizeEncodingSpeedOverQuality
-        // 在同码率（12.2 Mbps）下把 P95/P99 从 10.55/11.08ms 压低至 6.33/6.84ms（-40%）；
-        // HEVC 在 Balanced 默认档位表现更优，故仅在 Fastest/Fast 显式开启。
-        let speed_over_quality = match cfg.codec {
-            rc_encode::Codec::H264 => {
-                matches!(
-                    cfg.preset,
-                    Preset::Fastest | Preset::Fast | Preset::Balanced
-                )
-            }
-            _ => matches!(cfg.preset, Preset::Fastest | Preset::Fast),
-        };
+        let speed_over_quality = speed_over_quality_for(&cfg);
         let session = ffi::CompressionSession::new(&ffi::SessionParams {
             codec: cfg.codec,
             width: cfg.resolution.width,
@@ -199,12 +241,10 @@ impl VtEncoder {
             idr_requested: false,
             first_frame_pending: true,
         };
-        let bit = e6_profile_bit(&cfg);
-        if bit == 0 || (E6_VERIFIED_PROFILES.load(Ordering::Acquire) & bit) == 0 {
+        let cache_key = e6_cache_key(&cfg);
+        if !e6_cache_contains(cache_key) {
             encoder.self_check()?;
-            if bit != 0 {
-                E6_VERIFIED_PROFILES.fetch_or(bit, Ordering::Release);
-            }
+            e6_cache_insert(cache_key);
         }
         Ok(encoder)
     }
@@ -263,6 +303,13 @@ fn validate_supported(cfg: &EncoderConfig) -> Result<()> {
         return Err(Error::InvalidConfig(format!(
             "rc-encode-vt: 分辨率必须为偶数（YUV 4:2:0），当前 {}x{}；请先 Resolution::to_even",
             cfg.resolution.width, cfg.resolution.height
+        )));
+    }
+    let max = caps_for(cfg).max_resolution;
+    if cfg.resolution.width > max.width || cfg.resolution.height > max.height {
+        return Err(Error::InvalidConfig(format!(
+            "rc-encode-vt: 分辨率 {}x{} 超过硬件编码上限 {}x{}",
+            cfg.resolution.width, cfg.resolution.height, max.width, max.height
         )));
     }
     Ok(())
@@ -652,15 +699,16 @@ mod real_machine {
         );
 
         // —— 延迟分解（cfg(test) 探针，ffi::latency_diag）——
-        // 第 0 条记录是 E6 自检帧，跳过；四段长度可能不齐时按最短对齐。
+        // 若本次构造执行了 E6 自检（记录数多于正式帧数），跳过第 0 条 E6 帧；四段按最短对齐。
         let marks = crate::ffi::latency_diag::take();
-        let n = marks
+        let total_marks = marks
             .submitted
             .len()
             .min(marks.callback.len())
             .min(marks.woken.len())
-            .min(marks.returned.len())
-            .saturating_sub(1);
+            .min(marks.returned.len());
+        let start_idx = usize::from(total_marks > 300);
+        let n = total_marks.saturating_sub(start_idx);
         let seg_ms = |a: std::time::Instant, b: std::time::Instant| {
             b.checked_duration_since(a)
                 .unwrap_or_default()
@@ -670,7 +718,7 @@ mod real_machine {
         let mut vt_ms: Vec<f64> = Vec::with_capacity(n);
         let mut wake_ms: Vec<f64> = Vec::with_capacity(n);
         let mut extract_ms: Vec<f64> = Vec::with_capacity(n);
-        for r in 1..=n {
+        for r in start_idx..(start_idx + n) {
             vt_ms.push(seg_ms(marks.submitted[r], marks.callback[r]));
             wake_ms.push(seg_ms(marks.callback[r], marks.woken[r]));
             extract_ms.push(seg_ms(marks.woken[r], marks.returned[r]));
@@ -696,7 +744,7 @@ mod real_machine {
         report("唤醒→返回（提取+重排）", &mut extract_ms);
         // 相邻回调到达间隔：若 VT 以固定节拍投递输出，会在这里显形。
         let mut cadence_ms: Vec<f64> = Vec::with_capacity(n.saturating_sub(1));
-        for r in 2..=n {
+        for r in (start_idx + 1)..(start_idx + n) {
             cadence_ms.push(seg_ms(marks.callback[r - 1], marks.callback[r]));
         }
         report("相邻 callback 间隔（投递节拍）", &mut cadence_ms);
@@ -885,5 +933,87 @@ mod real_machine {
         assert!(!second.1.is_keyframe, "第二帧应为 P 帧");
         assert_eq!(encoder.in_flight_count(), 0);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod e6_cache_tests {
+    use super::*;
+
+    #[test]
+    fn e6_cache_key_distinguishes_llrc_profile_and_resolution() {
+        let h264_60 = EncoderConfig {
+            codec: rc_encode::Codec::H264,
+            resolution: Resolution::new(1920, 1080),
+            fps: 60,
+            ..EncoderConfig::default()
+        };
+        let h264_120 = EncoderConfig {
+            fps: 120,
+            ..h264_60
+        };
+        let hevc_60 = EncoderConfig {
+            codec: rc_encode::Codec::Hevc,
+            ..h264_60
+        };
+        let hevc_120 = EncoderConfig {
+            fps: 120,
+            ..hevc_60
+        };
+        let hevc_4k_120 = EncoderConfig {
+            resolution: Resolution::new(3840, 2160),
+            ..hevc_120
+        };
+
+        let h264_hq = EncoderConfig {
+            preset: Preset::HighQuality,
+            ..h264_60
+        };
+        let hevc_fastest = EncoderConfig {
+            preset: Preset::Fastest,
+            ..hevc_120
+        };
+
+        assert_ne!(e6_cache_key(&h264_60), e6_cache_key(&h264_120));
+        assert_ne!(e6_cache_key(&h264_60), e6_cache_key(&h264_hq));
+        assert_ne!(e6_cache_key(&hevc_60), e6_cache_key(&hevc_120));
+        assert_ne!(e6_cache_key(&hevc_120), e6_cache_key(&hevc_fastest));
+        assert_ne!(e6_cache_key(&hevc_120), e6_cache_key(&hevc_4k_120));
+        assert_ne!(e6_cache_key(&h264_120), e6_cache_key(&hevc_120));
+    }
+
+    #[test]
+    fn validate_supported_respects_per_codec_resolution_caps() {
+        let cfg_h264_5k = EncoderConfig {
+            codec: rc_encode::Codec::H264,
+            resolution: Resolution::new(5120, 2880),
+            fps: 60,
+            ..EncoderConfig::default()
+        };
+        let err =
+            validate_supported(&cfg_h264_5k).expect_err("H.264 超过 4096x4096 应在构造前被拒");
+        assert!(matches!(err, Error::InvalidConfig(_)));
+
+        let cfg_hevc_5k = EncoderConfig {
+            codec: rc_encode::Codec::Hevc,
+            resolution: Resolution::new(5120, 2880),
+            fps: 60,
+            ..EncoderConfig::default()
+        };
+        assert!(
+            validate_supported(&cfg_hevc_5k).is_ok(),
+            "HEVC 应放行 5K Studio Display (5120x2880)"
+        );
+
+        let cfg_hevc_over_8k = EncoderConfig {
+            codec: rc_encode::Codec::Hevc,
+            resolution: Resolution::new(8194, 4320),
+            fps: 60,
+            ..EncoderConfig::default()
+        };
+        assert!(matches!(
+            validate_supported(&cfg_hevc_over_8k),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 }
