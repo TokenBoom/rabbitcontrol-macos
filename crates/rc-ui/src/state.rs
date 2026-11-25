@@ -271,6 +271,15 @@ impl<H> ActiveSession<H> {
         let frame = self.effective_layer_frame(fallback_frame);
         Some((self.id, lease, frame))
     }
+
+    /// 关闭 S1 窗口但保留底层无头工具会话时，将图层状态复位为 `None` 并返回待主线程摘除的 `LayerLease`。
+    pub fn reset_layer_for_headless(&mut self) -> Option<LayerLease> {
+        let prev = std::mem::replace(&mut self.layer_state, LayerAttachment::None);
+        match prev {
+            LayerAttachment::Attached(lease) | LayerAttachment::Attaching(lease) => Some(lease),
+            LayerAttachment::None => None,
+        }
+    }
 }
 
 /// 主线程执行 `attach_layer` 前复核：仅当 `sid` 仍为当前未断开会话且处于 `Attaching(lease)`
@@ -817,6 +826,11 @@ pub struct AppState {
     pub service_transition_lock: Mutex<()>,
     /// 用户是否主动触发「整体退出 / 彻底退出」（为 `true` 时关闭主窗口不再隐藏到菜单栏）。
     pub quitting: AtomicBool,
+    /// 前台 GUI 单实例唤醒用 `gui.sock` IPC 服务句柄（供 `rc-host-agent` 直接唤起已运行主窗口）。
+    pub gui_ipc: Mutex<Option<rc_ui::service_ipc::IpcServer>>,
+    /// macOS 系统快捷键主动拦截器（开启「发送系统快捷键到被控端」且 S1 窗口获焦时生效）。
+    #[cfg(target_os = "macos")]
+    pub shortcut_tap: Mutex<Option<rc_input_macos::SystemShortcutTap>>,
     /// 最近一次建立的活动会话连接参数（供 `ByeReason::SessionSwitching` 自动重连复用，不含口令出参）。
     pub last_session_params: Mutex<Option<(bool, ActiveSessionMeta)>>,
     /// 单调递增会话代际号分配器（从 1 开始）。
@@ -831,6 +845,22 @@ pub struct AppState {
 
 impl Drop for AppState {
     fn drop(&mut self) {
+        if let Some(mut srv) = self
+            .gui_ipc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            srv.stop();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self
+                .shortcut_tap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
         if let Some(mut handle) = self
             .auth_maintainer
             .lock()
@@ -913,6 +943,9 @@ impl AppState {
             service_proxy_active: AtomicBool::new(false),
             service_transition_lock: Mutex::new(()),
             quitting: AtomicBool::new(false),
+            gui_ipc: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            shortcut_tap: Mutex::new(None),
             last_session_params: Mutex::new(None),
             next_session_id: AtomicU64::new(1),
             devices: default_mock_devices(),
@@ -1035,6 +1068,20 @@ impl AppState {
             AppGateState::PasswordChangeRequired => {
                 Err("首次登录必须修改密码后才能继续使用".to_string())
             }
+        }
+    }
+
+    /// 校验客户端当前未处于「安全锁定」状态；已锁定时拒绝修改设置或发起远控操作。
+    pub fn require_unlocked(&self) -> Result<(), String> {
+        let locked = self
+            .prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .client_lock_enabled;
+        if locked {
+            Err("客户端已锁定，请先输入安全密码解锁".to_string())
+        } else {
+            Ok(())
         }
     }
 

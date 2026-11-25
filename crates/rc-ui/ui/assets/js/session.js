@@ -140,6 +140,9 @@
     var shieldBtn = document.getElementById('btn-shield');
     var ctrlBtn = document.getElementById('btn-control-center');
     var screenTabEl = document.getElementById('screen-tab');
+    var screenTabsEl = document.getElementById('screen-tabs');
+    var addScreenBtn = document.getElementById('btn-add-screen');
+    var nextScreenMenuBtn = document.getElementById('menu-next-screen');
     var screenResMenuEl = document.getElementById('screen-res-menu');
     var screenResListEl = document.getElementById('screen-res-list');
     var tabFitWindowBtn = document.getElementById('btn-tab-fit-window');
@@ -167,6 +170,40 @@
     var watchOnlyMenuBtn = document.getElementById('opt-watch-only');
     var lockNowBtn = document.getElementById('btn-lock-remote-now');
     var autoLockExitBtn = document.getElementById('opt-auto-lock-exit');
+    var hostMuteBtn = document.getElementById('opt-host-mute');
+    var hostRestoreAudioBtn = document.getElementById('opt-host-restore-audio');
+    var privacyModeMenuItem = document.getElementById('menu-privacy-mode');
+    var privacyModeValEl = document.getElementById('menu-privacy-mode-val');
+    var privacyModeMenuEl = document.getElementById('privacy-mode-menu');
+    var openPrivacyModalBtn = document.getElementById('btn-open-privacy-modal');
+    var privacyModalBackdrop = document.getElementById('privacy-modal-backdrop');
+    var privacyModalCloseBtn = document.getElementById('btn-privacy-modal-close');
+    var privacyUploadBtn = document.getElementById('btn-privacy-upload');
+    var privacyFileInput = document.getElementById('privacy-file-input');
+    var privacyCustomCard = document.getElementById('privacy-custom-card');
+    var privacyCustomImg = document.getElementById('privacy-custom-img');
+    var privacyCustomEmpty = document.getElementById('privacy-custom-empty');
+    var privacyLastUsedBadge = document.getElementById('privacy-last-used-badge');
+    var privacyPresetsGrid = document.getElementById('privacy-presets-grid');
+    var privacyPreviewBtn = document.getElementById('btn-privacy-preview');
+    var privacyCancelBtn = document.getElementById('btn-privacy-cancel');
+    var privacyConfirmBtn = document.getElementById('btn-privacy-confirm');
+    var privacyPreviewOverlay = document.getElementById('privacy-preview-overlay');
+    var privacyPreviewSurface = document.getElementById('privacy-preview-surface');
+    var privacyPreviewImg = document.getElementById('privacy-preview-img');
+    var privacyPreviewCaption = document.getElementById('privacy-preview-caption');
+    var privacyPreviewCloseBtn = document.getElementById('btn-privacy-preview-close');
+    var optSendSysShortcutsBtn = document.getElementById('opt-send-sys-shortcuts');
+    var btnConfigShortcuts = document.getElementById('btn-config-shortcuts');
+    var menuMouseModeItem = document.getElementById('menu-mouse-mode');
+    var menuMouseModeValEl = document.getElementById('menu-mouse-mode-val');
+    var mouseModeMenuEl = document.getElementById('mouse-mode-menu');
+    var shortcutsModalBackdrop = document.getElementById('shortcuts-modal-backdrop');
+    var shortcutsModalCloseBtn = document.getElementById('btn-shortcuts-modal-close');
+    var shortcutsListEl = document.getElementById('shortcuts-list');
+    var shortcutsResetBtn = document.getElementById('btn-shortcuts-reset');
+    var shortcutsCancelBtn = document.getElementById('btn-shortcuts-cancel');
+    var shortcutsSaveBtn = document.getElementById('btn-shortcuts-save');
     var mtlsSwitchEl = document.getElementById('opt-mtls');
     var secTransportModeEl = document.getElementById('sec-transport-mode');
     var secMtlsStatusEl = document.getElementById('sec-mtls-status');
@@ -1169,6 +1206,50 @@
       });
     }
 
+    var prefsLoaded = false;
+    var displaysRequested = false;
+    var initialSessionPrefsApplied = false;
+
+    function normalizePrivacyPreset(p) {
+      if (p === 'custom') return 'custom';
+      return PRESET_LABELS[p] ? p : 'preset-1';
+    }
+
+    function requestSessionDisplaysOnce() {
+      if (displaysRequested) return;
+      if (IS_TAURI && typeof Bridge.listSessionDisplays === 'function') {
+        displaysRequested = true;
+        Bridge.listSessionDisplays().catch(function () {
+          displaysRequested = false;
+        });
+      }
+    }
+
+    function applySavedSessionPrefsIfReady() {
+      if (
+        initialSessionPrefsApplied ||
+        !prefsLoaded ||
+        !realSessionActive ||
+        sessionLifecycleState !== 'active' ||
+        watchMode
+      ) {
+        return;
+      }
+      initialSessionPrefsApplied = true;
+      if (privacyState.mode && privacyState.mode !== 'off') {
+        applyPrivacyMode(privacyState.mode, privacyState.preset, null, false, false);
+      }
+      if (hostAudioState.muted) {
+        applyHostSystemMute(true, hostAudioState.restoreOnExit, false, false);
+      }
+      if (peripheralsState.mouseMode && peripheralsState.mouseMode !== 'smart') {
+        applyMouseMode(peripheralsState.mouseMode, false, false);
+      }
+      if (peripheralsState.sendSystemShortcuts) {
+        applySystemShortcuts(true, peripheralsState.shortcutExceptions, false, false);
+      }
+    }
+
     if (IS_TAURI && typeof Bridge.getAppPrefs === 'function') {
       Bridge.getAppPrefs()
         .then(function (prefs) {
@@ -1192,6 +1273,41 @@
           if (!hasActiveSessionSecurity && typeof prefs.defaultEncryptConnection === 'boolean') {
             linkSecurityState.encryptConnection = prefs.defaultEncryptConnection;
             syncLinkSecurityUi();
+          }
+          if (typeof prefs.privacyMode === 'string') {
+            privacyState.mode = prefs.privacyMode;
+          }
+          if (typeof prefs.privacyPreset === 'string' && prefs.privacyPreset) {
+            privacyState.preset = normalizePrivacyPreset(prefs.privacyPreset);
+          }
+          if (typeof prefs.hostMuteOnConnect === 'boolean') {
+            hostAudioState.muted = prefs.hostMuteOnConnect;
+          }
+          if (typeof prefs.hostRestoreAudioOnExit === 'boolean') {
+            hostAudioState.restoreOnExit = prefs.hostRestoreAudioOnExit;
+          }
+          if (typeof prefs.sendSystemShortcuts === 'boolean') {
+            peripheralsState.sendSystemShortcuts = prefs.sendSystemShortcuts;
+          }
+          if (Array.isArray(prefs.shortcutExceptions)) {
+            peripheralsState.shortcutExceptions = prefs.shortcutExceptions.slice();
+          }
+          if (typeof prefs.mouseMode === 'string' && prefs.mouseMode) {
+            peripheralsState.mouseMode = prefs.mouseMode;
+          }
+          prefsLoaded = true;
+          syncPrivacyAndHostAudioUi();
+          syncPeripheralsUi();
+          applySavedSessionPrefsIfReady();
+        })
+        .catch(function () {});
+    }
+    if (IS_TAURI && typeof Bridge.getPrivacyCustomImage === 'function') {
+      Bridge.getPrivacyCustomImage()
+        .then(function (dataUrl) {
+          if (typeof dataUrl === 'string' && dataUrl.indexOf('data:image/') === 0) {
+            privacyState.customDataUrl = dataUrl;
+            syncPrivacyModalUi();
           }
         })
         .catch(function () {});
@@ -1318,29 +1434,99 @@
 
     document.addEventListener('pointerdown', onOutsidePointer, true);
 
-    /* ── S2 安全状态气泡 ───────────────────────────────────────── */
+    /* ── S2 安全状态气泡 & 防窥隐私幕布 & 被控端静音 & 外设 & 虚拟屏 ── */
     var secPrivacy = document.getElementById('sec-privacy');
+    var secPrivacyDesc = document.getElementById('sec-privacy-desc');
     var secMute = document.getElementById('sec-mute');
     var secLock = document.getElementById('sec-lock');
     var secMuteValue = document.getElementById('sec-mute-value');
     var secLockValue = document.getElementById('sec-lock-value');
     var warningPill = document.getElementById('security-warning');
 
-    /* 「需关注」判定：防窥=关闭 或 自动锁屏=关 时显示，否则隐藏（§6 S2） */
+    var privacyState = {
+      mode: 'off',
+      preset: 'preset-1',
+      customDataUrl: '',
+      draftPreset: 'preset-1',
+      draftCustomDataUrl: ''
+    };
+    var hostAudioState = {
+      muted: false,
+      restoreOnExit: true
+    };
+    var remoteAudioMuted = false;
+    var peripheralsState = {
+      sendSystemShortcuts: false,
+      shortcutExceptions: [],
+      mouseMode: 'smart'
+    };
+    var displaysState = {
+      displays: [],
+      activeDisplayId: 0
+    };
+
+    var SHORTCUT_CATALOG = [
+      { id: 'cmd+tab', label: '切换应用程序', key: '⌘Tab' },
+      { id: 'cmd+space', label: '聚焦搜索 (Spotlight)', key: '⌘Space' },
+      { id: 'cmd+q', label: '退出当前应用', key: '⌘Q' },
+      { id: 'cmd+h', label: '隐藏当前窗口', key: '⌘H' },
+      { id: 'cmd+m', label: '最小化当前窗口', key: '⌘M' },
+      { id: 'shift+cmd+3', label: '全屏截图', key: '⇧⌘3' },
+      { id: 'shift+cmd+4', label: '区域截图', key: '⇧⌘4' },
+      { id: 'shift+cmd+5', label: '录屏与截屏面板', key: '⇧⌘5' },
+      { id: 'alt+cmd+esc', label: '强制退出应用', key: '⌥⌘Esc' },
+      { id: 'ctrl+up', label: '调度中心 (Mission Control)', key: '⌃↑' },
+      { id: 'ctrl+left', label: '切换左侧桌面空间', key: '⌃←' },
+      { id: 'ctrl+right', label: '切换右侧桌面空间', key: '⌃→' }
+    ];
+
+    var PRESET_LABELS = {
+      'preset-1': '守护深蓝 · 远程隐私保护中',
+      'preset-2': '深邃星空 · 远程隐私保护中',
+      'preset-3': '静谧森绿 · 远程隐私保护中',
+      'preset-4': '极光紫夜 · 远程隐私保护中',
+      'preset-5': '极简石墨 · 远程隐私保护中',
+      'preset-6': '纯黑防窥 · 远程隐私保护中',
+      custom: '自定义隐私屏保'
+    };
+
+    var MOUSE_MODE_LABELS = {
+      smart: '智能鼠标',
+      remote: '使用被控端鼠标',
+      local: '使用主控端鼠标'
+    };
+
+    function isAnySessionModalOpen() {
+      if (privacyModalBackdrop && !privacyModalBackdrop.hidden) return true;
+      if (privacyPreviewOverlay && !privacyPreviewOverlay.hidden) return true;
+      if (shortcutsModalBackdrop && !shortcutsModalBackdrop.hidden) return true;
+      return false;
+    }
+
+    /* 「需关注」判定：仅当 防窥模式=关闭 且 自动锁屏=关 时才显示 */
     function syncSecurityState() {
       if (!secPrivacy || !secMute || !secLock) return;
       var privacyOff = secPrivacy.value === 'off';
       var lockOn = Boolean(secLock.checked);
-      var mutedOn = Boolean(secMute.checked);
+      var hostMutedOn = Boolean(secMute.checked);
 
-      if (warningPill) warningPill.hidden = !(privacyOff || !lockOn);
+      if (warningPill) warningPill.hidden = !(privacyOff && !lockOn);
 
-      /* 说明文字与 S3 控制中心子菜单双向同步 */
-      if (secMuteValue) secMuteValue.textContent = mutedOn ? '已静音' : '已外放';
+      if (secPrivacyDesc) {
+        if (secPrivacy.value === 'privacy') {
+          secPrivacyDesc.textContent = '被控端屏幕已防护，遮挡屏幕内容';
+        } else if (secPrivacy.value === 'black') {
+          secPrivacyDesc.textContent = '被控端已黑屏，防止周围窥视';
+        } else {
+          secPrivacyDesc.textContent = '被控端屏幕内容当前可见';
+        }
+      }
+
+      if (secMuteValue) secMuteValue.textContent = hostMutedOn ? '已静音' : '已外放';
       if (secLockValue) secLockValue.textContent = lockOn ? '已开启' : '未开启';
 
       if (soundPlayBtn) {
-        var playAudio = !mutedOn;
+        var playAudio = !remoteAudioMuted;
         soundPlayBtn.setAttribute('aria-checked', playAudio ? 'true' : 'false');
         var sc = soundPlayBtn.querySelector('.sn-check');
         if (sc) sc.hidden = !playAudio;
@@ -1349,6 +1535,473 @@
         autoLockExitBtn.setAttribute('aria-checked', lockOn ? 'true' : 'false');
         var lc = autoLockExitBtn.querySelector('.sn-check');
         if (lc) lc.hidden = !lockOn;
+      }
+      if (hostMuteBtn) {
+        hostMuteBtn.setAttribute('aria-checked', hostMutedOn ? 'true' : 'false');
+        var hmc = hostMuteBtn.querySelector('.sn-check');
+        if (hmc) hmc.hidden = !hostMutedOn;
+      }
+      if (hostRestoreAudioBtn) {
+        var restoreOn = Boolean(hostAudioState.restoreOnExit);
+        hostRestoreAudioBtn.setAttribute('aria-checked', restoreOn ? 'true' : 'false');
+        var hrc = hostRestoreAudioBtn.querySelector('.sn-check');
+        if (hrc) hrc.hidden = !restoreOn;
+      }
+      if (privacyModeValEl) {
+        privacyModeValEl.textContent =
+          secPrivacy.value === 'privacy'
+            ? '隐私屏保'
+            : secPrivacy.value === 'black'
+              ? '黑屏防窥'
+              : '不启用';
+      }
+      if (privacyModeMenuEl) {
+        Array.prototype.forEach.call(
+          privacyModeMenuEl.querySelectorAll('[data-privacy-opt]'),
+          function (btn) {
+            var checked = btn.getAttribute('data-privacy-opt') === secPrivacy.value;
+            btn.setAttribute('aria-checked', checked ? 'true' : 'false');
+            var ck = btn.querySelector('.sn-check');
+            if (ck) ck.hidden = !checked;
+          }
+        );
+      }
+    }
+
+    function syncPrivacyAndHostAudioUi() {
+      if (secPrivacy) {
+        secPrivacy.value =
+          privacyState.mode === 'privacy' || privacyState.mode === 'black'
+            ? privacyState.mode
+            : 'off';
+      }
+      if (secMute) {
+        secMute.checked = Boolean(hostAudioState.muted);
+      }
+      syncSecurityState();
+    }
+
+    function applyPrivacyMode(mode, preset, customDataUrl, persist, showToast) {
+      var prevMode = privacyState.mode;
+      var prevPreset = privacyState.preset;
+      var prevCustom = privacyState.customDataUrl;
+      var normMode = mode === 'privacy' || mode === 'black' ? mode : 'off';
+      var effPreset = normalizePrivacyPreset(preset || privacyState.preset || 'preset-1');
+      privacyState.mode = normMode;
+      privacyState.preset = effPreset;
+      if (customDataUrl) privacyState.customDataUrl = customDataUrl;
+      syncPrivacyAndHostAudioUi();
+
+      if (IS_TAURI && typeof Bridge.setSessionPrivacyMode === 'function') {
+        Bridge.setSessionPrivacyMode(
+          normMode,
+          effPreset,
+          effPreset === 'custom' ? privacyState.customDataUrl || null : null,
+          persist !== false
+        )
+          .then(function () {
+            if (showToast) {
+              toast(
+                normMode === 'privacy'
+                  ? '已开启被控端隐私屏保'
+                  : normMode === 'black'
+                    ? '已开启被控端黑屏防窥'
+                    : '已关闭被控端防窥模式'
+              );
+            }
+          })
+          .catch(function (err) {
+            privacyState.mode = prevMode;
+            privacyState.preset = prevPreset;
+            privacyState.customDataUrl = prevCustom;
+            syncPrivacyAndHostAudioUi();
+            toast('设置防窥模式失败：' + String(err || '未知错误'));
+          });
+      } else if (showToast) {
+        toast(
+          normMode === 'privacy'
+            ? '已开启被控端隐私屏保'
+            : normMode === 'black'
+              ? '已开启被控端黑屏防窥'
+              : '已关闭被控端防窥模式'
+        );
+      }
+    }
+
+    function applyHostSystemMute(muted, restoreOnExit, persist, showToast, customSuccessToast) {
+      var prevMuted = hostAudioState.muted;
+      var prevRestore = hostAudioState.restoreOnExit;
+      hostAudioState.muted = Boolean(muted);
+      if (typeof restoreOnExit === 'boolean') {
+        hostAudioState.restoreOnExit = restoreOnExit;
+      }
+      syncPrivacyAndHostAudioUi();
+      if (IS_TAURI && typeof Bridge.setSessionHostMute === 'function') {
+        Bridge.setSessionHostMute(
+          hostAudioState.muted,
+          hostAudioState.restoreOnExit,
+          persist !== false
+        )
+          .then(function () {
+            if (customSuccessToast) {
+              toast(customSuccessToast);
+            } else if (showToast) {
+              toast(hostAudioState.muted ? '已开启被控端静音运行' : '已恢复被控端本机外放');
+            }
+          })
+          .catch(function (err) {
+            hostAudioState.muted = prevMuted;
+            hostAudioState.restoreOnExit = prevRestore;
+            syncPrivacyAndHostAudioUi();
+            toast('设置被控端静音失败：' + String(err || '未知错误'));
+          });
+      } else if (customSuccessToast) {
+        toast(customSuccessToast);
+      } else if (showToast) {
+        toast(hostAudioState.muted ? '已开启被控端静音运行' : '已恢复被控端本机外放');
+      }
+    }
+
+    function syncPrivacyModalUi() {
+      if (!privacyModalBackdrop) return;
+      var sel = privacyState.draftPreset || privacyState.preset || 'preset-1';
+      var customUrl = privacyState.draftCustomDataUrl || privacyState.customDataUrl || '';
+      if (privacyCustomCard) {
+        privacyCustomCard.classList.toggle('is-selected', sel === 'custom' && Boolean(customUrl));
+      }
+      if (privacyCustomImg && privacyCustomEmpty && privacyLastUsedBadge) {
+        if (customUrl) {
+          privacyCustomImg.src = customUrl;
+          privacyCustomImg.hidden = false;
+          privacyCustomEmpty.hidden = true;
+          privacyLastUsedBadge.hidden = false;
+        } else {
+          privacyCustomImg.hidden = true;
+          privacyCustomEmpty.hidden = false;
+          privacyLastUsedBadge.hidden = true;
+        }
+      }
+      if (privacyPresetsGrid) {
+        Array.prototype.forEach.call(
+          privacyPresetsGrid.querySelectorAll('.sn-privacy-tile'),
+          function (tile) {
+            tile.classList.toggle('is-selected', tile.getAttribute('data-preset') === sel);
+          }
+        );
+      }
+    }
+
+    function openPrivacyModal() {
+      closePopover();
+      privacyState.draftPreset = privacyState.preset || 'preset-1';
+      privacyState.draftCustomDataUrl = privacyState.customDataUrl || '';
+      syncPrivacyModalUi();
+      if (privacyModalBackdrop) privacyModalBackdrop.hidden = false;
+    }
+
+    function closePrivacyModal() {
+      if (privacyModalBackdrop) privacyModalBackdrop.hidden = true;
+    }
+
+    function openPrivacyPreview() {
+      if (!privacyPreviewOverlay || !privacyPreviewSurface) return;
+      var sel = normalizePrivacyPreset(privacyState.draftPreset || 'preset-1');
+      var customUrl = privacyState.draftCustomDataUrl || privacyState.customDataUrl || '';
+      privacyPreviewSurface.className = 'sn-privacy-preview-card';
+      if (sel === 'custom' && customUrl) {
+        if (privacyPreviewImg) {
+          privacyPreviewImg.src = customUrl;
+          privacyPreviewImg.hidden = false;
+        }
+        if (privacyPreviewCaption) privacyPreviewCaption.hidden = true;
+      } else {
+        if (privacyPreviewImg) privacyPreviewImg.hidden = true;
+        var artIdx = sel.replace('preset-', '');
+        privacyPreviewSurface.classList.add('sn-privacy-art--' + (artIdx || '1'));
+        if (privacyPreviewCaption) {
+          privacyPreviewCaption.hidden = false;
+          var h3 = privacyPreviewCaption.querySelector('h3');
+          if (h3) h3.textContent = PRESET_LABELS[sel] || '远程隐私保护中';
+        }
+      }
+      privacyPreviewOverlay.hidden = false;
+    }
+
+    function closePrivacyPreview() {
+      if (privacyPreviewOverlay) privacyPreviewOverlay.hidden = true;
+    }
+
+    function compressImageFileToDataUrl(file, cb) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var maxW = 1280;
+          var maxH = 720;
+          var scale = Math.min(1, maxW / Math.max(1, img.width), maxH / Math.max(1, img.height));
+          var w = Math.max(2, Math.round(img.width * scale));
+          var h = Math.max(2, Math.round(img.height * scale));
+          var canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          var quality = 0.78;
+          var out = canvas.toDataURL('image/jpeg', quality);
+          // 控制端显示控制单帧上限 256 KiB：压缩 base64 至 <= 220 KiB 确保可靠送达。
+          while (out.length > 220000 && quality > 0.25) {
+            quality -= 0.1;
+            out = canvas.toDataURL('image/jpeg', quality);
+          }
+          cb(null, out);
+        };
+        img.onerror = function () {
+          cb('无法解析所选图片文件');
+        };
+        img.src = String(reader.result || '');
+      };
+      reader.onerror = function () {
+        cb('读取图片文件失败');
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function syncPeripheralsUi() {
+      if (optSendSysShortcutsBtn) {
+        var on = Boolean(peripheralsState.sendSystemShortcuts);
+        optSendSysShortcutsBtn.setAttribute('aria-checked', on ? 'true' : 'false');
+        var ck = optSendSysShortcutsBtn.querySelector('.sn-check');
+        if (ck) ck.hidden = !on;
+      }
+      var mm = peripheralsState.mouseMode || 'smart';
+      if (menuMouseModeValEl) {
+        menuMouseModeValEl.textContent = MOUSE_MODE_LABELS[mm] || '智能鼠标';
+      }
+      if (mouseModeMenuEl) {
+        Array.prototype.forEach.call(
+          mouseModeMenuEl.querySelectorAll('[data-mouse-mode]'),
+          function (btn) {
+            var checked = btn.getAttribute('data-mouse-mode') === mm;
+            btn.setAttribute('aria-checked', checked ? 'true' : 'false');
+            var ck = btn.querySelector('.sn-check');
+            if (ck) ck.hidden = !checked;
+          }
+        );
+      }
+      stage.classList.toggle('is-remote-cursor', mm === 'remote');
+    }
+
+    function applyMouseMode(mode, persist, showToast) {
+      var prevMode = peripheralsState.mouseMode;
+      var norm = mode === 'remote' || mode === 'local' ? mode : 'smart';
+      peripheralsState.mouseMode = norm;
+      syncPeripheralsUi();
+      if (IS_TAURI && typeof Bridge.setSessionPeripherals === 'function') {
+        Bridge.setSessionPeripherals({
+          mouseMode: norm,
+          persist: persist !== false
+        })
+          .then(function () {
+            if (showToast) {
+              toast('鼠标模式已切换为：' + (MOUSE_MODE_LABELS[norm] || '智能鼠标'));
+            }
+          })
+          .catch(function (err) {
+            peripheralsState.mouseMode = prevMode;
+            syncPeripheralsUi();
+            toast('切换鼠标模式失败：' + String(err || '未知错误'));
+          });
+      } else if (showToast) {
+        toast('鼠标模式已切换为：' + (MOUSE_MODE_LABELS[norm] || '智能鼠标'));
+      }
+    }
+
+    function applySystemShortcuts(enabled, exceptions, persist, showToast, customSuccessToast) {
+      var prevEnabled = peripheralsState.sendSystemShortcuts;
+      var prevExceptions = peripheralsState.shortcutExceptions.slice();
+      peripheralsState.sendSystemShortcuts = Boolean(enabled);
+      if (Array.isArray(exceptions)) {
+        peripheralsState.shortcutExceptions = exceptions.slice();
+      }
+      syncPeripheralsUi();
+      if (IS_TAURI && typeof Bridge.setSessionPeripherals === 'function') {
+        Bridge.setSessionPeripherals({
+          sendSystemShortcuts: peripheralsState.sendSystemShortcuts,
+          shortcutExceptions: peripheralsState.shortcutExceptions,
+          persist: persist !== false
+        })
+          .then(function () {
+            if (customSuccessToast) {
+              toast(customSuccessToast);
+            } else if (showToast) {
+              toast(
+                peripheralsState.sendSystemShortcuts
+                  ? '已开启发送系统快捷键到被控端'
+                  : '已关闭发送系统快捷键到被控端'
+              );
+            }
+          })
+          .catch(function (err) {
+            peripheralsState.sendSystemShortcuts = prevEnabled;
+            peripheralsState.shortcutExceptions = prevExceptions;
+            syncPeripheralsUi();
+            toast('系统快捷键设置失败：' + String(err || '请检查辅助功能权限'));
+          });
+      } else if (customSuccessToast) {
+        toast(customSuccessToast);
+      } else if (showToast) {
+        toast(
+          peripheralsState.sendSystemShortcuts
+            ? '已开启发送系统快捷键到被控端（预览）'
+            : '已关闭发送系统快捷键到被控端（预览）'
+        );
+      }
+    }
+
+    function openShortcutsModal() {
+      closePopover();
+      if (!shortcutsModalBackdrop || !shortcutsListEl) return;
+      shortcutsListEl.textContent = '';
+      var excSet = Object.create(null);
+      peripheralsState.shortcutExceptions.forEach(function (id) {
+        excSet[String(id).toLowerCase()] = true;
+      });
+      SHORTCUT_CATALOG.forEach(function (item) {
+        var row = document.createElement('label');
+        row.className = 'sn-shortcut-row';
+        var left = document.createElement('span');
+        left.className = 'sn-shortcut-row__left';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = item.id;
+        cb.checked = Boolean(excSet[item.id]);
+        var lbl = document.createElement('span');
+        lbl.textContent = item.label;
+        left.appendChild(cb);
+        left.appendChild(lbl);
+        var keyEl = document.createElement('span');
+        keyEl.className = 'sn-shortcut-row__key';
+        keyEl.textContent = item.key;
+        row.appendChild(left);
+        row.appendChild(keyEl);
+        shortcutsListEl.appendChild(row);
+      });
+      shortcutsModalBackdrop.hidden = false;
+    }
+
+    function closeShortcutsModal() {
+      if (shortcutsModalBackdrop) shortcutsModalBackdrop.hidden = true;
+    }
+
+    function renderDisplayTabs() {
+      var list = Array.isArray(displaysState.displays) ? displaysState.displays : [];
+      var canCycle = list.length > 1;
+      if (nextScreenMenuBtn) {
+        nextScreenMenuBtn.setAttribute('aria-disabled', canCycle ? 'false' : 'true');
+        nextScreenMenuBtn.title = canCycle
+          ? '切换下一个屏幕 (⌥⌘N)'
+          : '当前仅检测到 1 个显示器（可点击顶部 + 创建虚拟屏）';
+      }
+      if (!screenTabsEl || !list.length) return;
+      screenTabsEl.textContent = '';
+      var activeId = displaysState.activeDisplayId || list[0].id;
+      list.forEach(function (disp) {
+        var isActive = disp.id === activeId;
+        var tab = document.createElement('div');
+        tab.className = 'sn-screen-tab' + (isActive ? ' is-active' : '');
+        tab.setAttribute('data-display-id', String(disp.id));
+        tab.title = disp.name + (isActive ? ' — 右键切换分辨率' : ' — 点击切换至该屏');
+        tab.appendChild(createSvgIcon('i-monitor', 16));
+        var txt = document.createElement('span');
+        txt.className = 'sn-screen-tab__text';
+        txt.textContent = disp.name;
+        tab.appendChild(txt);
+
+        if (disp.is_virtual) {
+          var rmBtn = document.createElement('button');
+          rmBtn.type = 'button';
+          rmBtn.className = 'sn-screen-tab__close';
+          rmBtn.title = '移除此虚拟屏';
+          rmBtn.setAttribute('aria-label', '移除虚拟屏');
+          rmBtn.textContent = '×';
+          rmBtn.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            if (IS_TAURI && typeof Bridge.removeSessionVirtualDisplay === 'function') {
+              Bridge.removeSessionVirtualDisplay(disp.id)
+                .then(function () {
+                  toast('正在移除虚拟屏…');
+                })
+                .catch(function (err) {
+                  toast('移除虚拟屏失败：' + String(err || '未知错误'));
+                });
+            }
+          });
+          tab.appendChild(rmBtn);
+        }
+
+        tab.addEventListener('click', function () {
+          if (isActive) {
+            if (open && open.el === screenResMenuEl) closePopover();
+            return;
+          }
+          if (IS_TAURI && typeof Bridge.switchSessionDisplay === 'function') {
+            Bridge.switchSessionDisplay(disp.id)
+              .then(function () {
+                toast('正在切换至 ' + disp.name + '…');
+              })
+              .catch(function (err) {
+                toast('切换屏幕失败：' + String(err || '未知错误'));
+              });
+          } else {
+            displaysState.activeDisplayId = disp.id;
+            renderDisplayTabs();
+            toast('已切换至 ' + disp.name);
+          }
+        });
+
+        tab.addEventListener('contextmenu', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (isActive && screenResMenuEl) {
+            openPopover(screenResMenuEl, tab, 'left');
+          }
+        });
+
+        screenTabsEl.appendChild(tab);
+        if (isActive && screenItem) {
+          var lbl = screenItem.querySelector('.sn-menu__label');
+          if (lbl) lbl.textContent = disp.name;
+        }
+      });
+    }
+
+    function switchToNextDisplay() {
+      var list = Array.isArray(displaysState.displays) ? displaysState.displays : [];
+      if (list.length < 2) {
+        toast('当前仅检测到 1 个显示器，可点击顶部「+」创建虚拟屏');
+        return;
+      }
+      var curIdx = 0;
+      for (var i = 0; i < list.length; i += 1) {
+        if (list[i].id === displaysState.activeDisplayId) {
+          curIdx = i;
+          break;
+        }
+      }
+      var next = list[(curIdx + 1) % list.length];
+      if (!next) return;
+      if (IS_TAURI && typeof Bridge.switchSessionDisplay === 'function') {
+        Bridge.switchSessionDisplay(next.id)
+          .then(function () {
+            toast('已切换至 ' + next.name);
+          })
+          .catch(function (err) {
+            toast('切换屏幕失败：' + String(err || '未知错误'));
+          });
+      } else {
+        displaysState.activeDisplayId = next.id;
+        renderDisplayTabs();
+        toast('已切换至 ' + next.name);
       }
     }
 
@@ -1360,7 +2013,7 @@
         Bridge.saveStreamPrefs({ lockOnExit: on }).catch(function () {});
       }
       if (showToast) {
-        toast(on ? '已开启退出时锁定被控端' : '已关闭退出时锁定被控端');
+        toast(on ? '已开启远程结束后被控端自动锁屏' : '已关闭远程结束后被控端自动锁屏');
       }
     }
 
@@ -1379,17 +2032,16 @@
     }
 
     function applyRemoteAudioMuted(muted, showToast) {
-      var isMuted = Boolean(muted);
-      if (secMute) secMute.checked = isMuted;
+      remoteAudioMuted = Boolean(muted);
       syncSecurityState();
       if (IS_TAURI && typeof Bridge.sessionCommand === 'function') {
         Bridge.sessionCommand({
           type: 'set_audio_muted',
-          muted: isMuted
+          muted: remoteAudioMuted
         }).catch(function () {});
       }
       if (showToast) {
-        toast(isMuted ? '已静音远端音频' : '已开启远端音频');
+        toast(remoteAudioMuted ? '已暂停播放远端声音' : '已恢复播放远端声音');
       }
     }
 
@@ -1435,14 +2087,295 @@
     }
 
     if (secPrivacy && secMute && secLock) {
-      secPrivacy.addEventListener('change', syncSecurityState);
+      secPrivacy.addEventListener('change', function () {
+        applyPrivacyMode(secPrivacy.value, privacyState.preset, null, true, true);
+      });
       secMute.addEventListener('change', function () {
-        applyRemoteAudioMuted(Boolean(secMute.checked), IS_TAURI);
+        applyHostSystemMute(Boolean(secMute.checked), hostAudioState.restoreOnExit, true, true);
       });
       secLock.addEventListener('change', function () {
         applyLockOnExit(Boolean(secLock.checked), true, IS_TAURI);
       });
-      syncSecurityState(); /* mock 默认：隐私屏保 / 静音关 / 自动锁屏关 → 显示需关注 */
+      syncPrivacyAndHostAudioUi();
+      syncPeripheralsUi();
+    }
+
+    if (hostMuteBtn) {
+      hostMuteBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        applyHostSystemMute(!hostAudioState.muted, hostAudioState.restoreOnExit, true, true);
+        closePopover();
+      });
+    }
+    if (hostRestoreAudioBtn) {
+      hostRestoreAudioBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        var nextRestore = !hostAudioState.restoreOnExit;
+        applyHostSystemMute(
+          hostAudioState.muted,
+          nextRestore,
+          true,
+          false,
+          nextRestore ? '已开启：远程结束后恢复被控端声音设置' : '已关闭：远程结束后不再恢复声音设置'
+        );
+        closePopover();
+      });
+    }
+    if (privacyModeMenuItem && privacyModeMenuEl) {
+      var openPrivSub = function () {
+        cancelNestedClose();
+        openNestedMenu(privacyModeMenuItem, privacyModeMenuEl);
+      };
+      privacyModeMenuItem.addEventListener('pointerenter', openPrivSub);
+      privacyModeMenuItem.addEventListener('focus', openPrivSub);
+      privacyModeMenuItem.addEventListener('click', function (e) {
+        e.preventDefault();
+        openPrivSub();
+      });
+      privacyModeMenuEl.addEventListener('pointerenter', cancelNestedClose);
+      Array.prototype.forEach.call(
+        privacyModeMenuEl.querySelectorAll('[data-privacy-opt]'),
+        function (btn) {
+          btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            var modeVal = btn.getAttribute('data-privacy-opt') || 'off';
+            applyPrivacyMode(modeVal, privacyState.preset, null, true, true);
+            closePopover();
+          });
+        }
+      );
+    }
+    if (openPrivacyModalBtn) {
+      openPrivacyModalBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        openPrivacyModal();
+      });
+    }
+    if (privacyModalCloseBtn) privacyModalCloseBtn.addEventListener('click', closePrivacyModal);
+    if (privacyCancelBtn) privacyCancelBtn.addEventListener('click', closePrivacyModal);
+    if (privacyModalBackdrop) {
+      privacyModalBackdrop.addEventListener('click', function (e) {
+        if (e.target === privacyModalBackdrop) closePrivacyModal();
+      });
+    }
+    if (privacyUploadBtn && privacyFileInput) {
+      privacyUploadBtn.addEventListener('click', function () {
+        privacyFileInput.value = '';
+        privacyFileInput.click();
+      });
+      privacyFileInput.addEventListener('change', function () {
+        var file = privacyFileInput.files && privacyFileInput.files[0];
+        if (!file) return;
+        compressImageFileToDataUrl(file, function (err, dataUrl) {
+          if (err || !dataUrl) {
+            toast(err || '处理图片失败');
+            return;
+          }
+          privacyState.draftCustomDataUrl = dataUrl;
+          privacyState.draftPreset = 'custom';
+          syncPrivacyModalUi();
+          if (IS_TAURI && typeof Bridge.savePrivacyCustomImage === 'function') {
+            Bridge.savePrivacyCustomImage(dataUrl)
+              .then(function (savedUrl) {
+                if (savedUrl) {
+                  privacyState.customDataUrl = savedUrl;
+                  privacyState.draftCustomDataUrl = savedUrl;
+                }
+                syncPrivacyModalUi();
+                toast('自定义屏保图片已保存');
+              })
+              .catch(function (saveErr) {
+                toast('保存自定义图片失败：' + String(saveErr || '未知错误'));
+              });
+          }
+        });
+      });
+    }
+    if (privacyCustomCard) {
+      privacyCustomCard.addEventListener('click', function () {
+        if (privacyState.draftCustomDataUrl || privacyState.customDataUrl) {
+          privacyState.draftPreset = 'custom';
+          syncPrivacyModalUi();
+        } else if (privacyFileInput) {
+          privacyFileInput.value = '';
+          privacyFileInput.click();
+        }
+      });
+    }
+    if (privacyPresetsGrid) {
+      Array.prototype.forEach.call(
+        privacyPresetsGrid.querySelectorAll('.sn-privacy-tile'),
+        function (tile) {
+          tile.addEventListener('click', function () {
+            privacyState.draftPreset = tile.getAttribute('data-preset') || 'preset-1';
+            syncPrivacyModalUi();
+          });
+        }
+      );
+    }
+    if (privacyPreviewBtn) privacyPreviewBtn.addEventListener('click', openPrivacyPreview);
+    if (privacyPreviewCloseBtn) privacyPreviewCloseBtn.addEventListener('click', closePrivacyPreview);
+    if (privacyPreviewOverlay) {
+      privacyPreviewOverlay.addEventListener('click', function (e) {
+        if (e.target === privacyPreviewOverlay) closePrivacyPreview();
+      });
+    }
+    if (privacyConfirmBtn) {
+      privacyConfirmBtn.addEventListener('click', function () {
+        var sel = privacyState.draftPreset || 'preset-1';
+        var customUrl = privacyState.draftCustomDataUrl || privacyState.customDataUrl || '';
+        if (sel === 'custom' && !customUrl) {
+          toast('请先选择自定义屏保图片，或选择一个内置预设');
+          return;
+        }
+        closePrivacyModal();
+        applyPrivacyMode('privacy', sel, sel === 'custom' ? customUrl : null, true, true);
+      });
+    }
+
+    if (optSendSysShortcutsBtn) {
+      optSendSysShortcutsBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        applySystemShortcuts(
+          !peripheralsState.sendSystemShortcuts,
+          peripheralsState.shortcutExceptions,
+          true,
+          true
+        );
+        closePopover();
+      });
+    }
+    if (btnConfigShortcuts) {
+      btnConfigShortcuts.addEventListener('click', function (e) {
+        e.preventDefault();
+        openShortcutsModal();
+      });
+    }
+    if (shortcutsModalCloseBtn) shortcutsModalCloseBtn.addEventListener('click', closeShortcutsModal);
+    if (shortcutsCancelBtn) shortcutsCancelBtn.addEventListener('click', closeShortcutsModal);
+    if (shortcutsModalBackdrop) {
+      shortcutsModalBackdrop.addEventListener('click', function (e) {
+        if (e.target === shortcutsModalBackdrop) closeShortcutsModal();
+      });
+    }
+    if (shortcutsResetBtn && shortcutsListEl) {
+      shortcutsResetBtn.addEventListener('click', function () {
+        Array.prototype.forEach.call(
+          shortcutsListEl.querySelectorAll('input[type="checkbox"]'),
+          function (cb) {
+            cb.checked = false;
+          }
+        );
+      });
+    }
+    if (shortcutsSaveBtn && shortcutsListEl) {
+      shortcutsSaveBtn.addEventListener('click', function () {
+        var nextExc = [];
+        Array.prototype.forEach.call(
+          shortcutsListEl.querySelectorAll('input[type="checkbox"]'),
+          function (cb) {
+            if (cb.checked && cb.value) nextExc.push(cb.value);
+          }
+        );
+        closeShortcutsModal();
+        applySystemShortcuts(
+          peripheralsState.sendSystemShortcuts,
+          nextExc,
+          true,
+          false,
+          '已保存快捷键例外配置（本机保留 ' + nextExc.length + ' 项）'
+        );
+      });
+    }
+    if (securitySubEl) {
+      Array.prototype.forEach.call(
+        securitySubEl.querySelectorAll('.sn-submenu__item, .sn-submenu__row'),
+        function (mi) {
+          if (mi !== privacyModeMenuItem) {
+            mi.addEventListener('pointerenter', scheduleNestedClose);
+          }
+        }
+      );
+    }
+    if (peripheralsEl) {
+      Array.prototype.forEach.call(
+        peripheralsEl.querySelectorAll('.sn-submenu__item, .sn-submenu__row'),
+        function (mi) {
+          if (mi !== menuMouseModeItem) {
+            mi.addEventListener('pointerenter', scheduleNestedClose);
+          }
+        }
+      );
+    }
+    if (menuMouseModeItem && mouseModeMenuEl) {
+      var openMouseSub = function () {
+        cancelNestedClose();
+        openNestedMenu(menuMouseModeItem, mouseModeMenuEl);
+      };
+      menuMouseModeItem.addEventListener('pointerenter', openMouseSub);
+      menuMouseModeItem.addEventListener('focus', openMouseSub);
+      menuMouseModeItem.addEventListener('click', function (e) {
+        e.preventDefault();
+        openMouseSub();
+      });
+      mouseModeMenuEl.addEventListener('pointerenter', cancelNestedClose);
+      Array.prototype.forEach.call(
+        mouseModeMenuEl.querySelectorAll('[data-mouse-mode]'),
+        function (btn) {
+          btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            var mode = btn.getAttribute('data-mouse-mode') || 'smart';
+            applyMouseMode(mode, true, true);
+            closePopover();
+          });
+        }
+      );
+    }
+
+    if (addScreenBtn) {
+      addScreenBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (watchMode) {
+          toast('观看模式下无法创建虚拟屏');
+          return;
+        }
+        if (IS_TAURI && typeof Bridge.createSessionVirtualDisplay === 'function') {
+          addScreenBtn.disabled = true;
+          toast('正在创建虚拟屏…');
+          Bridge.createSessionVirtualDisplay(1920, 1080, true)
+            .catch(function (err) {
+              toast('创建虚拟屏失败：' + String(err || '未知错误'));
+            })
+            .then(function () {
+              window.setTimeout(function () {
+                addScreenBtn.disabled = false;
+              }, 600);
+            });
+        } else {
+          var nextId = 100 + displaysState.displays.length + 1;
+          if (!displaysState.displays.length) {
+            displaysState.displays.push({
+              id: 1,
+              name: MOCK.screenName,
+              width: 1512,
+              height: 982,
+              is_main: true,
+              is_virtual: false
+            });
+          }
+          displaysState.displays.push({
+            id: nextId,
+            name: '虚拟显示屏 ' + displaysState.displays.length,
+            width: 1920,
+            height: 1080,
+            is_main: false,
+            is_virtual: true
+          });
+          displaysState.activeDisplayId = nextId;
+          renderDisplayTabs();
+          toast('已创建虚拟屏（预览）');
+        }
+      });
     }
 
     if (shieldBtn) {
@@ -1501,6 +2434,8 @@
         activeNestedEl = null;
       }
       if (screenMoreEl) screenMoreEl.hidden = true;
+      if (privacyModeMenuEl) privacyModeMenuEl.hidden = true;
+      if (mouseModeMenuEl) mouseModeMenuEl.hidden = true;
       if (nestedAnchorItem) {
         nestedAnchorItem.classList.remove('is-open');
         nestedAnchorItem.setAttribute('aria-expanded', 'false');
@@ -1663,8 +2598,8 @@
             return;
           }
           if (action === 'next-screen') {
-            toast('被控端多显示器切换暂未支持');
             closePopover();
+            switchToNextDisplay();
           }
         });
       });
@@ -2083,6 +3018,7 @@
 
     /* ── 快捷键（§7.3）────────────────────────────────────────── */
     var swallowEscapeKeyup = false;
+    var swallowNextScreenKeyup = false;
     document.addEventListener('keydown', function (e) {
       var target = e.target;
       var typing =
@@ -2093,6 +3029,24 @@
           target.isContentEditable);
 
       if (e.key === 'Escape') {
+        if (privacyPreviewOverlay && !privacyPreviewOverlay.hidden) {
+          e.preventDefault();
+          swallowEscapeKeyup = true;
+          closePrivacyPreview();
+          return;
+        }
+        if (privacyModalBackdrop && !privacyModalBackdrop.hidden) {
+          e.preventDefault();
+          swallowEscapeKeyup = true;
+          closePrivacyModal();
+          return;
+        }
+        if (shortcutsModalBackdrop && !shortcutsModalBackdrop.hidden) {
+          e.preventDefault();
+          swallowEscapeKeyup = true;
+          closeShortcutsModal();
+          return;
+        }
         /* Esc 仅在有打开的菜单/气泡时逐级关闭并吞掉按压与抬起事件；否则透传给被控端 */
         if (activeNestedEl && !activeNestedEl.hidden) {
           e.preventDefault();
@@ -2114,12 +3068,18 @@
         }
       }
 
-      if (typing) return;
+      if (typing || isAnySessionModalOpen()) return;
 
-      /* ⌥⌘N：切换下一个屏幕（暂未支持多显示器，显式提示） */
-      if (e.altKey && e.metaKey && (e.key === 'n' || e.key === 'N')) {
+      /* ⌥⌘N：切换下一个屏幕（macOS 上 Option+N 会产出 Dead/˜，必须按物理 e.code 匹配并吞掉对应 keyup） */
+      if (
+        e.altKey &&
+        e.metaKey &&
+        !e.ctrlKey &&
+        (e.code === 'KeyN' || e.key === 'n' || e.key === 'N')
+      ) {
         e.preventDefault();
-        toast('被控端多显示器切换暂未支持');
+        swallowNextScreenKeyup = true;
+        switchToNextDisplay();
         return;
       }
 
@@ -2145,7 +3105,12 @@
           e.preventDefault();
           return;
         }
-        if (!realSessionActive || watchMode || open) return;
+        if (swallowNextScreenKeyup && (e.code === 'KeyN' || e.key === 'n' || e.key === 'N')) {
+          swallowNextScreenKeyup = false;
+          e.preventDefault();
+          return;
+        }
+        if (!realSessionActive || watchMode || open || isAnySessionModalOpen()) return;
         var target = e.target;
         var typing =
           target &&
@@ -2251,12 +3216,15 @@
         return isUserDisconnectReason(reason) || reason === '会话已结束';
       }
       function resetSessionControlsForNewSession() {
-        if (secMute) {
-          secMute.checked = false;
-          if (secPrivacy && secLock) {
-            syncSecurityState();
-          }
-        }
+        remoteAudioMuted = false;
+        displaysRequested = false;
+        initialSessionPrefsApplied = false;
+        displaysState = {
+          displays: [],
+          activeDisplayId: 0
+        };
+        renderDisplayTabs();
+        syncSecurityState();
         clipboardEnabled = true;
         syncClipboardMenuUi();
         seenNegotiated = false;
@@ -2366,7 +3334,47 @@
           if (hudRows.length >= 8 && data.width && data.height) {
             hudRows[7].textContent = formatHudResolution(data.width + 'x' + data.height);
           }
+          applySavedSessionPrefsIfReady();
+          requestSessionDisplaysOnce();
           reportStageRect();
+          return;
+        }
+        if (upd.kind === 'privacy_state') {
+          if (typeof data.mode === 'string') privacyState.mode = data.mode;
+          if (typeof data.preset === 'string' && data.preset) {
+            privacyState.preset = normalizePrivacyPreset(data.preset);
+          }
+          syncPrivacyAndHostAudioUi();
+          if (data.supported === false && privacyState.mode === 'off') {
+            toast('当前被控端暂不支持物理防窥幕布');
+          }
+          return;
+        }
+        if (upd.kind === 'host_mute_state') {
+          hostAudioState.muted = Boolean(data.muted);
+          syncPrivacyAndHostAudioUi();
+          if (data.supported === false) {
+            toast('当前被控端音频设备不支持系统静音控制');
+          }
+          return;
+        }
+        if (upd.kind === 'mouse_mode_state') {
+          if (typeof data.mode === 'string' && data.mode) {
+            peripheralsState.mouseMode = data.mode;
+            syncPeripheralsUi();
+          }
+          return;
+        }
+        if (upd.kind === 'displays_state') {
+          if (Array.isArray(data.displays)) {
+            displaysState.displays = data.displays.slice();
+            displaysState.activeDisplayId = Number(data.active_display_id || 0);
+            renderDisplayTabs();
+          }
+          return;
+        }
+        if (upd.kind === 'virtual_display_error') {
+          toast('虚拟屏操作失败：' + String(data.message || '系统不支持或权限不足'));
           return;
         }
         if (upd.kind === 'display_config') {
@@ -2466,6 +3474,10 @@
               }
             }
           }
+          sessionLifecycleState = 'active';
+          realSessionActive = true;
+          applySavedSessionPrefsIfReady();
+          requestSessionDisplaysOnce();
           return;
         }
         if (upd.kind === 'hud') {
@@ -2501,6 +3513,8 @@
             }
           }
           syncRelaySwitchUi(data.transport);
+          applySavedSessionPrefsIfReady();
+          requestSessionDisplaysOnce();
           applyHudSnapshot(data);
           return;
         }
@@ -2579,7 +3593,7 @@
       function isStageInputTarget(target) {
         if (!target) return false;
         if (hudWrap && hudWrap.contains(target)) return false;
-        if (open) return false;
+        if (open || isAnySessionModalOpen()) return false;
         return true;
       }
 

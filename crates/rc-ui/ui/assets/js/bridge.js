@@ -345,6 +345,74 @@
     quitAppCompletely: function () {
       return invoke("quit_app_completely");
     },
+    getClientLockStatus: function () {
+      return invoke("get_client_lock_status");
+    },
+    getPrivacyCustomImage: function () {
+      return invoke("get_privacy_custom_image");
+    },
+    savePrivacyCustomImage: function (dataUrl) {
+      return invoke("save_privacy_custom_image", { dataUrl: String(dataUrl || "") });
+    },
+    setSessionPrivacyMode: function (mode, preset, customImageDataUrl, persist) {
+      return invoke("set_session_privacy_mode", {
+        mode: String(mode || "off"),
+        preset: preset ? String(preset) : null,
+        customImageDataUrl: customImageDataUrl ? String(customImageDataUrl) : null,
+        persist: typeof persist === "boolean" ? persist : true
+      });
+    },
+    setSessionHostMute: function (muted, restoreOnExit, persist) {
+      return invoke("set_session_host_mute", {
+        muted: Boolean(muted),
+        restoreOnExit: typeof restoreOnExit === "boolean" ? restoreOnExit : null,
+        persist: typeof persist === "boolean" ? persist : true
+      });
+    },
+    setSessionPeripherals: function (opts) {
+      var o = opts || {};
+      return invoke("set_session_peripherals", {
+        sendSystemShortcuts: typeof o.sendSystemShortcuts === "boolean" ? o.sendSystemShortcuts : null,
+        shortcutExceptions: Array.isArray(o.shortcutExceptions) ? o.shortcutExceptions : null,
+        mouseMode: typeof o.mouseMode === "string" ? o.mouseMode : null,
+        persist: typeof o.persist === "boolean" ? o.persist : true
+      });
+    },
+    listSessionDisplays: function () {
+      return invoke("list_session_displays");
+    },
+    switchSessionDisplay: function (displayId) {
+      return invoke("switch_session_display", { displayId: Number(displayId) });
+    },
+    createSessionVirtualDisplay: function (width, height, hidpi) {
+      return invoke("create_session_virtual_display", {
+        width: width ? Number(width) : null,
+        height: height ? Number(height) : null,
+        hidpi: typeof hidpi === "boolean" ? hidpi : true
+      });
+    },
+    removeSessionVirtualDisplay: function (displayId) {
+      return invoke("remove_session_virtual_display", { displayId: Number(displayId) });
+    },
+    lockClient: function (password) {
+      return invoke("lock_client", { password: password == null ? null : String(password) });
+    },
+    unlockClient: function (password) {
+      return invoke("unlock_client", { password: String(password || "") });
+    },
+    changeClientLockPassword: function (currentPassword, newPassword) {
+      return invoke("change_client_lock_password", {
+        currentPassword: currentPassword == null ? null : String(currentPassword),
+        newPassword: String(newPassword || "")
+      });
+    },
+    onClientLockChanged: function (cb) {
+      return listen("client://lock-changed", function (ev) {
+        if (typeof cb === "function") {
+          cb(ev && ev.payload !== undefined ? ev.payload : ev);
+        }
+      });
+    },
     reconnectLastSession: function () {
       return invoke("reconnect_last_session");
     },

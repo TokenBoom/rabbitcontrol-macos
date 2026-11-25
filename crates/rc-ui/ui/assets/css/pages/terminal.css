@@ -764,20 +764,26 @@ body.is-tauri .tm-titlebar {
   flex: 1;
   min-height: 0;
   margin: 0;
-  padding: 14px 16px 20px;
-  overflow-y: auto;
-  overflow-x: hidden;
+  padding: 0;
+  overflow: hidden;
   background: var(--terminal-bg);
   color: var(--terminal-fg);
-  font-family: var(--tm-font-family, var(--font-mono));
-  font-size: var(--tm-font-size, var(--size-terminal));
-  line-height: var(--tm-line-height, 19px);
-  white-space: pre-wrap;
-  word-break: break-all;
   outline: none;
-  cursor: text;
-  user-select: text;
-  -webkit-user-select: text;
+}
+
+.tm-screen .xterm {
+  width: 100%;
+  height: 100%;
+  padding: 10px 12px 12px;
+}
+
+.tm-screen .xterm-viewport {
+  background-color: transparent !important;
+  overflow-y: auto !important;
+}
+
+.tm-screen .xterm-screen {
+  width: 100%;
 }
 
 .tm-line {

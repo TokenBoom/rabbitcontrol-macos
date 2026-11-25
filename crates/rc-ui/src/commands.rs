@@ -100,6 +100,9 @@ pub struct OpenSessionRequest {
     /// 是否强制通过 TCP 中继连接（忽略 P2P 直连）。
     #[serde(default)]
     pub force_relay: bool,
+    /// 后台静默工具会话模式（`true` 时仅建立底层传输会话，不弹出 S1 远程桌面窗口，供 W2/W3/W4 工具按需静默建连）。
+    #[serde(default)]
+    pub headless: bool,
     /// 本次会话是否开启端到端 mTLS 加密握手（未传时读取 `AppPrefs.default_encrypt_connection`）。
     #[serde(default)]
     pub encrypt_connection: Option<bool>,
@@ -350,6 +353,7 @@ fn css_rect_to_physical_frame(rect: StageRectMsg, scale_factor: f64) -> Frame {
 /// 退出或 `"session"` 窗口已销毁也不会 UAF），再在后台短线程 drop `lease` 与 `SessionHandle`
 /// （避免主线程阻塞等待 QUIC `Bye` / `join`）。
 pub(crate) fn teardown_session(app: &AppHandle, mut old: ActiveSession) {
+    stop_shortcut_tap_runtime(&app.state::<AppState>());
     if let Some(lease) = old.layer_state.take_lease() {
         let _ = app.run_on_main_thread(move || {
             metal_attach::detach_leased_layer(&lease);
@@ -397,6 +401,8 @@ pub(crate) fn disconnect_active_session_with_lock(
         );
         teardown_session(app, session);
     }
+    let state = app.state::<AppState>();
+    stop_shortcut_tap_runtime(&state);
     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
     new_epoch
 }
@@ -802,6 +808,7 @@ pub async fn open_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
 
     let parsed = model::parse_connect_input(&cfg.target)?;
@@ -840,15 +847,17 @@ pub async fn open_session(
         teardown_session(&app, old);
     }
 
-    window::ensure_session_window(&app, &state, cfg.watch_only)?;
-    window::set_session_window_title(&app, &device_name);
-    let _ = app.emit(
-        "session://update",
-        &SessionUpdate::Connecting {
-            phase: rc_ui::session_bridge::ConnectPhase::EndpointCreating,
-            watch_only: cfg.watch_only,
-        },
-    );
+    if !cfg.headless {
+        window::ensure_session_window(&app, &state, cfg.watch_only)?;
+        window::set_session_window_title(&app, &device_name);
+        let _ = app.emit(
+            "session://update",
+            &SessionUpdate::Connecting {
+                phase: rc_ui::session_bridge::ConnectPhase::EndpointCreating,
+                watch_only: cfg.watch_only,
+            },
+        );
+    }
     let preallocated_layer = preallocate_metal_layer_for_session(&app, cfg.prefer_hardware);
 
     let (connect_addr, relay_grant) =
@@ -930,7 +939,11 @@ pub async fn open_session(
         bitrate_bps: req_bitrate_bps,
         prefer_hardware: cfg.prefer_hardware,
         clipboard_enabled: cfg.clipboard_enabled,
-        audio_enabled: cfg.audio_enabled,
+        audio_enabled: if cfg.headless {
+            false
+        } else {
+            cfg.audio_enabled
+        },
         relay_grant,
         force_relay: cfg.force_relay,
         encrypt_connection,
@@ -979,6 +992,7 @@ pub async fn set_session_relay_mode(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let (watch_only, mut meta) = {
         let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -1138,6 +1152,7 @@ pub fn set_session_watch_only(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActiveSessionInfo, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let (info, tools_to_detach, restore_req) = {
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -1177,6 +1192,7 @@ pub fn set_session_watch_only(
                 restore_saved_portmaps_for_active_session(&st, sid, &restore_key);
             });
     }
+    let _ = sync_shortcut_tap_runtime(&app, &state);
     let _ = app.emit("session://active-state", &info);
     Ok(info)
 }
@@ -1188,6 +1204,7 @@ pub async fn set_session_mtls_mode(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActiveSessionInfo, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let (watch_only, mut meta) = {
         let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -1324,10 +1341,12 @@ pub fn session_command(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let cmd = cmd.0;
     match cmd {
         SessionCommand::Disconnect => {
+            stop_shortcut_tap_runtime(&state);
             let lock_on_exit = state
                 .prefs
                 .lock()
@@ -1370,6 +1389,7 @@ pub fn session_command(
 /// 未收录键码静默丢弃并计数；观看模式（`watch_only`）或无活动会话时静默忽略（T21 U9）。
 #[tauri::command]
 pub fn send_input_event(ev: WebInputEvent, state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(active) = slot.as_ref() else {
@@ -1522,9 +1542,9 @@ pub(crate) fn sync_standalone_status_bar(state: &AppState) {
         let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
         rt.current_status()
     };
-    let (host_enabled, connected_peer) = {
+    let connected_peer = {
         let host = state.host.lock().unwrap_or_else(|e| e.into_inner());
-        (host.allow_remote_assist, host.connected_peer.clone())
+        host.connected_peer.clone()
     };
     let perms = permissions::check_permissions();
     metal_attach::update_status_bar(StatusBarDisplay {
@@ -1538,7 +1558,6 @@ pub(crate) fn sync_standalone_status_bar(state: &AppState) {
                 .clone()
         }),
         signal_online: server_snap.state == ServerConnectionState::Connected,
-        remote_assist_enabled: host_enabled,
         connected_peer,
         missing_permissions: perms.platform_supported && !perms.host_ready,
         session_label: "独立托管模式".to_string(),
@@ -1679,9 +1698,13 @@ pub(crate) fn stop_host_service(state: &AppState, blocking: bool) -> HostStatusS
 
 /// 应用退出或主窗口销毁时幂等回收认证维护线程、被控端服务、局域网发现线程与信令服务器客户端。
 pub(crate) fn shutdown_host_and_lan(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    stop_shortcut_tap_runtime(&state);
     disconnect_active_session(app);
     window::close_session_and_tool_windows(app);
-    let state = app.state::<AppState>();
+    // 退出前在主线程主动清理物理防窥隐私幕布，防止后续 `stop_host_service` join 线程时主队列已停而超时。
+    #[cfg(target_os = "macos")]
+    rc_capture_macos::clear_privacy_curtain();
     stop_auth_maintainer(&state);
     shutdown_signal_client(&state);
     let _ = stop_host_service(&state, true);
@@ -1926,6 +1949,7 @@ pub fn set_host_enabled(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HostStatusSnapshot, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     if enabled {
         let prefs_path = app_prefs::default_prefs_path();
@@ -2068,6 +2092,7 @@ pub fn set_host_password(
     regenerate: bool,
     state: State<'_, AppState>,
 ) -> Result<HostStatusSnapshot, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let snap = set_host_password_inner(&state, password, regenerate)?;
     if state.is_service_proxy() {
@@ -2100,6 +2125,7 @@ pub fn respond_approval(
     accepted: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     respond_approval_inner(&state, generation, accepted)
 }
@@ -2107,6 +2133,7 @@ pub fn respond_approval(
 /// IPC 命令：主动断开当前接入本机的控制端会话（被控端继续监听新连接）。
 #[tauri::command]
 pub fn disconnect_host_client(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     disconnect_host_client_inner(&state)
 }
@@ -2425,6 +2452,7 @@ pub async fn save_server_config(
     app: AppHandle,
 ) -> Result<ServerStatusSnapshot, String> {
     let state_gate = app.state::<AppState>();
+    state_gate.require_unlocked()?;
     state_gate.require_authenticated()?;
     let app_for_blocking = app.clone();
     let snap = tauri::async_runtime::spawn_blocking(move || {
@@ -2544,6 +2572,7 @@ pub async fn refresh_device_id(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ServerStatusSnapshot, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let app_for_blocking = app.clone();
     let snap = tauri::async_runtime::spawn_blocking(move || {
@@ -2676,6 +2705,7 @@ pub async fn save_stream_prefs(
     app: AppHandle,
 ) -> Result<AppPrefs, String> {
     let state_gate = app.state::<AppState>();
+    state_gate.require_unlocked()?;
     state_gate.require_authenticated()?;
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -3369,6 +3399,7 @@ pub async fn probe_and_save_server(
     req: ProbeAndSaveServerRequest,
     app: AppHandle,
 ) -> Result<ProbeServerResponse, String> {
+    app.state::<AppState>().require_unlocked()?;
     let app_for_blocking = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
@@ -3425,6 +3456,7 @@ pub async fn auth_register(
     req: AuthRegisterRequest,
     app: AppHandle,
 ) -> Result<GateStatusSnapshot, String> {
+    app.state::<AppState>().require_unlocked()?;
     if req.email.trim().is_empty() {
         return Err("请输入邮箱地址".to_string());
     }
@@ -3472,6 +3504,7 @@ pub async fn auth_login(
     req: AuthLoginRequest,
     app: AppHandle,
 ) -> Result<GateStatusSnapshot, String> {
+    app.state::<AppState>().require_unlocked()?;
     if req.email.trim().is_empty() {
         return Err("请输入邮箱地址".to_string());
     }
@@ -3513,6 +3546,7 @@ pub async fn auth_change_password(
     req: AuthChangePasswordRequest,
     app: AppHandle,
 ) -> Result<GateStatusSnapshot, String> {
+    app.state::<AppState>().require_unlocked()?;
     if req.current_password.is_empty() || req.new_password.is_empty() {
         return Err("请填写当前密码与新密码".to_string());
     }
@@ -3603,6 +3637,7 @@ pub(crate) fn force_logout_from_kick(app: &AppHandle, reason: String) {
 /// IPC 命令：退出当前账号登录，清空凭据与设备证书、停信令与被控端并回退门禁至 `Unauthenticated`。
 #[tauri::command]
 pub async fn auth_logout(app: AppHandle) -> Result<GateStatusSnapshot, String> {
+    app.state::<AppState>().require_unlocked()?;
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || perform_logout_cleanup(&app_for_blocking, true))
         .await
@@ -3639,6 +3674,7 @@ pub async fn rename_my_device(
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
+        state.require_unlocked()?;
         state.require_authenticated()?;
         let local_did = local_device_id_snapshot(&state);
         let updated = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
@@ -3656,6 +3692,7 @@ pub async fn remove_my_device(device_id: String, app: AppHandle) -> Result<(), S
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
+        state.require_unlocked()?;
         state.require_authenticated()?;
         let norm_target = server_config::parse_device_id_input(&device_id)
             .ok_or_else(|| format!("设备码格式无效：{device_id:?}"))?;
@@ -3729,6 +3766,7 @@ pub async fn save_security_prefs(
     app: AppHandle,
 ) -> Result<SecurityPrefsSnapshot, String> {
     let state_gate = app.state::<AppState>();
+    state_gate.require_unlocked()?;
     state_gate.require_authenticated()?;
     let assist_changed = patch.allow_remote_assist;
     let app_for_blocking = app.clone();
@@ -3822,6 +3860,7 @@ pub async fn renew_device_cert(app: AppHandle) -> Result<GateCertStatus, String>
     let app_for_blocking = app.clone();
     let status = tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
+        state.require_unlocked()?;
         state.require_authenticated()?;
         let _ = state.auth.cert_manager().clear_device_cert();
         if let Err(err) = bind_device_and_ensure_cert(
@@ -3862,6 +3901,7 @@ pub struct LocalDirSnapshot {
 fn active_session_tools_with_portmap_key(
     state: &AppState,
 ) -> Result<(ToolClientHandle, Option<String>), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(active) = slot.as_ref() else {
@@ -3911,6 +3951,7 @@ pub async fn file_list_local(
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<LocalDirSnapshot, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     tauri::async_runtime::spawn_blocking(move || file_list_local_inner(path))
         .await
@@ -3924,6 +3965,7 @@ pub async fn file_mkdir_local(
     name: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     tauri::async_runtime::spawn_blocking(move || file_mkdir_local_inner(parent, name))
         .await
@@ -3933,6 +3975,7 @@ pub async fn file_mkdir_local(
 /// IPC 命令：异步删除本机文件或目录（`spawn_blocking`）。
 #[tauri::command]
 pub async fn file_delete_local(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     tauri::async_runtime::spawn_blocking(move || rc_tools::file_transfer::delete_local_path(&path))
         .await
@@ -3946,6 +3989,7 @@ pub async fn file_rename_local(
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     tauri::async_runtime::spawn_blocking(move || {
         rc_tools::file_transfer::rename_local_path(&path, &new_name)
@@ -4221,7 +4265,9 @@ pub async fn terminal_set_font_prefs(
     patch: TerminalPrefsPatch,
     app: AppHandle,
 ) -> Result<AppPrefs, String> {
-    app.state::<AppState>().require_authenticated()?;
+    let st = app.state::<AppState>();
+    st.require_unlocked()?;
+    st.require_authenticated()?;
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
@@ -4459,6 +4505,7 @@ pub fn save_general_prefs(
     patch: GeneralPrefsPatch,
     state: State<'_, AppState>,
 ) -> Result<GeneralPrefsSnapshot, String> {
+    state.require_unlocked()?;
     let prefs_path = app_prefs::default_prefs_path();
     let _io = state
         .prefs_io_lock
@@ -4641,8 +4688,9 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
     }
 }
 
-/// 显示并前置 `"main"` 控制端主窗口。
+/// 显示并前置 `"main"` 控制端主窗口（macOS 上同步取消应用隐藏并激活至最前）。
 pub(crate) fn show_and_focus_main_window(app: &AppHandle) {
+    metal_attach::activate_app_and_unhide();
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
@@ -4660,9 +4708,9 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
         let rt = st.server.lock().unwrap_or_else(|e| e.into_inner());
         rt.current_status()
     };
-    let (allow_assist, connected_peer) = {
+    let connected_peer = {
         let host = st.host.lock().unwrap_or_else(|e| e.into_inner());
-        (host.allow_remote_assist, host.connected_peer.clone())
+        host.connected_peer.clone()
     };
     let perms = permissions::check_permissions();
     let initial = StatusBarDisplay {
@@ -4675,7 +4723,6 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
                 .clone()
         }),
         signal_online: server_snap.state == ServerConnectionState::Connected,
-        remote_assist_enabled: allow_assist,
         connected_peer,
         missing_permissions: perms.platform_supported && !perms.host_ready,
         session_label: "独立托管模式".to_string(),
@@ -4686,145 +4733,6 @@ pub(crate) fn install_standalone_status_bar(app: &AppHandle) {
         Arc::new(move |action| match action {
             StatusBarAction::OpenMainGui => {
                 show_and_focus_main_window(&app_cb);
-            }
-            StatusBarAction::CopyDeviceId => {
-                let st = app_cb.state::<AppState>();
-                if let Some(did) = local_device_id_snapshot(&st) {
-                    let _ = metal_attach::copy_text_to_pasteboard(&did);
-                }
-            }
-            StatusBarAction::CheckPermissions => {
-                show_and_focus_main_window(&app_cb);
-                let _ = app_cb.emit("tray://open-permissions", ());
-            }
-            StatusBarAction::ToggleRemoteAssist(target) => {
-                let app_worker = app_cb.clone();
-                let _ = std::thread::Builder::new()
-                    .name("rc-tray-toggle-assist".to_string())
-                    .spawn(move || {
-                        let st = app_worker.state::<AppState>();
-                        if st.gate_state() != AppGateState::Authenticated {
-                            let app_ui = app_worker.clone();
-                            let _ = app_worker.run_on_main_thread(move || {
-                                show_and_focus_main_window(&app_ui);
-                            });
-                            return;
-                        }
-                        if target {
-                            let perms = permissions::check_permissions();
-                            if permissions::ensure_host_ready(&perms).is_err() {
-                                let app_ui = app_worker.clone();
-                                let _ = app_worker.run_on_main_thread(move || {
-                                    show_and_focus_main_window(&app_ui);
-                                    let _ = app_ui.emit("tray://open-permissions", ());
-                                });
-                                return;
-                            }
-                        }
-                        let prefs_path = app_prefs::default_prefs_path();
-                        let patch = SecurityPrefsPatch {
-                            allow_remote_assist: Some(target),
-                            ..Default::default()
-                        };
-                        {
-                            let _io = st.prefs_io_lock.lock().unwrap_or_else(|e| e.into_inner());
-                            let _file_lock = config_paths::acquire_file_lock(
-                                &prefs_path,
-                                Duration::from_secs(3),
-                            );
-                            let prefs_res = {
-                                let mut prefs = st.prefs.lock().unwrap_or_else(|e| e.into_inner());
-                                let prev = prefs.clone();
-                                if prefs.apply_security_patch(patch).is_err() {
-                                    None
-                                } else if app_prefs::save_to_path(&prefs_path, &prefs).is_err() {
-                                    *prefs = prev;
-                                    None
-                                } else {
-                                    Some(prev.allow_remote_assist)
-                                }
-                            };
-                            let Some(prev_allow) = prefs_res else {
-                                return;
-                            };
-                            if target {
-                                let addr = SocketAddr::from((
-                                    [0, 0, 0, 0],
-                                    host_bridge::DEFAULT_HOST_PORT,
-                                ));
-                                match start_host_service_with_policy(&st, addr, true, true) {
-                                    Ok(snap) => {
-                                        if let (Some(listen_addr), Some(display_addr)) =
-                                            (snap.listen_addr, snap.display_addr)
-                                        {
-                                            let _ = app_worker.emit(
-                                                "host://update",
-                                                &HostUpdate::Listening {
-                                                    listen_addr,
-                                                    display_addr,
-                                                    backend: snap.backend,
-                                                },
-                                            );
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let reverted = {
-                                            let mut prefs =
-                                                st.prefs.lock().unwrap_or_else(|e| e.into_inner());
-                                            prefs.allow_remote_assist = prev_allow;
-                                            prefs.clone()
-                                        };
-                                        let _ = app_prefs::save_to_path(&prefs_path, &reverted);
-                                        drop(_file_lock);
-                                        drop(_io);
-                                        sync_standalone_status_bar(&st);
-                                        return;
-                                    }
-                                }
-                            } else {
-                                let (cancelled_gen, emit_listening) = {
-                                    let mut host =
-                                        st.host.lock().unwrap_or_else(|e| e.into_inner());
-                                    host.allow_remote_assist = false;
-                                    let cancelled =
-                                        host.pending_approval.take().map(|p| p.generation);
-                                    if let Some(h) = host.handle.as_ref() {
-                                        if let Some(gen) = cancelled {
-                                            let _ = h.respond_approval(gen, false);
-                                        }
-                                        h.set_allow_remote_assist(false);
-                                    }
-                                    sync_lan_advertising_locked(&st, &host);
-                                    let listening = if let (Some(la), Some(da)) =
-                                        (host.listen_addr.clone(), host.display_addr.clone())
-                                    {
-                                        Some(HostUpdate::Listening {
-                                            listen_addr: la,
-                                            display_addr: da,
-                                            backend: host.backend.clone(),
-                                        })
-                                    } else {
-                                        None
-                                    };
-                                    (cancelled, listening)
-                                };
-                                refresh_host_security_runtime(&st);
-                                if let Some(generation) = cancelled_gen {
-                                    let _ = app_worker.emit(
-                                        "host://update",
-                                        &HostUpdate::ApprovalCancelled { generation },
-                                    );
-                                }
-                                if let Some(upd) = emit_listening {
-                                    let _ = app_worker.emit("host://update", &upd);
-                                } else {
-                                    let _ = app_worker.emit("host://update", &HostUpdate::Stopped);
-                                }
-                            }
-                        }
-                        sync_assist_state_to_server(&app_worker, &st, target);
-                        sync_standalone_status_bar(&st);
-                    });
             }
             StatusBarAction::QuitAll => {
                 quit_app_completely_inner(&app_cb);
@@ -4872,6 +4780,7 @@ pub(crate) fn quit_app_completely_inner(app: &AppHandle) {
 /// IPC 命令：一键安装并启动 macOS 系统级后台服务（LaunchDaemon + 双会话 LaunchAgent）。
 #[tauri::command]
 pub async fn install_system_service(app: AppHandle) -> Result<ServiceStatusReport, String> {
+    app.state::<AppState>().require_unlocked()?;
     let app_for_blocking = app.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         let st = app_for_blocking.state::<AppState>();
@@ -4901,6 +4810,7 @@ pub async fn install_system_service(app: AppHandle) -> Result<ServiceStatusRepor
                 st.set_service_proxy(use_proxy);
                 if use_proxy {
                     st.rebind_storage_to_active_paths();
+                    rebind_gui_ipc(&app_for_blocking);
                     let _ = app_for_blocking.run_on_main_thread(move || {
                         metal_attach::remove_status_bar();
                     });
@@ -4924,6 +4834,7 @@ pub async fn install_system_service(app: AppHandle) -> Result<ServiceStatusRepor
                 st.set_service_proxy(keep_proxy);
                 if keep_proxy {
                     st.rebind_storage_to_active_paths();
+                    rebind_gui_ipc(&app_for_blocking);
                     let _ = app_for_blocking.run_on_main_thread(move || {
                         metal_attach::remove_status_bar();
                     });
@@ -4949,6 +4860,7 @@ pub async fn install_system_service(app: AppHandle) -> Result<ServiceStatusRepor
 /// IPC 命令：卸载 macOS 系统级后台服务并无缝切回前台独立托管模式。
 #[tauri::command]
 pub async fn uninstall_system_service(app: AppHandle) -> Result<ServiceStatusReport, String> {
+    app.state::<AppState>().require_unlocked()?;
     let app_for_blocking = app.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         let st = app_for_blocking.state::<AppState>();
@@ -4959,6 +4871,7 @@ pub async fn uninstall_system_service(app: AppHandle) -> Result<ServiceStatusRep
         let report = service_manager::uninstall_system_service()?;
         st.set_service_proxy(false);
         st.rebind_storage_to_active_paths();
+        rebind_gui_ipc(&app_for_blocking);
         {
             let mut rt = st.server.lock().unwrap_or_else(|e| e.into_inner());
             rt.shutting_down = false;
@@ -4999,6 +4912,7 @@ pub async fn reconnect_last_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     let (watch_only, mut meta) = {
         let guard = state
@@ -5069,6 +4983,795 @@ pub async fn reconnect_last_session(
 #[tauri::command]
 pub fn quit_app_completely(app: AppHandle) -> Result<(), String> {
     quit_app_completely_inner(&app);
+    Ok(())
+}
+
+/// 在当前生效运行目录重新绑定前台 GUI 单实例唤醒用 `gui.sock`。
+pub(crate) fn rebind_gui_ipc(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if let Some(mut old) = st.gui_ipc.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        old.stop();
+    }
+    if let Ok(secret) =
+        rc_ui::service_ipc::read_or_create_ipc_secret(&config_paths::ipc_secret_path())
+    {
+        let app_wake = app.clone();
+        if let Ok(gui_srv) = rc_ui::service_ipc::IpcServer::bind(
+            config_paths::gui_socket_path(),
+            secret,
+            move |req| match req {
+                ServiceRequest::Ping => ServiceResponse::Pong {
+                    pid: std::process::id(),
+                    session_type: rc_ui::service_ipc::ServiceSessionType::Standalone,
+                    binary_sha256: None,
+                },
+                ServiceRequest::OpenMainGui => {
+                    let app_ui = app_wake.clone();
+                    let _ = app_wake.run_on_main_thread(move || {
+                        show_and_focus_main_window(&app_ui);
+                    });
+                    ServiceResponse::Ok
+                }
+                _ => ServiceResponse::Error {
+                    message: "gui.sock 仅支持 Ping 与 OpenMainGui".to_string(),
+                },
+            },
+        ) {
+            *st.gui_ipc.lock().unwrap_or_else(|e| e.into_inner()) = Some(gui_srv);
+        }
+    }
+}
+
+/// 客户端「安全锁定」状态快照（供主窗口锁屏遮罩与设置页读取）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientLockStatus {
+    /// 当前主界面是否处于安全锁定状态。
+    pub locked: bool,
+    /// 是否已设置 8–16 位安全密码。
+    pub has_password: bool,
+    /// 脱敏展示的当前登录账号（未登录时为空）。
+    pub account_masked: Option<String>,
+}
+
+fn build_client_lock_status(state: &AppState) -> ClientLockStatus {
+    let (locked, has_password) = {
+        let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        (prefs.client_lock_enabled, prefs.has_client_lock_password())
+    };
+    let account_masked = state
+        .auth
+        .current_session()
+        .map(|s| app_prefs::mask_account_display(&s.email))
+        .filter(|s| !s.is_empty());
+    ClientLockStatus {
+        locked,
+        has_password,
+        account_masked,
+    }
+}
+
+/// IPC 命令：查询客户端「安全锁定」当前状态。
+#[tauri::command]
+pub fn get_client_lock_status(state: State<'_, AppState>) -> ClientLockStatus {
+    build_client_lock_status(&state)
+}
+
+/// IPC 命令：开启客户端「安全锁定」（首次锁定或修改密码时传入 8–16 位安全密码，已设密码时可传 `None` 直接锁定）。
+#[tauri::command]
+pub fn lock_client(
+    password: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClientLockStatus, String> {
+    let prefs_path = app_prefs::default_prefs_path();
+    {
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let next = {
+            let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+            if state.is_service_proxy() && prefs_path.exists() {
+                *prefs = app_prefs::load_from_path(&prefs_path);
+            }
+            let prev = prefs.clone();
+            if prefs.client_lock_enabled {
+                if password.is_some() {
+                    return Err("客户端已处于锁定状态，请先解锁后再修改安全密码".to_string());
+                }
+                drop(prefs);
+                drop(_file_lock);
+                drop(_io);
+                return Ok(build_client_lock_status(&state));
+            }
+            if let Some(pw) = password {
+                if prefs.has_client_lock_password() {
+                    return Err("已设置安全密码，修改密码需先校验当前安全密码".to_string());
+                }
+                if let Err(err) = prefs.set_client_lock_password(&pw) {
+                    *prefs = prev;
+                    return Err(err);
+                }
+            } else if !prefs.has_client_lock_password() {
+                return Err("请先设置 8-16 位安全密码".to_string());
+            }
+            prefs.client_lock_enabled = true;
+            let cloned = prefs.clone();
+            if let Err(err) = app_prefs::save_to_path(&prefs_path, &cloned) {
+                *prefs = prev;
+                return Err(err);
+            }
+            cloned
+        };
+        let _ = next;
+    }
+    // 锁定时关闭已打开的设置、远控与工具窗口并停止快捷键拦截器，防止通过已开窗口绕过锁定。
+    stop_shortcut_tap_runtime(&state);
+    disconnect_active_session(&app);
+    window::close_session_and_tool_windows(&app);
+    let app_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = app_main.get_webview_window("settings") {
+            let _ = win.destroy();
+        }
+    });
+    let status = build_client_lock_status(&state);
+    let _ = app.emit("client://lock-changed", &status);
+    Ok(status)
+}
+
+/// IPC 命令：校验安全密码并解除客户端「安全锁定」。
+#[tauri::command]
+pub fn unlock_client(
+    password: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClientLockStatus, String> {
+    let prefs_path = app_prefs::default_prefs_path();
+    {
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
+        if !prefs.client_lock_enabled {
+            return Ok(ClientLockStatus {
+                locked: false,
+                has_password: prefs.has_client_lock_password(),
+                account_masked: state
+                    .auth
+                    .current_session()
+                    .map(|s| app_prefs::mask_account_display(&s.email))
+                    .filter(|s| !s.is_empty()),
+            });
+        }
+        if !prefs.verify_client_lock_password(&password) {
+            return Err("安全密码错误，请重新输入".to_string());
+        }
+        let prev = prefs.clone();
+        prefs.client_lock_enabled = false;
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+    }
+    let status = build_client_lock_status(&state);
+    let _ = app.emit("client://lock-changed", &status);
+    Ok(status)
+}
+
+/// IPC 命令：修改客户端「安全锁定」密码（需先处于已解锁态；若已有旧密码须提供当前密码校验）。
+#[tauri::command]
+pub fn change_client_lock_password(
+    current_password: Option<String>,
+    new_password: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClientLockStatus, String> {
+    state.require_unlocked()?;
+    let prefs_path = app_prefs::default_prefs_path();
+    {
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
+        if prefs.has_client_lock_password() {
+            let cur = current_password.as_deref().unwrap_or("");
+            if !prefs.verify_client_lock_password(cur) {
+                return Err("当前安全密码不正确".to_string());
+            }
+        }
+        let prev = prefs.clone();
+        if let Err(err) = prefs.set_client_lock_password(&new_password) {
+            *prefs = prev;
+            return Err(err);
+        }
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+    }
+    let status = build_client_lock_status(&state);
+    let _ = app.emit("client://lock-changed", &status);
+    Ok(status)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 防窥隐私幕布 / 被控端静音 / 外设快捷键与鼠标模式 / 虚拟显示器 IPC 命令
+// ─────────────────────────────────────────────────────────────────
+
+/// 将 `data:image/<mime>;base64,<payload>` 解析为 `(ext, raw_bytes)` 并限制大小在 320 KiB 内。
+fn decode_privacy_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
+    let trimmed = data_url.trim();
+    let Some(rest) = trimmed.strip_prefix("data:") else {
+        return Err("图片数据格式无效，缺少 data: 前缀".to_string());
+    };
+    let Some((header, b64)) = rest.split_once(',') else {
+        return Err("图片数据格式无效，缺少 base64 分隔符".to_string());
+    };
+    if !header.ends_with(";base64") {
+        return Err("仅支持 Base64 编码的 JPEG/PNG/WebP 图片".to_string());
+    }
+    let mime = header
+        .trim_end_matches(";base64")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match mime.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => return Err("仅支持 JPEG、PNG 或 WebP 图片".to_string()),
+    };
+    let raw = rc_client_core::display_ctrl::base64_decode(b64.trim())
+        .ok_or_else(|| "图片 Base64 解码失败".to_string())?;
+    if raw.is_empty() {
+        return Err("图片内容不能为空".to_string());
+    }
+    if raw.len() > 320 * 1024 {
+        return Err("自定义屏保图片压缩后不能超过 320 KiB".to_string());
+    }
+    Ok((ext.to_string(), raw))
+}
+
+fn privacy_file_to_data_url(filename: &str) -> Option<String> {
+    let dir = app_prefs::default_privacy_dir();
+    let bytes = app_prefs::load_privacy_custom_image(&dir, filename)?;
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+    let b64 = rc_client_core::display_ctrl::base64_encode(&bytes);
+    Some(format!("data:{mime};base64,{b64}"))
+}
+
+/// IPC 命令：读取本机已保存的自定义隐私屏保图片（返回 Data URL）。
+#[tauri::command]
+pub fn get_privacy_custom_image(state: State<'_, AppState>) -> Option<String> {
+    let fname = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .privacy_custom_image
+        .clone()?;
+    privacy_file_to_data_url(&fname)
+}
+
+/// IPC 命令：保存并持久化用户选择的自定义隐私屏保图片（返回 Data URL）。
+#[tauri::command]
+pub fn save_privacy_custom_image(
+    data_url: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let (_ext, raw) = decode_privacy_data_url(&data_url)?;
+    let dir = app_prefs::default_privacy_dir();
+    let filename = app_prefs::save_privacy_custom_image(&dir, &raw)?;
+    let prefs_path = app_prefs::default_prefs_path();
+    {
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = prefs.clone();
+        prefs.privacy_custom_image = Some(filename.clone());
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+    }
+    privacy_file_to_data_url(&filename).ok_or_else(|| "保存隐私屏保图片后读取失败".to_string())
+}
+
+/// IPC 命令：设置当前远控会话的防窥模式并持久化偏好。
+#[tauri::command]
+pub fn set_session_privacy_mode(
+    mode: String,
+    preset: Option<String>,
+    custom_image_data_url: Option<String>,
+    persist: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let norm_mode = match mode.trim() {
+        "privacy" => "privacy",
+        "black" => "black",
+        _ => "off",
+    };
+    let mut resolved_preset = preset
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            state
+                .prefs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .privacy_preset
+                .clone()
+        });
+    if resolved_preset.is_empty() {
+        resolved_preset = "preset-1".to_string();
+    }
+
+    let custom_b64: Option<String> = if norm_mode == "privacy" && resolved_preset == "custom" {
+        if let Some(ref du) = custom_image_data_url {
+            let (_ext, raw) = decode_privacy_data_url(du)?;
+            if persist.unwrap_or(true) {
+                let dir = app_prefs::default_privacy_dir();
+                if let Ok(fname) = app_prefs::save_privacy_custom_image(&dir, &raw) {
+                    let prefs_path = app_prefs::default_prefs_path();
+                    let _io = state
+                        .prefs_io_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+                    let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+                    prefs.privacy_custom_image = Some(fname);
+                    let _ = app_prefs::save_to_path(&prefs_path, &prefs);
+                }
+            }
+            Some(rc_client_core::display_ctrl::base64_encode(&raw))
+        } else {
+            let fname = state
+                .prefs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .privacy_custom_image
+                .clone();
+            let dir = app_prefs::default_privacy_dir();
+            fname
+                .and_then(|f| app_prefs::load_privacy_custom_image(&dir, &f))
+                .map(|raw| rc_client_core::display_ctrl::base64_encode(&raw))
+        }
+    } else {
+        None
+    };
+
+    if persist.unwrap_or(true) {
+        let prefs_path = app_prefs::default_prefs_path();
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = prefs.clone();
+        if let Err(err) = prefs.apply_privacy_patch(app_prefs::PrivacyPrefsPatch {
+            privacy_mode: Some(norm_mode.to_string()),
+            privacy_preset: Some(resolved_preset.clone()),
+            host_mute_on_connect: None,
+            host_restore_audio_on_exit: None,
+        }) {
+            *prefs = prev;
+            return Err(err);
+        }
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+    }
+
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = guard.as_ref() {
+        if !active.disconnecting && !active.watch_only {
+            active.handle.send_display_ctrl(
+                rc_client_core::display_ctrl::DisplayControlMsg::SetPrivacyMode {
+                    mode: norm_mode.to_string(),
+                    preset: resolved_preset,
+                    custom_image_base64: custom_b64,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// IPC 命令：设置被控端本机静音运行及远控结束后是否恢复声音设置。
+#[tauri::command]
+pub fn set_session_host_mute(
+    muted: bool,
+    restore_on_exit: Option<bool>,
+    persist: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let eff_restore = restore_on_exit.unwrap_or_else(|| {
+        state
+            .prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .host_restore_audio_on_exit
+    });
+
+    if persist.unwrap_or(true) {
+        let prefs_path = app_prefs::default_prefs_path();
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = prefs.clone();
+        if let Err(err) = prefs.apply_privacy_patch(app_prefs::PrivacyPrefsPatch {
+            privacy_mode: None,
+            privacy_preset: None,
+            host_mute_on_connect: Some(muted),
+            host_restore_audio_on_exit: Some(eff_restore),
+        }) {
+            *prefs = prev;
+            return Err(err);
+        }
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+    }
+
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = guard.as_ref() {
+        if !active.disconnecting && !active.watch_only {
+            active.handle.send_display_ctrl(
+                rc_client_core::display_ctrl::DisplayControlMsg::SetHostMute {
+                    muted,
+                    restore_on_exit: eff_restore,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 卸载并释放当前运行的 macOS 系统快捷键拦截器（关闭 S1 / 断线 / 锁定 / 停机时调用，不留常驻全局钩子）。
+pub(crate) fn stop_shortcut_tap_runtime(state: &AppState) {
+    #[cfg(target_os = "macos")]
+    {
+        let old = state
+            .shortcut_tap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(tap) = old {
+            tap.set_enabled(false);
+            drop(tap);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+    }
+}
+
+/// 按显式 `(enabled, exceptions)` 同步 macOS 主动系统快捷键拦截器；关闭时直接卸载释放钩子线程。
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_shortcut_tap_with_params(
+    app: &AppHandle,
+    state: &AppState,
+    enabled: bool,
+    exceptions: &[String],
+) -> Result<(), String> {
+    let has_controllable_session = {
+        let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .is_some_and(|active| !active.disconnecting && !active.watch_only)
+    };
+    if !enabled || !has_controllable_session {
+        stop_shortcut_tap_runtime(state);
+        return Ok(());
+    }
+    let session_focused = app
+        .get_webview_window("session")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+
+    let mut slot = state.shortcut_tap.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tap) = slot.as_ref() {
+        tap.set_enabled(true);
+        tap.set_exceptions(exceptions);
+        tap.set_window_focused(session_focused);
+        return Ok(());
+    }
+
+    let app_cb = app.clone();
+    let on_event = Arc::new(move |ev: rc_input_macos::InterceptedShortcutEvent| {
+        let st = app_cb.state::<AppState>();
+        let guard = st.session.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = guard.as_ref() else {
+            return;
+        };
+        if active.disconnecting || active.watch_only {
+            return;
+        }
+        // `SystemShortcutTap` 已通过 `FlagsChanged` 精确配对修饰键按下/抬起，此处直接按原序发送每个扫描码。
+        active.handle.send_input(rc_input::InputEvent::Key {
+            scancode: ev.scancode,
+            pressed: ev.pressed,
+            modifiers: ev.modifiers,
+        });
+    });
+
+    let tap = rc_input_macos::SystemShortcutTap::spawn(true, exceptions, on_event)?;
+    tap.set_window_focused(session_focused);
+    *slot = Some(tap);
+    Ok(())
+}
+
+/// 按当前持久化偏好同步 macOS 主动系统快捷键拦截器。
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_shortcut_tap_runtime(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let (enabled, exceptions) = {
+        let p = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        (p.send_system_shortcuts, p.shortcut_exceptions.clone())
+    };
+    sync_shortcut_tap_with_params(app, state, enabled, &exceptions)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn sync_shortcut_tap_with_params(
+    _app: &AppHandle,
+    _state: &AppState,
+    _enabled: bool,
+    _exceptions: &[String],
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn sync_shortcut_tap_runtime(_app: &AppHandle, _state: &AppState) -> Result<(), String> {
+    Ok(())
+}
+
+/// 更新 S1 远控窗口焦点变化至系统快捷键拦截器。
+pub(crate) fn notify_session_window_focus(state: &AppState, focused: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(tap) = state
+            .shortcut_tap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            tap.set_window_focused(focused);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, focused);
+    }
+}
+
+/// IPC 命令：保存并实时应用外设偏好（发送系统快捷键、例外快捷键列表、鼠标模式）。
+#[tauri::command]
+pub fn set_session_peripherals(
+    send_system_shortcuts: Option<bool>,
+    shortcut_exceptions: Option<Vec<String>>,
+    mouse_mode: Option<String>,
+    persist: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppPrefs, String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let do_persist = persist.unwrap_or(true);
+    let (prev_prefs_snapshot, next_prefs) = if do_persist {
+        let prefs_path = app_prefs::default_prefs_path();
+        let _io = state
+            .prefs_io_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = prefs.clone();
+        if let Err(err) = prefs.apply_peripherals_patch(app_prefs::PeripheralsPrefsPatch {
+            send_system_shortcuts,
+            shortcut_exceptions: shortcut_exceptions.clone(),
+            mouse_mode: mouse_mode.clone(),
+        }) {
+            *prefs = prev;
+            return Err(err);
+        }
+        if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
+            *prefs = prev;
+            return Err(err);
+        }
+        (Some(prev), prefs.clone())
+    } else {
+        let mut effective = state
+            .prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        effective.apply_peripherals_patch(app_prefs::PeripheralsPrefsPatch {
+            send_system_shortcuts,
+            shortcut_exceptions,
+            mouse_mode: mouse_mode.clone(),
+        })?;
+        (None, effective)
+    };
+
+    if send_system_shortcuts.is_some()
+        || next_prefs.send_system_shortcuts
+        || !next_prefs.shortcut_exceptions.is_empty()
+    {
+        if let Err(err) = sync_shortcut_tap_with_params(
+            &app,
+            &state,
+            next_prefs.send_system_shortcuts,
+            &next_prefs.shortcut_exceptions,
+        ) {
+            if send_system_shortcuts == Some(true) {
+                // 拦截器初始化失败（如缺少辅助功能权限）时回滚持久化状态，避免磁盘与 UI 脱节。
+                if let Some(prev) = prev_prefs_snapshot {
+                    let prefs_path = app_prefs::default_prefs_path();
+                    let _io = state
+                        .prefs_io_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+                    let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+                    *prefs = prev;
+                    let _ = app_prefs::save_to_path(&prefs_path, &prefs);
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        let _ = sync_shortcut_tap_with_params(
+            &app,
+            &state,
+            next_prefs.send_system_shortcuts,
+            &next_prefs.shortcut_exceptions,
+        );
+    }
+
+    if let Some(ref mode) = mouse_mode {
+        let norm = match mode.trim() {
+            "remote" => "remote",
+            "local" => "local",
+            _ => "smart",
+        };
+        let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = guard.as_ref() {
+            if !active.disconnecting && !active.watch_only {
+                active.handle.send_display_ctrl(
+                    rc_client_core::display_ctrl::DisplayControlMsg::SetMouseMode {
+                        mode: norm.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(next_prefs)
+}
+
+/// IPC 命令：请求被控端刷新全部可用物理与虚拟显示器列表。
+#[tauri::command]
+pub fn list_session_displays(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_ref() else {
+        return Err("当前无活动远控会话".to_string());
+    };
+    if active.disconnecting {
+        return Err("远控会话正在断开".to_string());
+    }
+    active
+        .handle
+        .send_display_ctrl(rc_client_core::display_ctrl::DisplayControlMsg::ListDisplays);
+    Ok(())
+}
+
+/// IPC 命令：切换当前远控采集与控制的目标显示器。
+#[tauri::command]
+pub fn switch_session_display(display_id: u32, state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_ref() else {
+        return Err("当前无活动远控会话".to_string());
+    };
+    if active.disconnecting {
+        return Err("远控会话正在断开".to_string());
+    }
+    active.handle.send_display_ctrl(
+        rc_client_core::display_ctrl::DisplayControlMsg::SwitchDisplay { display_id },
+    );
+    Ok(())
+}
+
+/// IPC 命令：在被控端创建一个新的虚拟显示器并切至该屏。
+#[tauri::command]
+pub fn create_session_virtual_display(
+    width: Option<u32>,
+    height: Option<u32>,
+    hidpi: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_ref() else {
+        return Err("当前无活动远控会话".to_string());
+    };
+    if active.disconnecting {
+        return Err("远控会话正在断开".to_string());
+    }
+    if active.watch_only {
+        return Err("观看模式下无法创建虚拟屏".to_string());
+    }
+    active.handle.send_display_ctrl(
+        rc_client_core::display_ctrl::DisplayControlMsg::CreateVirtualDisplay {
+            width: width.unwrap_or(1920),
+            height: height.unwrap_or(1080),
+            hidpi: hidpi.unwrap_or(true),
+        },
+    );
+    Ok(())
+}
+
+/// IPC 命令：销毁被控端指定的虚拟显示器。
+#[tauri::command]
+pub fn remove_session_virtual_display(
+    display_id: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_ref() else {
+        return Err("当前无活动远控会话".to_string());
+    };
+    if active.disconnecting {
+        return Err("远控会话正在断开".to_string());
+    }
+    if active.watch_only {
+        return Err("观看模式下无法移除虚拟屏".to_string());
+    }
+    active.handle.send_display_ctrl(
+        rc_client_core::display_ctrl::DisplayControlMsg::RemoveVirtualDisplay { display_id },
+    );
     Ok(())
 }
 

@@ -702,9 +702,10 @@
     if (p1ActiveOverlay) p1ActiveOverlay.hidden = !controlling;
   }
 
-  function openSession(watchOnly, targetDevice) {
+  function openSession(watchOnly, targetDevice, extraOpts) {
+    var extra = extraOpts || {};
     var device = targetDevice || findDevice(state.deviceId);
-    if (device && isDeviceControlled(device)) {
+    if (!extra.headless && device && isDeviceControlled(device)) {
       focusSessionWindow();
       return;
     }
@@ -721,7 +722,8 @@
         connectToTarget(device.deviceId, {
           watchOnly: Boolean(watchOnly),
           promptPassword: false,
-          displayName: device.name
+          displayName: device.name,
+          headless: Boolean(extra.headless)
         });
         return;
       }
@@ -729,7 +731,8 @@
         connectToTarget(device.addr, {
           watchOnly: Boolean(watchOnly),
           promptPassword: Boolean(device.requiresPassword),
-          displayName: device.name
+          displayName: device.name,
+          headless: Boolean(extra.headless)
         });
         return;
       }
@@ -778,8 +781,8 @@
         sawTargetActive: false,
         expiresAt: Date.now() + 20000
       };
-      toast("正在连接「" + device.name + "」，建连后自动打开工具…");
-      openSession(false, device);
+      toast("正在后台连接「" + device.name + "」，建连后自动打开工具…");
+      openSession(false, device, { headless: true });
       return;
     }
     toast("功能开发中");
@@ -1051,17 +1054,18 @@
     renderP2DeviceId();
   }
 
-  function launchSessionWithTarget(addr, watchOnly, password, deviceName) {
+  function launchSessionWithTarget(addr, watchOnly, password, deviceName, headless) {
     var cfg = {
       target: addr,
       watchOnly: Boolean(watchOnly),
       password: password && password.length > 0 ? password : null,
-      deviceName: deviceName || null
+      deviceName: deviceName || null,
+      headless: Boolean(headless)
     };
     var isDeviceCode = Boolean(parseDeviceIdInput(addr));
     sessionLaunching = true;
     updateConnectState();
-    if (isDeviceCode) {
+    if (isDeviceCode && !headless) {
       toast("正在连接目标设备…");
     }
     return Bridge.openSession(cfg)
@@ -1077,7 +1081,13 @@
 
   function promptAndLaunchSession(target, displayTarget, targetKindLabel, options) {
     if (options.promptPassword === false) {
-      return launchSessionWithTarget(target, options.watchOnly, null, options.displayName);
+      return launchSessionWithTarget(
+        target,
+        options.watchOnly,
+        null,
+        options.displayName,
+        options.headless
+      );
     }
     var field = createPasswordField({
       placeholder: options.placeholder || "请输入对方验证码（无密码可留空）",
@@ -1096,7 +1106,7 @@
     var submit = function () {
       var pw = input.value.trim();
       closeModal(true);
-      launchSessionWithTarget(target, options.watchOnly, pw, options.displayName);
+      launchSessionWithTarget(target, options.watchOnly, pw, options.displayName, options.headless);
     };
 
     cancelBtn.addEventListener("click", function () {
@@ -1151,7 +1161,8 @@
         options = {
           watchOnly: options.watchOnly,
           promptPassword: false,
-          displayName: options.displayName || ownDev.name
+          displayName: options.displayName || ownDev.name,
+          headless: Boolean(options.headless)
         };
       }
       promptAndLaunchSession(deviceId, formatDeviceId(deviceId), "目标设备码", options);
@@ -3225,6 +3236,21 @@
         Bridge.onGateStatus(applyGateStatus);
       }
       refreshGateStatus().then(finishBootSync, finishBootSync);
+
+      if (Overlay && typeof Overlay.applyClientLockStatus === "function") {
+        if (typeof Bridge.onClientLockChanged === "function") {
+          Bridge.onClientLockChanged(function (st) {
+            Overlay.applyClientLockStatus(st);
+          });
+        }
+        if (typeof Bridge.getClientLockStatus === "function") {
+          Bridge.getClientLockStatus()
+            .then(function (st) {
+              Overlay.applyClientLockStatus(st);
+            })
+            .catch(function () {});
+        }
+      }
 
       if (typeof Bridge.onTrayOpenPermissions === "function") {
         Bridge.onTrayOpenPermissions(function () {

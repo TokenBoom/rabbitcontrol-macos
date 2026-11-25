@@ -269,6 +269,125 @@ pub fn lock_screen_now() -> bool {
     }
 }
 
+/// 在线显示器描述（物理屏或虚拟屏）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnlineDisplayInfo {
+    /// macOS `CGDirectDisplayID`。
+    pub id: u32,
+    /// 可读显示器名称。
+    pub name: String,
+    /// 逻辑宽度（点）。
+    pub width: u32,
+    /// 逻辑高度（点）。
+    pub height: u32,
+    /// 全局桌面坐标原点 X。
+    pub origin_x: f64,
+    /// 全局桌面坐标原点 Y。
+    pub origin_y: f64,
+    /// 是否为主显示器。
+    pub is_main: bool,
+    /// 是否为本进程创建的虚拟显示器。
+    pub is_virtual: bool,
+}
+
+/// 开启或更新被控端物理防窥隐私幕布（遮挡全部物理屏且对 SCK 采集排除）。
+pub fn set_privacy_curtain(
+    mode: &str,
+    preset: &str,
+    custom_image_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::set_privacy_curtain(mode, preset, custom_image_bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (mode, preset, custom_image_bytes);
+        Err("privacy curtain is only supported on macOS".to_string())
+    }
+}
+
+/// 关闭并销毁被控端全部物理防窥隐私幕布窗口（幂等）。
+pub fn clear_privacy_curtain() {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::clear_privacy_curtain();
+    }
+}
+
+/// 枚举当前全部在线显示器（含物理屏与本进程创建的虚拟屏）。
+pub fn list_online_displays() -> Vec<OnlineDisplayInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::list_online_displays()
+            .into_iter()
+            .map(|d| OnlineDisplayInfo {
+                id: d.id,
+                name: d.name,
+                width: d.width,
+                height: d.height,
+                origin_x: d.origin_x,
+                origin_y: d.origin_y,
+                is_main: d.is_main,
+                is_virtual: d.is_virtual,
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// 创建一个 macOS 虚拟显示器。
+pub fn create_virtual_display(
+    width: u32,
+    height: u32,
+    hidpi: bool,
+) -> Result<OnlineDisplayInfo, String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::create_virtual_display(width, height, hidpi).map(|d| {
+            OnlineDisplayInfo {
+                id: d.id,
+                name: d.name,
+                width: d.width,
+                height: d.height,
+                origin_x: d.origin_x,
+                origin_y: d.origin_y,
+                is_main: d.is_main,
+                is_virtual: d.is_virtual,
+            }
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (width, height, hidpi);
+        Err("virtual display is only supported on macOS".to_string())
+    }
+}
+
+/// 销毁指定的虚拟显示器。
+pub fn destroy_virtual_display(display_id: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::destroy_virtual_display(display_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = display_id;
+        false
+    }
+}
+
+/// 销毁本进程创建的全部虚拟显示器（幂等）。
+pub fn destroy_all_virtual_displays() {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::privacy_and_virtual::destroy_all_virtual_displays();
+    }
+}
+
 /// 从已采集的 `CVPixelBuffer` 读取左上角最多 `max_w × max_h` 像素的 Y 平面亮度切片（仅 `bench-metrics`）。
 ///
 /// 返回 `(实际宽, 实际高, 连续 Y 字节)`；非 `CVPixelBuffer` 纹理返回显式错误。

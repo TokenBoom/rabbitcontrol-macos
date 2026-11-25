@@ -34,6 +34,10 @@ pub struct SckConfig {
     /// 采集的显示器索引：`0` 表示主显示器（`CGMainDisplayID` 匹配，
     /// 找不到时退回列表第一个），`n > 0` 取枚举列表的第 n 个。
     pub display: u32,
+    /// 可选精确目标显示器 ID（`CGDirectDisplayID`；设置后优先于 `display` 索引，支持虚拟屏与多屏切换）。
+    pub display_id: Option<u32>,
+    /// 是否在采集画面中包含系统鼠标光标（默认 `false`，选择「使用被控端鼠标」时为 `true`）。
+    pub shows_cursor: bool,
     /// 帧率上限。SCK 只在内容变化时出帧，这是上限不是承诺（C1）。
     pub fps: u32,
     /// 可选的输出分辨率覆写。
@@ -54,6 +58,8 @@ impl Default for SckConfig {
     fn default() -> Self {
         Self {
             display: 0,
+            display_id: None,
+            shows_cursor: false,
             fps: 60,
             resolution: None,
             origin_us: None,
@@ -189,13 +195,15 @@ impl SckBackend {
     /// 枚举显示器并构建一条全新的 SCStream（`new` 与 `rebuild` 共用，M8）。
     fn establish(&mut self) -> Result<()> {
         let displays = ffi::enumerate_displays().map_err(unknown_capture_error)?;
-        let snapshot = pick_display(&displays, self.config.display).ok_or_else(|| {
-            unknown_capture_error(format!(
-                "找不到可采集的显示器（index={}, 共 {} 个）",
-                self.config.display,
-                displays.len()
-            ))
-        })?;
+        let snapshot = pick_display(&displays, self.config.display, self.config.display_id)
+            .ok_or_else(|| {
+                unknown_capture_error(format!(
+                    "找不到可采集的显示器（index={}, id={:?}, 共 {} 个）",
+                    self.config.display,
+                    self.config.display_id,
+                    displays.len()
+                ))
+            })?;
 
         // 若配置指定了输出分辨率，取偶后直接请求 SCK 按该尺寸缩放输出；
         // 否则沿用 M9：Retina 下采样到逻辑分辨率（GPU 侧完成，CPU 不过手），
@@ -214,9 +222,14 @@ impl SckBackend {
         #[cfg(not(feature = "bench-metrics"))]
         let exclude_self = false;
 
-        let (handles, mailbox) =
-            ffi::build_stream_with_options(snapshot, target, self.config.fps, exclude_self)
-                .map_err(unknown_capture_error)?;
+        let (handles, mailbox) = ffi::build_stream_with_options(
+            snapshot,
+            target,
+            self.config.fps,
+            exclude_self,
+            self.config.shows_cursor,
+        )
+        .map_err(unknown_capture_error)?;
 
         self.display = DisplaySummary {
             id: DisplayId(self.config.display),
@@ -416,10 +429,19 @@ fn unknown_capture_error(msg: impl Into<String>) -> Error {
     InvalidationReason::Unknown.to_capture_error(msg)
 }
 
-/// 按配置挑选显示器：index 0 → 主显示器，否则列表第 index 个。
-fn pick_display(displays: &[ffi::DisplaySnapshot], index: u32) -> Option<&ffi::DisplaySnapshot> {
+/// 按配置挑选显示器：优先精确匹配 `display_id`，其次 `index == 0` 匹配主显示器，否则取第 `index` 个。
+fn pick_display(
+    displays: &[ffi::DisplaySnapshot],
+    index: u32,
+    display_id: Option<u32>,
+) -> Option<&ffi::DisplaySnapshot> {
     if displays.is_empty() {
         return None;
+    }
+    if let Some(target_id) = display_id {
+        if let Some(found) = displays.iter().find(|d| d.display_id == target_id) {
+            return Some(found);
+        }
     }
     if index == 0 {
         let main_id = ffi::main_display_id();

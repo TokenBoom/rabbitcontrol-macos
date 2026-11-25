@@ -15,6 +15,8 @@
 // 见模块文档：本模块是 crate 内唯一允许 unsafe 的地方。
 #![allow(unsafe_code)]
 
+pub(crate) mod privacy_and_virtual;
+
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 
@@ -1431,6 +1433,8 @@ pub(crate) struct DisplaySnapshot {
     pub scale: f32,
     /// 建 SCContentFilter 用的强引用。
     display: Retained<SCDisplay>,
+    /// 需要从采集中排除的隐私幕布 `SCWindow` 列表（被控端防窥模式激活时生效）。
+    privacy_windows: Vec<Retained<SCWindow>>,
     /// 当前进程对应的 `SCRunningApplication`（仅 `bench-metrics` 排除自渲染窗用）。
     #[cfg(feature = "bench-metrics")]
     self_app: Option<Retained<SCRunningApplication>>,
@@ -1444,6 +1448,17 @@ pub(crate) fn enumerate_displays() -> Result<Vec<DisplaySnapshot>, String> {
     let content = fetch_shareable_content(Duration::from_secs(3))?;
     // SAFETY: displays 是纯属性 getter。
     let displays = unsafe { content.displays() };
+    let excluded_privacy_ids = privacy_and_virtual::privacy_excluded_window_ids();
+    let privacy_windows: Vec<Retained<SCWindow>> = if excluded_privacy_ids.is_empty() {
+        Vec::new()
+    } else {
+        // SAFETY: windows/windowID 均为只读属性 getter。
+        unsafe { content.windows() }
+            .to_vec()
+            .into_iter()
+            .filter(|w| excluded_privacy_ids.contains(&unsafe { w.windowID() }))
+            .collect()
+    };
     #[cfg(feature = "bench-metrics")]
     let (self_app, self_windows) = {
         let self_pid = std::process::id() as i32;
@@ -1486,6 +1501,7 @@ pub(crate) fn enumerate_displays() -> Result<Vec<DisplaySnapshot>, String> {
                     backing: Resolution::new(backing_w, backing_h),
                     scale,
                     display,
+                    privacy_windows: privacy_windows.clone(),
                     #[cfg(feature = "bench-metrics")]
                     self_app: self_app.clone(),
                     #[cfg(feature = "bench-metrics")]
@@ -1564,16 +1580,20 @@ impl Drop for StreamHandles {
 }
 
 /// 组装 `SCStreamConfiguration`（M5/M7/M9 全部在这里落实）。
-fn make_configuration(target: Resolution, fps: u32) -> Retained<SCStreamConfiguration> {
+fn make_configuration(
+    target: Resolution,
+    fps: u32,
+    shows_cursor: bool,
+) -> Retained<SCStreamConfiguration> {
     // SAFETY: new 是无参构造。
     let config = unsafe { SCStreamConfiguration::new() };
     // M5：'420v'（NV12 video range）—— VideoToolbox 的原生输入，零拷贝直达
     // 编码器，无需 CPU 色彩转换。
     // SAFETY: 纯属性 setter。
     unsafe { config.setPixelFormat(PIXEL_FORMAT_420V) };
-    // M7：光标不进视频帧（远端由输入层单独绘制光标，避免双光标/滞后）。
+    // M7：默认关闭光标（远端由输入层单独绘制光标）；当控制端选择「使用被控端鼠标」时开启。
     // SAFETY: 纯属性 setter。
-    unsafe { config.setShowsCursor(false) };
+    unsafe { config.setShowsCursor(shows_cursor) };
     // 显式关闭音频采集，避免 SCK 维护额外音频管线与回调开销。
     // SAFETY: 纯属性 setter。
     unsafe { config.setCapturesAudio(false) };
@@ -1613,15 +1633,18 @@ fn make_configuration(target: Resolution, fps: u32) -> Retained<SCStreamConfigur
     config
 }
 
-/// 组装 `SCContentFilter`（捕获整块显示器，含桌面与 Dock，坑 10：每显示器一个 filter）。
+/// 组装 `SCContentFilter`（捕获整块显示器，含桌面与 Dock，并自动排除防窥隐私幕布窗口）。
 fn make_filter(display: &DisplaySnapshot) -> Retained<SCContentFilter> {
-    // NSArray::new 产生空数组（合法的 excluded：什么都不排除）；绑定层安全方法。
-    let empty: Retained<NSArray<SCWindow>> = NSArray::new();
+    let excluded: Retained<NSArray<SCWindow>> = if display.privacy_windows.is_empty() {
+        NSArray::new()
+    } else {
+        NSArray::from_retained_slice(&display.privacy_windows)
+    };
     // SAFETY: alloc + initWithDisplay:excludingWindows: 标准构造；
-    // display 强引用有效，excluded 为空数组。
+    // display 与 excluded 均为有效强引用。
     unsafe {
         let allocated = SCContentFilter::alloc();
-        SCContentFilter::initWithDisplay_excludingWindows(allocated, &display.display, &empty)
+        SCContentFilter::initWithDisplay_excludingWindows(allocated, &display.display, &excluded)
     }
 }
 
@@ -1694,6 +1717,7 @@ pub(crate) fn build_stream_with_options(
     target: Resolution,
     fps: u32,
     exclude_self: bool,
+    shows_cursor: bool,
 ) -> Result<(StreamHandles, FrameMailbox), String> {
     #[cfg(feature = "bench-metrics")]
     let filter = if exclude_self {
@@ -1706,7 +1730,7 @@ pub(crate) fn build_stream_with_options(
         let _ = exclude_self;
         make_filter(display)
     };
-    let config = make_configuration(target, fps);
+    let config = make_configuration(target, fps, shows_cursor);
     let mailbox = FrameMailbox::new();
     let handler = RcSckStreamHandler::new(mailbox.clone());
 

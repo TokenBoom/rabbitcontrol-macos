@@ -6,6 +6,7 @@
   <title>终端远控 — RabbitControl</title>
   <link rel="stylesheet" href="assets/css/tokens.css" />
   <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/vendor/xterm/xterm.css" />
   <link rel="stylesheet" href="assets/css/pages/terminal.css" />
 </head>
 <!-- W3 终端远控窗口：会话管理列表（亮色默认视图）+ 交互式终端（暗色视图） -->
@@ -69,12 +70,8 @@
 
       <!-- 交互终端输出舞台（独立定位容器，确保 .tm-notice 不遮挡上方标签栏与状态栏） -->
       <div class="tm-stage" id="terminal-stage">
-        <!-- 实时 PTY 输出区（零 innerHTML，安全 DOM 节点渲染） -->
-        <pre class="tm-screen" id="terminal-screen" tabindex="0" aria-label="远程终端"></pre>
-
-        <!-- 中文输入法组合输入代理（透明定位，不影响视觉） -->
-        <textarea class="tm-ime-input" id="terminal-ime" autocomplete="off" autocorrect="off"
-                  autocapitalize="off" spellcheck="false" aria-hidden="true" tabindex="-1"></textarea>
+        <!-- 实时 PTY 输出区（xterm.js 离线终端引擎，支持完整 VT100/xterm-256color/TrueColor/TUI） -->
+        <div class="tm-screen" id="terminal-screen" aria-label="远程终端"></div>
 
         <!-- 未连接 / 异常居中提示 -->
         <div class="tm-notice" id="terminal-notice" hidden>
@@ -148,6 +145,9 @@
   <div class="tm-toast" id="tm-toast" role="status" aria-live="polite"></div>
 
   <script src="assets/js/bridge.js"></script>
+  <script src="assets/vendor/xterm/xterm.js"></script>
+  <script src="assets/vendor/xterm/addon-fit.js"></script>
+  <script src="assets/vendor/xterm/addon-unicode11.js"></script>
   <script src="assets/js/terminal.js"></script>
 </body>
 </html>

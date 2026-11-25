@@ -191,6 +191,15 @@ impl<P: EventPoster + Send> InputInjector for InputBridge<P> {
         self.injector
             .set_screen_bounds(ScreenBounds::new(self.origin.0, self.origin.1, wf, hf));
     }
+
+    fn set_screen_bounds(&mut self, origin_x: f64, origin_y: f64, w: u32, h: u32) {
+        let wf = f64::from(w);
+        let hf = f64::from(h);
+        self.origin = (origin_x, origin_y);
+        self.size = (wf, hf);
+        self.injector
+            .set_screen_bounds(ScreenBounds::new(origin_x, origin_y, wf, hf));
+    }
 }
 
 #[cfg(test)]

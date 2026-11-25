@@ -71,7 +71,11 @@
     "shield-check":
       '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
     "key-round":
-      '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>'
+      '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
+    eye:
+      '<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>',
+    "eye-off":
+      '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>'
   };
 
   function icon(name, size) {
@@ -278,6 +282,7 @@
 
   /* ── O1 更多工具（§6 O1）─────────────────────────────────────── */
   function openO1() {
+    if (clientLockState.locked) return;
     if (document.querySelector(".rc-tools")) return; /* 已开 */
     closePopover();
 
@@ -514,10 +519,8 @@
     el.setAttribute("aria-label", "应用菜单");
 
     var items = [
-      { icon: "lock", label: "安全锁定", act: function () { toast("功能开发中"); } },
+      { icon: "lock", label: "安全锁定", act: function () { triggerClientLock(); } },
       { icon: "settings", label: "设置", act: function () { openSettings(); } },
-      { icon: "circle-help", label: "帮助与反馈", act: function () { toast("功能开发中"); } },
-      { icon: "headphones", label: "在线客服", act: function () { toast("功能开发中"); } },
       { icon: "info", label: "关于", act: function () { triggerAbout(); } },
       { sep: true },
       { icon: "rotate-cw", label: "检查更新", act: function () { toast("当前已是最新版本"); } }
@@ -563,6 +566,7 @@
   }
 
   function openO2(anchor) {
+    if (clientLockState.locked) return;
     var btn = anchor || document.querySelector('[data-rc-anchor="menu"]');
     if (popover && popover.el.classList.contains("rc-menu")) {
       closePopover();
@@ -665,6 +669,7 @@
   }
 
   function openO3(anchor) {
+    if (clientLockState.locked) return;
     var btn = anchor || document.querySelector('[data-rc-anchor="account"]');
     if (popover && popover.el.classList.contains("rc-account")) {
       closePopover();
@@ -796,6 +801,322 @@
 
   ensureStylesheet();
 
+  /* ── 客户端「安全锁定」三段式交互（确认 → 设置安全密码 → 锁屏遮罩与解锁）── */
+  var clientLockState = {
+    locked: false,
+    hasPassword: false,
+    accountMasked: ""
+  };
+  var lockScreenEl = null;
+
+  function setBackgroundInert(isLocked) {
+    var nodes = document.body ? document.body.children : [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el === lockScreenEl) continue;
+      if (isLocked) {
+        el.setAttribute("aria-hidden", "true");
+        try {
+          el.inert = true;
+        } catch (_) {}
+      } else {
+        el.removeAttribute("aria-hidden");
+        try {
+          el.inert = false;
+        } catch (_) {}
+      }
+    }
+  }
+
+  function renderClientLockScreen(status) {
+    if (status && typeof status === "object") {
+      clientLockState.locked = Boolean(status.locked);
+      clientLockState.hasPassword = Boolean(status.hasPassword);
+      clientLockState.accountMasked =
+        typeof status.accountMasked === "string" ? status.accountMasked : "";
+    }
+    if (!clientLockState.locked) {
+      if (lockScreenEl && lockScreenEl.parentNode) {
+        lockScreenEl.parentNode.removeChild(lockScreenEl);
+      }
+      lockScreenEl = null;
+      setBackgroundInert(false);
+      return;
+    }
+    closeAll();
+    if (!lockScreenEl) {
+      lockScreenEl = document.createElement("div");
+      lockScreenEl.className = "rc-lock-screen";
+      lockScreenEl.setAttribute("role", "dialog");
+      lockScreenEl.setAttribute("aria-modal", "true");
+      lockScreenEl.setAttribute("aria-label", "客户端已锁定");
+      document.body.appendChild(lockScreenEl);
+    }
+    setBackgroundInert(true);
+    var accountLabel = clientLockState.accountMasked || "";
+    lockScreenEl.innerHTML =
+      '<div class="rc-lock-screen__drag" data-tauri-drag-region></div>' +
+      '<div class="rc-lock-screen__body">' +
+      '<div class="rc-lock-screen__shield" aria-hidden="true">' +
+      '<svg width="88" height="96" viewBox="0 0 88 96" fill="none">' +
+      '<path d="M44 4L10 18v26c0 24 14.4 42.4 34 48 19.6-5.6 34-24 34-48V18L44 4z" fill="rgba(255,255,255,0.92)" stroke="rgba(255,255,255,1)" stroke-width="2"/>' +
+      '<rect x="30" y="42" width="28" height="22" rx="5" fill="#2f7bff"/>' +
+      '<path d="M35 42v-7a9 9 0 0 1 18 0v7" stroke="#2f7bff" stroke-width="4" stroke-linecap="round"/>' +
+      "</svg>" +
+      "</div>" +
+      '<h2 class="rc-lock-screen__title">客户端已锁定</h2>' +
+      '<p class="rc-lock-screen__desc">防止客户端设置被修改，保障数据与使用安全</p>' +
+      (accountLabel ? '<div class="rc-lock-screen__account">' + escapeHtml(accountLabel) + "</div>" : "") +
+      '<button type="button" class="rc-lock-screen__btn" id="rc-lock-unlock-trigger">立即解锁</button>' +
+      '<form class="rc-lock-screen__form" id="rc-lock-unlock-form" hidden>' +
+      '<div class="rc-lock-input-wrap">' +
+      '<input type="password" class="rc-lock-input" id="rc-lock-unlock-input" maxlength="16" autocomplete="off" placeholder="请输入 8-16 位安全密码" />' +
+      '<button type="button" class="rc-lock-eye" id="rc-lock-unlock-eye" aria-label="显示密码">' + icon("eye-off", 16) + "</button>" +
+      "</div>" +
+      '<p class="rc-lock-error" id="rc-lock-unlock-err" hidden></p>' +
+      '<div class="rc-lock-screen__form-actions">' +
+      '<button type="button" class="rc-btn rc-btn--secondary" id="rc-lock-unlock-cancel">取消</button>' +
+      '<button type="submit" class="rc-btn rc-btn--primary" id="rc-lock-unlock-submit">确认解锁</button>' +
+      "</div>" +
+      "</form>" +
+      "</div>";
+
+    var triggerBtn = lockScreenEl.querySelector("#rc-lock-unlock-trigger");
+    var form = lockScreenEl.querySelector("#rc-lock-unlock-form");
+    var input = lockScreenEl.querySelector("#rc-lock-unlock-input");
+    var eyeBtn = lockScreenEl.querySelector("#rc-lock-unlock-eye");
+    var errEl = lockScreenEl.querySelector("#rc-lock-unlock-err");
+    var cancelBtn = lockScreenEl.querySelector("#rc-lock-unlock-cancel");
+    var submitBtn = lockScreenEl.querySelector("#rc-lock-unlock-submit");
+    if (triggerBtn) {
+      window.setTimeout(function () {
+        if (clientLockState.locked && triggerBtn && !triggerBtn.hidden) {
+          triggerBtn.focus();
+        }
+      }, 0);
+    }
+
+    triggerBtn.addEventListener("click", function () {
+      triggerBtn.hidden = true;
+      form.hidden = false;
+      errEl.hidden = true;
+      input.value = "";
+      input.focus();
+    });
+    cancelBtn.addEventListener("click", function () {
+      form.hidden = true;
+      triggerBtn.hidden = false;
+      errEl.hidden = true;
+      input.value = "";
+    });
+    eyeBtn.addEventListener("click", function () {
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      eyeBtn.innerHTML = icon(show ? "eye" : "eye-off", 16);
+      eyeBtn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+    });
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var pw = input.value || "";
+      if (!pw) {
+        errEl.textContent = "请输入安全密码";
+        errEl.hidden = false;
+        return;
+      }
+      if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.unlockClient === "function") {
+        submitBtn.disabled = true;
+        errEl.hidden = true;
+        window.RCBridge.unlockClient(pw)
+          .then(function (next) {
+            renderClientLockScreen(next);
+            toast("客户端已解锁");
+          })
+          .catch(function (err) {
+            errEl.textContent = String(err || "安全密码错误");
+            errEl.hidden = false;
+            input.select();
+          })
+          .then(function () {
+            submitBtn.disabled = false;
+          });
+      } else {
+        renderClientLockScreen({ locked: false, hasPassword: true });
+        toast("客户端已解锁");
+      }
+    });
+  }
+
+  function openSetLockPasswordModal() {
+    var layer = document.createElement("div");
+    layer.className = "rc-layer rc-layer--confirm";
+    layer.innerHTML =
+      '<div class="rc-lock-pwd" role="dialog" aria-modal="true" aria-labelledby="rc-lock-pwd-title">' +
+      '<h2 class="rc-lock-pwd__title" id="rc-lock-pwd-title">设置安全密码</h2>' +
+      '<form class="rc-lock-pwd__form" id="rc-lock-pwd-form">' +
+      '<div class="rc-lock-pwd__box">' +
+      '<label class="rc-lock-pwd__row">' +
+      '<span class="rc-lock-pwd__label">安全密码</span>' +
+      '<div class="rc-lock-input-wrap">' +
+      '<input type="password" class="rc-lock-input" id="rc-lock-pwd-1" maxlength="16" autocomplete="off" placeholder="请输入 8-16 位安全密码" />' +
+      '<button type="button" class="rc-lock-eye" data-eye-for="rc-lock-pwd-1" aria-label="显示密码">' + icon("eye-off", 16) + "</button>" +
+      "</div>" +
+      "</label>" +
+      '<label class="rc-lock-pwd__row">' +
+      '<span class="rc-lock-pwd__label">确认密码</span>' +
+      '<div class="rc-lock-input-wrap">' +
+      '<input type="password" class="rc-lock-input" id="rc-lock-pwd-2" maxlength="16" autocomplete="off" placeholder="请输入 8-16 位安全密码" />' +
+      '<button type="button" class="rc-lock-eye" data-eye-for="rc-lock-pwd-2" aria-label="显示密码">' + icon("eye-off", 16) + "</button>" +
+      "</div>" +
+      "</label>" +
+      "</div>" +
+      '<p class="rc-lock-error" id="rc-lock-pwd-err" hidden></p>' +
+      '<div class="rc-lock-pwd__actions">' +
+      '<button type="button" class="rc-btn rc-btn--secondary" data-action="cancel">取消</button>' +
+      '<button type="submit" class="rc-btn rc-btn--primary" id="rc-lock-pwd-submit" disabled>保存并锁定</button>' +
+      "</div>" +
+      "</form>" +
+      "</div>";
+
+    var form = layer.querySelector("#rc-lock-pwd-form");
+    var p1 = layer.querySelector("#rc-lock-pwd-1");
+    var p2 = layer.querySelector("#rc-lock-pwd-2");
+    var errEl = layer.querySelector("#rc-lock-pwd-err");
+    var submitBtn = layer.querySelector("#rc-lock-pwd-submit");
+
+    function updateValid() {
+      var v1 = p1.value || "";
+      var v2 = p2.value || "";
+      var lenOk = v1.length >= 8 && v1.length <= 16;
+      var same = v1 === v2;
+      if (v2.length > 0 && !same) {
+        errEl.textContent = "两次输入的安全密码不一致";
+        errEl.hidden = false;
+      } else if (v1.length > 0 && !lenOk) {
+        errEl.textContent = "安全密码长度需为 8-16 位";
+        errEl.hidden = false;
+      } else {
+        errEl.hidden = true;
+      }
+      submitBtn.disabled = !(lenOk && same);
+    }
+
+    p1.addEventListener("input", updateValid);
+    p2.addEventListener("input", updateValid);
+
+    Array.prototype.forEach.call(layer.querySelectorAll("[data-eye-for]"), function (btn) {
+      btn.addEventListener("click", function () {
+        var target = layer.querySelector("#" + btn.getAttribute("data-eye-for"));
+        if (!target) return;
+        var show = target.type === "password";
+        target.type = show ? "text" : "password";
+        btn.innerHTML = icon(show ? "eye" : "eye-off", 16);
+        btn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+      });
+    });
+
+    layer.querySelector('[data-action="cancel"]').addEventListener("click", function () {
+      popModal(layer);
+    });
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var pw = p1.value || "";
+      if (pw.length < 8 || pw.length > 16 || pw !== (p2.value || "")) {
+        updateValid();
+        return;
+      }
+      if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.lockClient === "function") {
+        submitBtn.disabled = true;
+        window.RCBridge.lockClient(pw)
+          .then(function (next) {
+            popModal(layer);
+            renderClientLockScreen(next);
+          })
+          .catch(function (err) {
+            errEl.textContent = String(err || "锁定失败");
+            errEl.hidden = false;
+            submitBtn.disabled = false;
+          });
+      } else {
+        popModal(layer);
+        renderClientLockScreen({ locked: true, hasPassword: true, accountMasked: MOCK.phone });
+      }
+    });
+
+    pushModal(
+      layer,
+      function () {
+        popModal(layer);
+      },
+      p1
+    );
+  }
+
+  function openLockConfirmModal(status) {
+    var layer = document.createElement("div");
+    layer.className = "rc-layer rc-layer--confirm";
+    layer.innerHTML =
+      '<div class="rc-lock-confirm" role="alertdialog" aria-modal="true" aria-labelledby="rc-lock-c-title">' +
+      '<div class="rc-lock-confirm__badge" aria-hidden="true">!</div>' +
+      '<h2 class="rc-lock-confirm__title" id="rc-lock-c-title">确定要开启客户端锁定吗？</h2>' +
+      '<p class="rc-lock-confirm__desc">防止客户端设置被修改，保障数据与使用安全。</p>' +
+      '<div class="rc-lock-confirm__actions">' +
+      '<button type="button" class="rc-lock-confirm__btn rc-lock-confirm__btn--cancel" data-action="cancel">取消</button>' +
+      '<button type="button" class="rc-lock-confirm__btn rc-lock-confirm__btn--ok" data-action="ok">确定</button>' +
+      "</div>" +
+      "</div>";
+
+    layer.querySelector('[data-action="cancel"]').addEventListener("click", function () {
+      popModal(layer);
+    });
+    layer.querySelector('[data-action="ok"]').addEventListener("click", function () {
+      popModal(layer);
+      var hasPwd = Boolean(status && status.hasPassword);
+      if (!hasPwd) {
+        openSetLockPasswordModal();
+        return;
+      }
+      if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.lockClient === "function") {
+        window.RCBridge.lockClient(null)
+          .then(function (next) {
+            renderClientLockScreen(next);
+          })
+          .catch(function (err) {
+            toast("锁定失败：" + err);
+          });
+      } else {
+        renderClientLockScreen({ locked: true, hasPassword: true, accountMasked: MOCK.phone });
+      }
+    });
+
+    pushModal(
+      layer,
+      function () {
+        popModal(layer);
+      },
+      layer.querySelector('[data-action="ok"]')
+    );
+  }
+
+  function triggerClientLock() {
+    if (window.RCBridge && window.RCBridge.isTauri && typeof window.RCBridge.getClientLockStatus === "function") {
+      window.RCBridge.getClientLockStatus()
+        .then(function (st) {
+          clientLockState.hasPassword = Boolean(st && st.hasPassword);
+          clientLockState.locked = Boolean(st && st.locked);
+          if (st && typeof st.accountMasked === "string") {
+            clientLockState.accountMasked = st.accountMasked;
+          }
+          openLockConfirmModal(st);
+        })
+        .catch(function () {
+          openLockConfirmModal(clientLockState);
+        });
+      return;
+    }
+    openLockConfirmModal(clientLockState);
+  }
+
   /* ── 公开 API ─────────────────────────────────────────────────── */
   var api = {
     toast: toast,
@@ -804,6 +1125,8 @@
     openO2: openO2,
     openO3: openO3,
     openAbout: openAbout,
+    triggerClientLock: triggerClientLock,
+    applyClientLockStatus: renderClientLockScreen,
     closeAll: closeAll,
     wireAnchors: wireAnchors,
     setAccount: setAccount,

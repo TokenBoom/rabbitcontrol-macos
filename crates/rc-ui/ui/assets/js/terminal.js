@@ -1,11 +1,12 @@
-/* terminal.js —— W3 终端远控管理器（亮色会话列表 + 暗色 VT100 交互终端，零 innerHTML，零第三方依赖）
+/* terminal.js —— W3 终端远控管理器（亮色会话列表 + xterm.js 暗色交互终端，零 innerHTML）
  *
  * 架构与约束：
  *   - 视图 1（list）：展示远程设备状态、创建后台会话按钮与会话卡片列表（打开终端 / ... 重命名 & 终止会话）；
- *   - 视图 2（terminal）：完整 VT100/ANSI 终端模拟器（SGR 256/24bit 真彩色、?1049h/l 备选屏、CJK 双倍字符宽、
- *     括号粘贴 ?2004h/l、中文 IME 组合输入、100ms 防抖 Resize），支持返回会话列表或直接切换其他后台会话；
+ *   - 视图 2（terminal）：基于离线内置 xterm.js（+ FitAddon + Unicode11Addon）的完整 VT100/xterm-256color/
+ *     TrueColor 终端模拟器，原生兼容 agy / vim / htop / tmux 等复杂交互式 TUI、CJK 双倍字符宽、
+ *     括号粘贴、中文 IME 组合输入与 100ms 防抖自适应 Resize；
  *   - 关闭窗口或返回列表仅执行 detach（暂停实时流），不会终止远端后台 PTY，仅在点击「终止会话」时关闭 PTY；
- *   - 严禁使用 innerHTML / insertAdjacentHTML：所有节点一律经 createElement / createElementNS + textContent 渲染。
+ *   - 严禁使用 innerHTML / insertAdjacentHTML：所有自定义 DOM 节点一律经 createElement / createElementNS + textContent 渲染。
  */
 
 (function () {
@@ -14,11 +15,11 @@
   var Bridge = window.RCBridge;
   var IS_TAURI = Boolean(Bridge && Bridge.isTauri);
 
-  var MAX_LINES = 2000;
   var MAX_SESSIONS = 8;
   var MAX_NAME_CHARS = 64;
   var RESIZE_DEBOUNCE_MS = 100;
   var SVG_NS = 'http://www.w3.org/2000/svg';
+  var DEFAULT_FONT_FAMILY = '"SF Mono", Menlo, Monaco, Consolas, "PingFang SC", monospace';
 
   function pad2(n) {
     return n < 10 ? '0' + n : String(n);
@@ -85,171 +86,21 @@
     return svg;
   }
 
-  var FG_CLASS_BY_CODE = {
-    30: 'tm-ansi-fg-muted',
-    31: 'tm-ansi-fg-red',
-    32: 'tm-ansi-fg-green',
-    33: 'tm-ansi-fg-yellow',
-    34: 'tm-ansi-fg-blue',
-    35: 'tm-ansi-fg-magenta',
-    36: 'tm-ansi-fg-cyan',
-    37: 'tm-ansi-fg-white',
-    90: 'tm-ansi-fg-muted',
-    91: 'tm-ansi-fg-red',
-    92: 'tm-ansi-fg-green',
-    93: 'tm-ansi-fg-yellow',
-    94: 'tm-ansi-fg-blue',
-    95: 'tm-ansi-fg-magenta',
-    96: 'tm-ansi-fg-cyan',
-    97: 'tm-ansi-fg-white'
-  };
-
-  var BG_CLASS_BY_CODE = {
-    41: 'tm-ansi-bg-red',
-    42: 'tm-ansi-bg-green',
-    43: 'tm-ansi-bg-yellow',
-    44: 'tm-ansi-bg-blue',
-    101: 'tm-ansi-bg-red',
-    102: 'tm-ansi-bg-green',
-    103: 'tm-ansi-bg-yellow',
-    104: 'tm-ansi-bg-blue'
-  };
-
-  var FKEY_SEQ = {
-    F1: '\x1bOP',
-    F2: '\x1bOQ',
-    F3: '\x1bOR',
-    F4: '\x1bOS',
-    F5: '\x1b[15~',
-    F6: '\x1b[17~',
-    F7: '\x1b[18~',
-    F8: '\x1b[19~',
-    F9: '\x1b[20~',
-    F10: '\x1b[21~',
-    F11: '\x1b[23~',
-    F12: '\x1b[24~'
-  };
-
-  var ANSI16_COLORS = [
-    '#18181b', '#ef4444', '#22c55e', '#eab308', '#3b82f6', '#a855f7', '#06b6d4', '#e4e4e7',
-    '#71717a', '#f87171', '#4ade80', '#facc15', '#60a5fa', '#c084fc', '#22d3ee', '#fafafa'
-  ];
-
-  function clampByte(v) {
-    var n = parseInt(v, 10);
-    if (isNaN(n) || n < 0) return 0;
-    if (n > 255) return 255;
-    return n;
-  }
-
-  function ansi256ToCss(idx) {
-    var n = clampByte(idx);
-    if (n < 16) return ANSI16_COLORS[n];
-    if (n >= 232) {
-      var gray = 8 + (n - 232) * 10;
-      return 'rgb(' + gray + ',' + gray + ',' + gray + ')';
-    }
-    var c = n - 16;
-    var r = Math.floor(c / 36);
-    var g = Math.floor((c % 36) / 6);
-    var b = c % 6;
-    var steps = [0, 95, 135, 175, 215, 255];
-    return 'rgb(' + steps[r] + ',' + steps[g] + ',' + steps[b] + ')';
-  }
-
-  function emptyStyle() {
-    return {
-      fg: '',
-      bg: '',
-      fgCss: '',
-      bgCss: '',
-      bold: false,
-      dim: false,
-      italic: false,
-      underline: false,
-      inverse: false
-    };
-  }
-
-  function styleClassName(st) {
-    var cls = [];
-    if (st.bold) cls.push('tm-ansi-bold');
-    if (st.dim) cls.push('tm-ansi-dim');
-    if (st.italic) cls.push('tm-ansi-italic');
-    if (st.underline) cls.push('tm-ansi-underline');
-    if (st.inverse) cls.push('tm-ansi-inverse');
-    if (!st.fgCss && st.fg) cls.push(st.fg);
-    if (!st.bgCss && st.bg) cls.push(st.bg);
-    return cls.join(' ');
-  }
-
-  function makeStyleToken(st) {
-    var cls = styleClassName(st);
-    if (!cls && !st.fgCss && !st.bgCss) return '';
-    return cls + '|' + (st.fgCss || '') + '|' + (st.bgCss || '');
-  }
-
-  function parseStyleToken(token) {
-    if (!token) return null;
-    var parts = token.split('|');
-    return {
-      cls: parts[0] || '',
-      fgCss: parts[1] || '',
-      bgCss: parts[2] || ''
-    };
-  }
-
-  function charDisplayWidth(ch) {
-    if (!ch) return 0;
-    var cp = ch.codePointAt ? ch.codePointAt(0) : ch.charCodeAt(0);
-    if (cp == null || cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
-    if (
-      (cp >= 0x0300 && cp <= 0x036f) ||
-      (cp >= 0x1ab0 && cp <= 0x1aff) ||
-      (cp >= 0x20d0 && cp <= 0x20ff) ||
-      (cp >= 0xfe20 && cp <= 0xfe2f)
-    ) {
-      return 0;
-    }
-    if (
-      cp >= 0x1100 &&
-      (cp <= 0x115f ||
-        cp === 0x2329 ||
-        cp === 0x232a ||
-        (cp >= 0x2e80 && cp <= 0x303e) ||
-        (cp >= 0x3040 && cp <= 0x3247) ||
-        (cp >= 0x3250 && cp <= 0x4dbf) ||
-        (cp >= 0x4e00 && cp <= 0xa4cf) ||
-        (cp >= 0xa960 && cp <= 0xa97f) ||
-        (cp >= 0xac00 && cp <= 0xd7a3) ||
-        (cp >= 0xf900 && cp <= 0xfaff) ||
-        (cp >= 0xfe10 && cp <= 0xfe19) ||
-        (cp >= 0xfe30 && cp <= 0xfe6f) ||
-        (cp >= 0xff00 && cp <= 0xff60) ||
-        (cp >= 0xffe0 && cp <= 0xffe6) ||
-        (cp >= 0x1f300 && cp <= 0x1faff) ||
-        (cp >= 0x20000 && cp <= 0x3fffd))
-    ) {
-      return 2;
-    }
-    return 1;
-  }
-
-  function makeLine(system) {
-    return {
-      chars: [],
-      styles: [],
-      dirty: true,
-      system: Boolean(system),
-      node: null
-    };
-  }
-
   function errMessage(err, fallback) {
     if (!err) return fallback || '操作失败';
     if (typeof err === 'string') return err;
     if (err.message) return String(err.message);
     return String(err);
+  }
+
+  function readCssToken(name, fallback) {
+    try {
+      var val = window.getComputedStyle(document.documentElement).getPropertyValue(name);
+      if (val && val.trim()) return val.trim();
+    } catch (_e) {
+      /* ignore */
+    }
+    return fallback;
   }
 
   /* ── 浏览器静态预览模拟传输层（!IS_TAURI） ───────────────── */
@@ -503,7 +354,6 @@
     var liveMoreBtn = document.getElementById('tm-live-more');
     var reconnectBtn = document.getElementById('terminal-reconnect');
     var screenEl = document.getElementById('terminal-screen');
-    var imeEl = document.getElementById('terminal-ime');
     var noticeEl = document.getElementById('terminal-notice');
     var noticeTextEl = document.getElementById('terminal-notice-text');
     var noticeBackBtn = document.getElementById('terminal-notice-back');
@@ -578,14 +428,6 @@
     var lastCols = 80;
     var lastRows = 24;
     var resizeTimer = 0;
-    var rafId = 0;
-    var renderPending = false;
-    var fullRebuild = true;
-    var removedNodes = [];
-    var prevCursorLineIdx = -1;
-    var prevCursorCol = -1;
-    var prevCursorVisible = false;
-    var isComposing = false;
 
     var Api = IS_TAURI
       ? {
@@ -617,6 +459,222 @@
       : createBrowserMockTransport(function (ev) {
           handleTerminalEvent(ev);
         });
+
+    /* ── xterm.js 终端实例 ─────────────────────────────────── */
+    var xterm = null;
+    var fitAddon = null;
+    var xtermMounted = false;
+
+    function buildXtermTheme() {
+      return {
+        background: readCssToken('--terminal-bg', '#1A1B1F'),
+        foreground: readCssToken('--terminal-fg', '#F2F3F5'),
+        cursor: readCssToken('--accent', '#3370FF'),
+        cursorAccent: readCssToken('--terminal-bg', '#1A1B1F'),
+        selectionBackground: 'rgba(51, 112, 255, 0.35)',
+        black: '#18181B',
+        red: '#EF4444',
+        green: '#22C55E',
+        yellow: '#EAB308',
+        blue: '#3B82F6',
+        magenta: '#A855F7',
+        cyan: '#06B6D4',
+        white: '#E4E4E7',
+        brightBlack: '#71717A',
+        brightRed: '#F87171',
+        brightGreen: '#4ADE80',
+        brightYellow: '#FACC15',
+        brightBlue: '#60A5FA',
+        brightMagenta: '#C084FC',
+        brightCyan: '#22D3EE',
+        brightWhite: '#FAFAFA'
+      };
+    }
+
+    function copyTextToClipboard(text) {
+      if (!text) return false;
+      if (Bridge && typeof Bridge.copyText === 'function') {
+        Bridge.copyText(text).catch(function () {});
+        return true;
+      }
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).catch(function () {});
+        return true;
+      }
+      return false;
+    }
+
+    function isAnyModalOpen() {
+      if (renameBackdropEl && !renameBackdropEl.hidden) return true;
+      if (fontBackdropEl && !fontBackdropEl.hidden) return true;
+      return false;
+    }
+
+    function ensureXterm() {
+      if (xterm) return xterm;
+      if (typeof window.Terminal !== 'function') {
+        return null;
+      }
+      xterm = new window.Terminal({
+        allowProposedApi: true,
+        cursorBlink: true,
+        cursorStyle: 'block',
+        scrollback: 5000,
+        convertEol: false,
+        macOptionClickForcesSelection: true,
+        fontFamily: DEFAULT_FONT_FAMILY,
+        fontSize: fontState ? fontState.size : 13,
+        lineHeight: 1.32,
+        theme: buildXtermTheme()
+      });
+
+      if (window.FitAddon && typeof window.FitAddon.FitAddon === 'function') {
+        fitAddon = new window.FitAddon.FitAddon();
+        xterm.loadAddon(fitAddon);
+      }
+
+      if (window.Unicode11Addon && typeof window.Unicode11Addon.Unicode11Addon === 'function') {
+        try {
+          var u11 = new window.Unicode11Addon.Unicode11Addon();
+          xterm.loadAddon(u11);
+          if (xterm.unicode) {
+            xterm.unicode.activeVersion = '11';
+          }
+        } catch (_e) {
+          /* ignore if unsupported */
+        }
+      }
+
+      xterm.onData(function (data) {
+        if (viewMode !== 'terminal' || isAnyModalOpen()) return;
+        var tab = getActiveTab();
+        if (!tab || !tab.connected || tab.termId == null || !data) return;
+        Api.input(tab.termId, data).catch(function () {});
+      });
+
+      xterm.onBinary(function (data) {
+        if (viewMode !== 'terminal' || isAnyModalOpen()) return;
+        var tab = getActiveTab();
+        if (!tab || !tab.connected || tab.termId == null || !data) return;
+        Api.input(tab.termId, data).catch(function () {});
+      });
+
+      xterm.onTitleChange(function (title) {
+        var tab = getActiveTab();
+        if (tab && title) {
+          tab.title = title;
+          syncLiveChrome();
+        }
+      });
+
+      xterm.attachCustomKeyEventHandler(function (e) {
+        if (viewMode !== 'terminal' || isAnyModalOpen()) return false;
+        if (e.type !== 'keydown') return true;
+        var lower = (e.key || '').toLowerCase();
+
+        // macOS Cmd+C：选中文本时复制并阻止 WKWebView 默认菜单竞态覆写剪贴板，无选中时忽略
+        if (e.metaKey && !e.ctrlKey && !e.altKey && lower === 'c') {
+          if (xterm.hasSelection()) {
+            e.preventDefault();
+            copyTextToClipboard(xterm.getSelection());
+            return false;
+          }
+          return false;
+        }
+        // macOS Cmd+V：交由浏览器原生 paste 事件（xterm 内部自动处理括号粘贴）
+        if (e.metaKey && !e.ctrlKey && !e.altKey && lower === 'v') {
+          return false;
+        }
+        // macOS Cmd+A：全选终端缓冲
+        if (e.metaKey && !e.ctrlKey && !e.altKey && lower === 'a') {
+          e.preventDefault();
+          xterm.selectAll();
+          return false;
+        }
+        // macOS Cmd+K：清屏
+        if (e.metaKey && !e.ctrlKey && !e.altKey && lower === 'k') {
+          e.preventDefault();
+          xterm.clear();
+          return false;
+        }
+        // Ctrl+Shift+C / Ctrl+Shift+V 兼容 Linux/Win 习惯
+        if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey) {
+          if (lower === 'c' && xterm.hasSelection()) {
+            copyTextToClipboard(xterm.getSelection());
+            return false;
+          }
+          if (lower === 'v') {
+            if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+              navigator.clipboard
+                .readText()
+                .then(function (txt) {
+                  if (txt && xterm) xterm.paste(txt);
+                })
+                .catch(function () {});
+            }
+            return false;
+          }
+        }
+        return true;
+      });
+
+      return xterm;
+    }
+
+    function mountXtermIfNeeded() {
+      var t = ensureXterm();
+      if (!t) return null;
+      if (!xtermMounted) {
+        screenEl.textContent = '';
+        t.open(screenEl);
+        xtermMounted = true;
+      }
+      return t;
+    }
+
+    function computeAndFitGrid(forceNotify) {
+      var t = mountXtermIfNeeded();
+      var cols = lastCols > 0 ? lastCols : 80;
+      var rows = lastRows > 0 ? lastRows : 24;
+      if (t && fitAddon && viewMode === 'terminal') {
+        try {
+          var dims = fitAddon.proposeDimensions();
+          if (dims && dims.cols && dims.rows && isFinite(dims.cols) && isFinite(dims.rows)) {
+            cols = Math.min(512, Math.max(40, Math.floor(dims.cols)));
+            rows = Math.min(512, Math.max(12, Math.floor(dims.rows)));
+            if (t.cols !== cols || t.rows !== rows) {
+              t.resize(cols, rows);
+            }
+          }
+        } catch (_e) {
+          /* ignore layout-not-ready */
+        }
+      }
+      var changed = cols !== lastCols || rows !== lastRows;
+      lastCols = cols;
+      lastRows = rows;
+      if (changed || forceNotify) {
+        var tab = getActiveTab();
+        if (tab && tab.connected && tab.termId != null) {
+          Api.resize(tab.termId, cols, rows).catch(function () {});
+        }
+      }
+      return { cols: cols, rows: rows };
+    }
+
+    function resetXtermView() {
+      var t = mountXtermIfNeeded();
+      if (t) {
+        t.reset();
+      }
+    }
+
+    function writeSystemNoticeToXterm(text) {
+      var t = mountXtermIfNeeded();
+      if (t && text) {
+        t.writeln('\r\n\x1b[90m' + String(text) + '\x1b[0m');
+      }
+    }
 
     function showToast(msg) {
       if (!toastEl || !msg) return;
@@ -684,27 +742,7 @@
         connected: false,
         disconnectNoticed: false,
         title: sess ? sess.title : '',
-        cwd: sess ? sess.cwd : '',
-        lines: [makeLine(false)],
-        altLines: null,
-        savedMainState: null,
-        inAltScreen: false,
-        scrollTop: 0,
-        scrollBottom: -1,
-        curLineIdx: 0,
-        curCol: 0,
-        savedCursor: null,
-        cursorVisible: true,
-        bracketedPaste: false,
-        lastBsCol: -1,
-        lastBsSpaceCol: -1,
-        curStyle: emptyStyle(),
-        curStyleToken: '',
-        parseState: 'normal',
-        csiBuf: '',
-        oscBuf: '',
-        pendingSurrogate: '',
-        utf8Decoder: typeof TextDecoder === 'function' ? new TextDecoder('utf-8', { fatal: false }) : null
+        cwd: sess ? sess.cwd : ''
       };
       tabByTermId[key] = tab;
       return tab;
@@ -713,49 +751,6 @@
     function getActiveTab() {
       if (activeTermId == null) return null;
       return tabByTermId[String(activeTermId)] || null;
-    }
-
-    function cancelPendingRender() {
-      renderPending = false;
-      if (rafId) {
-        window.cancelAnimationFrame(rafId);
-        rafId = 0;
-      }
-    }
-
-    function resetTabBuffer(tab, skipRender) {
-      tab.lines = [makeLine(false)];
-      tab.altLines = null;
-      tab.savedMainState = null;
-      tab.inAltScreen = false;
-      tab.scrollTop = 0;
-      tab.scrollBottom = -1;
-      tab.curLineIdx = 0;
-      tab.curCol = 0;
-      tab.savedCursor = null;
-      tab.cursorVisible = true;
-      tab.bracketedPaste = false;
-      tab.lastBsCol = -1;
-      tab.lastBsSpaceCol = -1;
-      tab.curStyle = emptyStyle();
-      tab.curStyleToken = '';
-      tab.parseState = 'normal';
-      tab.csiBuf = '';
-      tab.oscBuf = '';
-      tab.pendingSurrogate = '';
-      if (typeof TextDecoder === 'function') {
-        tab.utf8Decoder = new TextDecoder('utf-8', { fatal: false });
-      }
-      if (tab.termId === activeTermId) {
-        removedNodes = [];
-        fullRebuild = true;
-        prevCursorLineIdx = -1;
-        prevCursorCol = -1;
-        prevCursorVisible = false;
-        if (!skipRender) {
-          scheduleRender();
-        }
-      }
     }
 
     /* ── 独立计时器 ─────────────────────────────────────────── */
@@ -792,7 +787,11 @@
         listViewEl.hidden = true;
         liveViewEl.hidden = false;
         if (backBtn) backBtn.hidden = false;
+        mountXtermIfNeeded();
         syncLiveChrome();
+        window.requestAnimationFrame(function () {
+          computeAndFitGrid(false);
+        });
       } else {
         liveViewEl.hidden = true;
         listViewEl.hidden = false;
@@ -1028,36 +1027,35 @@
       if (fontStatusEl) fontStatusEl.textContent = msg ? String(msg) : '';
     }
 
-    function applyFontCssVars(fontFamilyCss, sizePx) {
+    function applyFontToXterm(fontFamilyCss, sizePx) {
       var sz = Math.max(10, Math.min(28, Math.round(Number(sizePx) || 13)));
-      var lh = Math.max(14, Math.round(sz * 1.46));
-      var cw = Math.max(5, Math.round(sz * 0.54));
-      var ch = Math.max(10, Math.round(sz * 1.15));
-      screenEl.style.setProperty('--tm-font-family', fontFamilyCss || 'var(--font-mono)');
-      screenEl.style.setProperty('--tm-font-size', sz + 'px');
-      screenEl.style.setProperty('--tm-line-height', lh + 'px');
-      screenEl.style.setProperty('--tm-cursor-w', cw + 'px');
-      screenEl.style.setProperty('--tm-cursor-h', ch + 'px');
-      lastCols = -1;
-      lastRows = -1;
-      handleResize();
-      scheduleRender();
+      var fam = fontFamilyCss || DEFAULT_FONT_FAMILY;
+      var t = ensureXterm();
+      if (t) {
+        t.options.fontFamily = fam;
+        t.options.fontSize = sz;
+        if (viewMode === 'terminal') {
+          window.requestAnimationFrame(function () {
+            computeAndFitGrid(true);
+          });
+        }
+      }
     }
 
     function applyActiveFontFromState() {
       if (fontState.source === 'local' && fontState.family) {
         var safe = sanitizeFontFamilyCss(fontState.family);
-        applyFontCssVars("'" + safe + "', var(--font-mono)", fontState.size);
+        applyFontToXterm('"' + safe + '", ' + DEFAULT_FONT_FAMILY, fontState.size);
         return;
       }
       if (fontState.source === 'remote' && fontState.fontId) {
         var alias = fontState.loadedAliases[fontState.fontId];
         if (alias) {
-          applyFontCssVars("'" + alias + "', var(--font-mono)", fontState.size);
+          applyFontToXterm('"' + alias + '", ' + DEFAULT_FONT_FAMILY, fontState.size);
           return;
         }
       }
-      applyFontCssVars('var(--font-mono)', fontState.size);
+      applyFontToXterm(DEFAULT_FONT_FAMILY, fontState.size);
     }
 
     function persistFontPrefs() {
@@ -1654,1075 +1652,18 @@
     }
 
     function focusTerminal() {
-      if (viewMode !== 'terminal') return;
-      if (renameBackdropEl && !renameBackdropEl.hidden) return;
-      if (fontBackdropEl && !fontBackdropEl.hidden) return;
-      if (imeEl) {
-        imeEl.focus({ preventScroll: true });
-      } else {
-        screenEl.focus({ preventScroll: true });
+      if (viewMode !== 'terminal' || isAnyModalOpen()) return;
+      var t = mountXtermIfNeeded();
+      if (t) {
+        t.focus();
       }
     }
 
-    /* ── VT100 / ANSI 缓冲区操作（作用于指定 Tab） ──────────── */
-
-    function resetBsTracking(tab) {
-      tab.lastBsCol = -1;
-      tab.lastBsSpaceCol = -1;
-    }
-
-    function viewportTopOf(tab) {
-      return Math.max(0, tab.lines.length - lastRows);
-    }
-
-    function scrollBoundsOf(tab) {
-      var top = viewportTopOf(tab);
-      var rTop = Math.max(0, Math.min(lastRows - 1, tab.scrollTop));
-      var rawBot = tab.scrollBottom >= 0 ? tab.scrollBottom : lastRows - 1;
-      var rBot = Math.max(rTop, Math.min(lastRows - 1, rawBot));
-      return {
-        startIdx: top + rTop,
-        endIdx: top + rBot
-      };
-    }
-
-    function trimLinesAboveMax(tab) {
-      var dropLimit = tab.inAltScreen ? lastRows : MAX_LINES;
-      while (tab.lines.length > dropLimit) {
-        var dropped = tab.lines.shift();
-        if (tab.termId === activeTermId && dropped && dropped.node) {
-          removedNodes.push(dropped.node);
-        }
-        if (tab.curLineIdx > 0) tab.curLineIdx -= 1;
-        if (tab.termId === activeTermId && prevCursorLineIdx >= 0) prevCursorLineIdx -= 1;
-      }
-    }
-
-    function truncateLinesAfter(tab, keepCount) {
-      while (tab.lines.length > keepCount) {
-        var popped = tab.lines.pop();
-        if (tab.termId === activeTermId && popped && popped.node) {
-          removedNodes.push(popped.node);
-        }
-      }
-      if (tab.termId === activeTermId && prevCursorLineIdx >= tab.lines.length) {
-        prevCursorLineIdx = -1;
-      }
-    }
-
-    function ensureLineAt(tab, idx) {
-      while (tab.lines.length <= idx) {
-        tab.lines.push(makeLine(false));
-      }
-      trimLinesAboveMax(tab);
-      if (idx >= tab.lines.length) idx = tab.lines.length - 1;
-      return tab.lines[idx];
-    }
-
-    function ensureCurrentLine(tab) {
-      if (!tab.lines.length) {
-        tab.lines.push(makeLine(false));
-        tab.curLineIdx = 0;
-        tab.curCol = 0;
-      }
-      if (tab.curLineIdx >= tab.lines.length) {
-        tab.curLineIdx = tab.lines.length - 1;
-      }
-      if (tab.curLineIdx < 0) {
-        tab.curLineIdx = 0;
-      }
-      return tab.lines[tab.curLineIdx];
-    }
-
-    function clearWideAt(line, col) {
-      if (col < 0 || col >= line.chars.length) return;
-      if (line.chars[col] === '' && col > 0) {
-        line.chars[col - 1] = ' ';
-        line.chars[col] = ' ';
-        line.dirty = true;
-      } else if (col + 1 < line.chars.length && line.chars[col + 1] === '') {
-        line.chars[col] = ' ';
-        line.chars[col + 1] = ' ';
-        line.dirty = true;
-      }
-    }
-
-    function putChar(tab, ch) {
-      var width = charDisplayWidth(ch);
-      if (width === 0) return;
-
-      var line = ensureCurrentLine(tab);
-      while (line.chars.length < tab.curCol) {
-        line.chars.push(' ');
-        line.styles.push('');
-      }
-      if (
-        ch === ' ' &&
-        !tab.curStyleToken &&
-        tab.curCol === tab.lastBsCol &&
-        tab.curCol === line.chars.length - 1
-      ) {
-        tab.lastBsSpaceCol = tab.curCol;
-        tab.lastBsCol = -1;
-      } else {
-        resetBsTracking(tab);
-      }
-
-      clearWideAt(line, tab.curCol);
-      if (width === 2) {
-        clearWideAt(line, tab.curCol + 1);
-      }
-
-      line.chars[tab.curCol] = ch;
-      line.styles[tab.curCol] = tab.curStyleToken;
-      if (width === 2) {
-        line.chars[tab.curCol + 1] = '';
-        line.styles[tab.curCol + 1] = tab.curStyleToken;
-      }
-      line.dirty = true;
-      tab.curCol += width;
-    }
-
-    function scrollUpInRegion(tab, count) {
-      var bounds = scrollBoundsOf(tab);
-      ensureLineAt(tab, bounds.endIdx);
-      var start = bounds.startIdx;
-      var end = Math.min(tab.lines.length - 1, bounds.endIdx);
-      for (var k = 0; k < count; k += 1) {
-        if (
-          tab.scrollTop === 0 &&
-          (tab.scrollBottom < 0 || tab.scrollBottom >= lastRows - 1) &&
-          !tab.inAltScreen
-        ) {
-          tab.lines.push(makeLine(false));
-          trimLinesAboveMax(tab);
-        } else {
-          var removed = tab.lines.splice(start, 1)[0];
-          if (tab.termId === activeTermId && removed && removed.node) {
-            removedNodes.push(removed.node);
-          }
-          tab.lines.splice(end, 0, makeLine(false));
-          if (tab.termId === activeTermId) fullRebuild = true;
-        }
-      }
-    }
-
-    function scrollDownInRegion(tab, count) {
-      var bounds = scrollBoundsOf(tab);
-      ensureLineAt(tab, bounds.endIdx);
-      var start = bounds.startIdx;
-      var end = Math.min(tab.lines.length - 1, bounds.endIdx);
-      for (var k = 0; k < count; k += 1) {
-        var removed = tab.lines.splice(end, 1)[0];
-        if (tab.termId === activeTermId && removed && removed.node) {
-          removedNodes.push(removed.node);
-        }
-        tab.lines.splice(start, 0, makeLine(false));
-      }
-      if (tab.termId === activeTermId) fullRebuild = true;
-    }
-
-    function newLine(tab) {
-      resetBsTracking(tab);
-      var bounds = scrollBoundsOf(tab);
-      if (tab.curLineIdx === bounds.endIdx) {
-        scrollUpInRegion(tab, 1);
-        tab.curLineIdx = Math.min(tab.lines.length - 1, bounds.endIdx);
-      } else if (tab.curLineIdx < tab.lines.length - 1) {
-        tab.curLineIdx += 1;
-      } else {
-        tab.lines.push(makeLine(false));
-        trimLinesAboveMax(tab);
-        tab.curLineIdx = tab.lines.length - 1;
-      }
-      tab.curCol = 0;
-    }
-
-    function lineFeedOnly(tab) {
-      resetBsTracking(tab);
-      var bounds = scrollBoundsOf(tab);
-      if (tab.curLineIdx === bounds.endIdx) {
-        scrollUpInRegion(tab, 1);
-        tab.curLineIdx = Math.min(tab.lines.length - 1, bounds.endIdx);
-      } else {
-        ensureLineAt(tab, tab.curLineIdx + 1);
-        tab.curLineIdx = Math.min(tab.lines.length - 1, tab.curLineIdx + 1);
-      }
-    }
-
-    function appendSystemLine(tab, text) {
-      resetBsTracking(tab);
-      var sysLine = makeLine(true);
-      sysLine.chars = String(text).split('');
-      tab.lines.push(sysLine);
-      trimLinesAboveMax(tab);
-      tab.curLineIdx = tab.lines.length - 1;
-      tab.curCol = tab.lines[tab.curLineIdx].chars.length;
-      if (tab.termId === activeTermId) scheduleRender();
-    }
-
-    function applySgr(tab, paramsStr) {
-      var raw = paramsStr === '' ? ['0'] : paramsStr.split(';');
-      for (var i = 0; i < raw.length; i += 1) {
-        var code = parseInt(raw[i], 10);
-        if (isNaN(code)) code = 0;
-        if (code === 0) {
-          tab.curStyle = emptyStyle();
-        } else if (code === 1) {
-          tab.curStyle.bold = true;
-        } else if (code === 2) {
-          tab.curStyle.dim = true;
-        } else if (code === 3) {
-          tab.curStyle.italic = true;
-        } else if (code === 4) {
-          tab.curStyle.underline = true;
-        } else if (code === 7) {
-          tab.curStyle.inverse = true;
-        } else if (code === 22) {
-          tab.curStyle.bold = false;
-          tab.curStyle.dim = false;
-        } else if (code === 23) {
-          tab.curStyle.italic = false;
-        } else if (code === 24) {
-          tab.curStyle.underline = false;
-        } else if (code === 27) {
-          tab.curStyle.inverse = false;
-        } else if (code === 39) {
-          tab.curStyle.fg = '';
-          tab.curStyle.fgCss = '';
-        } else if (code === 49) {
-          tab.curStyle.bg = '';
-          tab.curStyle.bgCss = '';
-        } else if (FG_CLASS_BY_CODE[code]) {
-          tab.curStyle.fg = FG_CLASS_BY_CODE[code];
-          tab.curStyle.fgCss = '';
-        } else if (BG_CLASS_BY_CODE[code]) {
-          tab.curStyle.bg = BG_CLASS_BY_CODE[code];
-          tab.curStyle.bgCss = '';
-        } else if (code === 38 || code === 48) {
-          var mode = parseInt(raw[i + 1], 10);
-          var cssVal = '';
-          if (mode === 5 && i + 2 < raw.length) {
-            cssVal = ansi256ToCss(raw[i + 2]);
-            i += 2;
-          } else if (mode === 2 && i + 4 < raw.length) {
-            cssVal =
-              'rgb(' +
-              clampByte(raw[i + 2]) +
-              ',' +
-              clampByte(raw[i + 3]) +
-              ',' +
-              clampByte(raw[i + 4]) +
-              ')';
-            i += 4;
-          }
-          if (cssVal) {
-            if (code === 38) {
-              tab.curStyle.fgCss = cssVal;
-              tab.curStyle.fg = '';
-            } else {
-              tab.curStyle.bgCss = cssVal;
-              tab.curStyle.bg = '';
-            }
-          }
-        }
-      }
-      tab.curStyleToken = makeStyleToken(tab.curStyle);
-    }
-
-    function enterAltScreen(tab, saveCursorFirst) {
-      if (saveCursorFirst) {
-        tab.savedCursor = { lineIdx: tab.curLineIdx, col: tab.curCol };
-      }
-      if (!tab.inAltScreen) {
-        tab.savedMainState = {
-          lines: tab.lines,
-          curLineIdx: tab.curLineIdx,
-          curCol: tab.curCol,
-          scrollTop: tab.scrollTop,
-          scrollBottom: tab.scrollBottom
-        };
-        tab.inAltScreen = true;
-      }
-      tab.lines = [];
-      for (var i = 0; i < lastRows; i += 1) {
-        tab.lines.push(makeLine(false));
-      }
-      tab.curLineIdx = 0;
-      tab.curCol = 0;
-      tab.scrollTop = 0;
-      tab.scrollBottom = -1;
-      if (tab.termId === activeTermId) fullRebuild = true;
-    }
-
-    function leaveAltScreen(tab, restoreCursorAfter) {
-      if (tab.inAltScreen && tab.savedMainState) {
-        tab.lines = tab.savedMainState.lines;
-        tab.curLineIdx = tab.savedMainState.curLineIdx;
-        tab.curCol = tab.savedMainState.curCol;
-        tab.scrollTop = tab.savedMainState.scrollTop;
-        tab.scrollBottom = tab.savedMainState.scrollBottom;
-        tab.savedMainState = null;
-        tab.inAltScreen = false;
-        tab.lines.forEach(function (ln) {
-          ln.node = null;
-          ln.dirty = true;
-        });
-        if (tab.termId === activeTermId) fullRebuild = true;
-      }
-      if (restoreCursorAfter && tab.savedCursor) {
-        tab.curLineIdx = Math.max(0, Math.min(tab.lines.length - 1, tab.savedCursor.lineIdx));
-        tab.curCol = Math.max(0, tab.savedCursor.col);
-      }
-    }
-
-    function handleDecPrivateMode(tab, paramsStr, enable) {
-      var items = paramsStr.split(';');
-      items.forEach(function (item) {
-        var mode = parseInt(item, 10);
-        if (mode === 1049) {
-          if (enable) enterAltScreen(tab, true);
-          else leaveAltScreen(tab, true);
-        } else if (mode === 47 || mode === 1047) {
-          if (enable) enterAltScreen(tab, false);
-          else leaveAltScreen(tab, false);
-        } else if (mode === 25) {
-          tab.cursorVisible = enable;
-        } else if (mode === 2004) {
-          tab.bracketedPaste = enable;
-        }
-      });
-    }
-
-    function handleCsi(tab, paramsRaw, finalChar) {
-      if (paramsRaw.charAt(0) === '?') {
-        if (finalChar === 'h' || finalChar === 'l') {
-          handleDecPrivateMode(tab, paramsRaw.slice(1), finalChar === 'h');
-        }
-        return;
-      }
-      if (paramsRaw.charAt(0) === '>') {
-        return;
-      }
-      if (finalChar === 'm') {
-        applySgr(tab, paramsRaw);
-        return;
-      }
-      resetBsTracking(tab);
-      var n = Math.max(1, parseInt(paramsRaw || '1', 10) || 1);
-
-      if (finalChar === 'A') {
-        var boundsUp = scrollBoundsOf(tab);
-        var minLine = Math.max(viewportTopOf(tab), boundsUp.startIdx);
-        tab.curLineIdx = Math.max(minLine, tab.curLineIdx - n);
-        return;
-      }
-      if (finalChar === 'B') {
-        var maxLineB = viewportTopOf(tab) + Math.max(0, lastRows - 1);
-        var nextLineB = Math.min(maxLineB, tab.curLineIdx + n);
-        ensureLineAt(tab, nextLineB);
-        tab.curLineIdx = Math.min(nextLineB, tab.lines.length - 1);
-        return;
-      }
-      if (finalChar === 'C') {
-        tab.curCol = Math.min(lastCols - 1, tab.curCol + n);
-        return;
-      }
-      if (finalChar === 'D') {
-        tab.curCol = Math.max(0, tab.curCol - n);
-        return;
-      }
-      if (finalChar === 'E') {
-        var nextE = Math.min(viewportTopOf(tab) + Math.max(0, lastRows - 1), tab.curLineIdx + n);
-        ensureLineAt(tab, nextE);
-        tab.curLineIdx = Math.min(nextE, tab.lines.length - 1);
-        tab.curCol = 0;
-        return;
-      }
-      if (finalChar === 'F') {
-        tab.curLineIdx = Math.max(viewportTopOf(tab), tab.curLineIdx - n);
-        tab.curCol = 0;
-        return;
-      }
-      if (finalChar === 'G') {
-        var colAbs = parseInt(paramsRaw || '1', 10);
-        tab.curCol = Math.max(0, Math.min(lastCols - 1, (isNaN(colAbs) ? 1 : colAbs) - 1));
-        return;
-      }
-      if (finalChar === 'H' || finalChar === 'f') {
-        var parts = paramsRaw.split(';');
-        var row = parseInt(parts[0] || '1', 10);
-        var col = parseInt(parts[1] || '1', 10);
-        if (isNaN(row) || row < 1) row = 1;
-        if (isNaN(col) || col < 1) col = 1;
-        var vpTop = viewportTopOf(tab);
-        var targetLine = Math.min(vpTop + Math.max(0, lastRows - 1), vpTop + (row - 1));
-        ensureLineAt(tab, targetLine);
-        tab.curLineIdx = Math.min(targetLine, tab.lines.length - 1);
-        tab.curCol = Math.max(0, Math.min(lastCols - 1, col - 1));
-        return;
-      }
-      if (finalChar === 'J') {
-        var jMode = parseInt(paramsRaw || '0', 10);
-        if (jMode === 2 || jMode === 3) {
-          tab.lines = [makeLine(false)];
-          if (tab.termId === activeTermId) {
-            removedNodes = [];
-            fullRebuild = true;
-            prevCursorLineIdx = -1;
-          }
-          tab.curLineIdx = 0;
-          tab.curCol = 0;
-        } else if (jMode === 1) {
-          var vpStart = viewportTopOf(tab);
-          for (var i1 = vpStart; i1 < tab.curLineIdx && i1 < tab.lines.length; i1 += 1) {
-            tab.lines[i1].chars = [];
-            tab.lines[i1].styles = [];
-            tab.lines[i1].dirty = true;
-          }
-          var ln1 = ensureCurrentLine(tab);
-          for (var c1 = 0; c1 <= tab.curCol && c1 < ln1.chars.length; c1 += 1) {
-            ln1.chars[c1] = ' ';
-            ln1.styles[c1] = '';
-          }
-          ln1.dirty = true;
-        } else {
-          var ln0 = ensureCurrentLine(tab);
-          ln0.chars.length = Math.min(ln0.chars.length, tab.curCol);
-          ln0.styles.length = ln0.chars.length;
-          ln0.dirty = true;
-          truncateLinesAfter(tab, tab.curLineIdx + 1);
-        }
-        return;
-      }
-      if (finalChar === 'K') {
-        var kMode = parseInt(paramsRaw || '0', 10);
-        var lineK = ensureCurrentLine(tab);
-        if (kMode === 2) {
-          lineK.chars = [];
-          lineK.styles = [];
-          lineK.dirty = true;
-        } else if (kMode === 1) {
-          for (var ck = 0; ck < tab.curCol && ck < lineK.chars.length; ck += 1) {
-            lineK.chars[ck] = ' ';
-            lineK.styles[ck] = '';
-          }
-          lineK.dirty = true;
-        } else {
-          if (tab.curCol > 0 && lineK.chars[tab.curCol] === '') {
-            clearWideAt(lineK, tab.curCol);
-          }
-          lineK.chars.length = Math.min(lineK.chars.length, tab.curCol);
-          lineK.styles.length = lineK.chars.length;
-          lineK.dirty = true;
-        }
-        return;
-      }
-      if (finalChar === 'P') {
-        var lineP = ensureCurrentLine(tab);
-        clearWideAt(lineP, tab.curCol);
-        if (tab.curCol < lineP.chars.length) {
-          lineP.chars.splice(tab.curCol, n);
-          lineP.styles.splice(tab.curCol, n);
-          lineP.dirty = true;
-        }
-        return;
-      }
-      if (finalChar === '@') {
-        var lineAt = ensureCurrentLine(tab);
-        clearWideAt(lineAt, tab.curCol);
-        while (lineAt.chars.length < tab.curCol) {
-          lineAt.chars.push(' ');
-          lineAt.styles.push('');
-        }
-        for (var a = 0; a < n; a += 1) {
-          lineAt.chars.splice(tab.curCol, 0, ' ');
-          lineAt.styles.splice(tab.curCol, 0, '');
-        }
-        if (lineAt.chars.length > lastCols) {
-          lineAt.chars.length = lastCols;
-          lineAt.styles.length = lastCols;
-        }
-        lineAt.dirty = true;
-        return;
-      }
-      if (finalChar === 'X') {
-        var lineX = ensureCurrentLine(tab);
-        while (lineX.chars.length < tab.curCol + n) {
-          lineX.chars.push(' ');
-          lineX.styles.push('');
-        }
-        for (var cx = 0; cx < n; cx += 1) {
-          clearWideAt(lineX, tab.curCol + cx);
-          lineX.chars[tab.curCol + cx] = ' ';
-          lineX.styles[tab.curCol + cx] = '';
-        }
-        lineX.dirty = true;
-        return;
-      }
-      if (finalChar === 'L') {
-        var boundsL = scrollBoundsOf(tab);
-        if (tab.curLineIdx >= boundsL.startIdx && tab.curLineIdx <= boundsL.endIdx) {
-          ensureLineAt(tab, boundsL.endIdx);
-          for (var il = 0; il < n; il += 1) {
-            var rmL = tab.lines.splice(Math.min(tab.lines.length - 1, boundsL.endIdx), 1)[0];
-            if (tab.termId === activeTermId && rmL && rmL.node) removedNodes.push(rmL.node);
-            tab.lines.splice(tab.curLineIdx, 0, makeLine(false));
-          }
-          if (tab.termId === activeTermId) fullRebuild = true;
-        }
-        return;
-      }
-      if (finalChar === 'M') {
-        var boundsM = scrollBoundsOf(tab);
-        if (tab.curLineIdx >= boundsM.startIdx && tab.curLineIdx <= boundsM.endIdx) {
-          ensureLineAt(tab, boundsM.endIdx);
-          for (var dl = 0; dl < n; dl += 1) {
-            var rmM = tab.lines.splice(tab.curLineIdx, 1)[0];
-            if (tab.termId === activeTermId && rmM && rmM.node) removedNodes.push(rmM.node);
-            tab.lines.splice(Math.min(tab.lines.length, boundsM.endIdx), 0, makeLine(false));
-          }
-          if (tab.termId === activeTermId) fullRebuild = true;
-        }
-        return;
-      }
-      if (finalChar === 'r') {
-        var rParts = paramsRaw.split(';');
-        var topR = parseInt(rParts[0] || '1', 10);
-        var botR = parseInt(rParts[1] || String(lastRows), 10);
-        if (isNaN(topR) || topR < 1) topR = 1;
-        if (isNaN(botR) || botR > lastRows) botR = lastRows;
-        if (topR < botR) {
-          tab.scrollTop = topR - 1;
-          tab.scrollBottom = botR - 1;
-        } else {
-          tab.scrollTop = 0;
-          tab.scrollBottom = -1;
-        }
-        tab.curLineIdx = viewportTopOf(tab);
-        tab.curCol = 0;
-        return;
-      }
-      if (finalChar === 's') {
-        tab.savedCursor = { lineIdx: tab.curLineIdx, col: tab.curCol };
-        return;
-      }
-      if (finalChar === 'u' && tab.savedCursor) {
-        tab.curLineIdx = Math.max(0, Math.min(tab.lines.length - 1, tab.savedCursor.lineIdx));
-        tab.curCol = Math.max(0, tab.savedCursor.col);
-      }
-    }
-
-    function handleOsc(tab, content) {
-      var sep = content.indexOf(';');
-      if (sep < 0) return;
-      var code = content.slice(0, sep);
-      var payload = content.slice(sep + 1);
-      if ((code === '0' || code === '2') && payload) {
-        tab.title = payload;
-        if (tab.termId === activeTermId) {
-          syncLiveChrome();
-        }
-      }
-    }
-
-    function feedText(tab, text) {
-      if (!text) return;
-      var stream = tab.pendingSurrogate ? tab.pendingSurrogate + text : text;
-      tab.pendingSurrogate = '';
-      if (stream.length > 0) {
-        var tailCode = stream.charCodeAt(stream.length - 1);
-        if (tailCode >= 0xd800 && tailCode <= 0xdbff) {
-          tab.pendingSurrogate = stream.charAt(stream.length - 1);
-          stream = stream.slice(0, -1);
-        }
-      }
-
-      for (var i = 0; i < stream.length; i += 1) {
-        var code = stream.charCodeAt(i);
-        var ch = stream.charAt(i);
-        if (code >= 0xd800 && code <= 0xdbff && i + 1 < stream.length) {
-          var low = stream.charCodeAt(i + 1);
-          if (low >= 0xdc00 && low <= 0xdfff) {
-            ch = stream.slice(i, i + 2);
-            i += 1;
-          }
-        }
-
-        if (tab.parseState === 'normal') {
-          if (code === 0x1b) {
-            tab.parseState = 'esc';
-          } else if (ch === '\r') {
-            resetBsTracking(tab);
-            tab.curCol = 0;
-          } else if (ch === '\n') {
-            newLine(tab);
-          } else if (code === 0x0b || code === 0x0c) {
-            lineFeedOnly(tab);
-          } else if (code === 0x08) {
-            var prevCol = tab.curCol;
-            var bsLine = ensureCurrentLine(tab);
-            if (prevCol >= 2 && bsLine.chars[prevCol - 1] === '') {
-              tab.curCol = prevCol - 2;
-            } else {
-              tab.curCol = Math.max(0, prevCol - 1);
-            }
-            if (
-              tab.curCol === tab.lastBsSpaceCol &&
-              tab.curCol === bsLine.chars.length - 1 &&
-              bsLine.chars[tab.curCol] === ' ' &&
-              !bsLine.styles[tab.curCol]
-            ) {
-              bsLine.chars.pop();
-              bsLine.styles.pop();
-              bsLine.dirty = true;
-              resetBsTracking(tab);
-            } else {
-              tab.lastBsCol = tab.curCol;
-              tab.lastBsSpaceCol = -1;
-            }
-          } else if (ch === '\t') {
-            resetBsTracking(tab);
-            var nextStop = tab.curCol + (8 - (tab.curCol % 8));
-            while (tab.curCol < nextStop) {
-              putChar(tab, ' ');
-            }
-          } else if (code === 0x07) {
-            /* BEL 忽略 */
-          } else if (code >= 0x20) {
-            putChar(tab, ch);
-          }
-        } else if (tab.parseState === 'esc') {
-          if (ch === '[') {
-            tab.parseState = 'csi';
-            tab.csiBuf = '';
-          } else if (ch === ']') {
-            tab.parseState = 'osc';
-            tab.oscBuf = '';
-          } else if (ch === '(' || ch === ')' || ch === '*' || ch === '+') {
-            tab.parseState = 'charset';
-          } else if (ch === '7') {
-            tab.savedCursor = { lineIdx: tab.curLineIdx, col: tab.curCol };
-            tab.parseState = 'normal';
-          } else if (ch === '8') {
-            if (tab.savedCursor) {
-              tab.curLineIdx = Math.max(0, Math.min(tab.lines.length - 1, tab.savedCursor.lineIdx));
-              tab.curCol = Math.max(0, tab.savedCursor.col);
-            }
-            tab.parseState = 'normal';
-          } else if (ch === 'M') {
-            var boundsRv = scrollBoundsOf(tab);
-            if (tab.curLineIdx === boundsRv.startIdx) {
-              scrollDownInRegion(tab, 1);
-            } else if (tab.curLineIdx > 0) {
-              tab.curLineIdx -= 1;
-            }
-            tab.parseState = 'normal';
-          } else if (ch === 'c') {
-            resetTabBuffer(tab);
-            tab.parseState = 'normal';
-          } else {
-            tab.parseState = 'normal';
-          }
-        } else if (tab.parseState === 'charset') {
-          tab.parseState = 'normal';
-        } else if (tab.parseState === 'csi') {
-          if (code >= 0x40 && code <= 0x7e) {
-            handleCsi(tab, tab.csiBuf, ch);
-            tab.parseState = 'normal';
-            tab.csiBuf = '';
-          } else if (tab.csiBuf.length < 64) {
-            tab.csiBuf += ch;
-          }
-        } else if (tab.parseState === 'osc') {
-          if (code === 0x07) {
-            handleOsc(tab, tab.oscBuf);
-            tab.parseState = 'normal';
-            tab.oscBuf = '';
-          } else if (code === 0x1b) {
-            tab.parseState = 'oscEsc';
-          } else if (tab.oscBuf.length < 256) {
-            tab.oscBuf += ch;
-          }
-        } else if (tab.parseState === 'oscEsc') {
-          if (ch === '\\') {
-            handleOsc(tab, tab.oscBuf);
-          }
-          tab.parseState = 'normal';
-          tab.oscBuf = '';
-        }
-      }
-      if (tab.termId === activeTermId) {
-        scheduleRender();
-      }
-    }
-
-    /* ── 安全 DOM 渲染（零 innerHTML） ──────────────────────── */
-
-    function appendStyledRange(parent, chars, styles, start, end) {
-      if (start >= end) return;
-      var segStart = start;
-      var segToken = styles[start] || '';
-      for (var i = start + 1; i <= end; i += 1) {
-        var nextToken = i < end ? styles[i] || '' : null;
-        if (nextToken !== segToken) {
-          var chunk = chars.slice(segStart, i).join('');
-          if (chunk) {
-            if (segToken) {
-              var parsed = parseStyleToken(segToken);
-              var span = document.createElement('span');
-              if (parsed.cls) span.className = parsed.cls;
-              if (parsed.fgCss) span.style.color = parsed.fgCss;
-              if (parsed.bgCss) span.style.backgroundColor = parsed.bgCss;
-              span.textContent = chunk;
-              parent.appendChild(span);
-            } else {
-              parent.appendChild(document.createTextNode(chunk));
-            }
-          }
-          segStart = i;
-          segToken = nextToken;
-        }
-      }
-    }
-
-    function populateLineNode(div, line, hasCursor, cursorCol) {
-      div.textContent = '';
-      div.className = line.system ? 'tm-line tm-line--system' : 'tm-line';
-
-      if (line.system) {
-        div.textContent = line.chars.join('');
-        return;
-      }
-
-      var chars = line.chars;
-      var styles = line.styles;
-
-      if (!hasCursor) {
-        appendStyledRange(div, chars, styles, 0, chars.length);
-        return;
-      }
-
-      var col = Math.max(0, cursorCol);
-      if (col > 0 && col < chars.length && chars[col] === '') {
-        col -= 1;
-      }
-      var cursor = document.createElement('span');
-      cursor.className = 'tm-live-cursor';
-      cursor.setAttribute('aria-hidden', 'true');
-
-      if (col < chars.length) {
-        appendStyledRange(div, chars, styles, 0, col);
-        div.appendChild(cursor);
-        appendStyledRange(div, chars, styles, col, chars.length);
-      } else {
-        appendStyledRange(div, chars, styles, 0, chars.length);
-        div.appendChild(cursor);
-      }
-    }
-
-    function renderLineNode(line, hasCursor, cursorCol) {
-      var div = document.createElement('div');
-      populateLineNode(div, line, hasCursor, cursorCol);
-      return div;
-    }
-
-    function flushRender() {
-      rafId = 0;
-      if (!renderPending) return;
-      renderPending = false;
-
-      if (viewMode !== 'terminal') return;
-      var tab = getActiveTab();
-      if (!tab) {
-        screenEl.textContent = '';
-        return;
-      }
-
-      var wasNearBottom =
-        screenEl.scrollHeight - screenEl.scrollTop - screenEl.clientHeight <= 48;
-
-      var cursorVisible = Boolean(tab.connected && tab.cursorVisible);
-      var cursorLineIdx = cursorVisible ? tab.curLineIdx : -1;
-      var lines = tab.lines;
-
-      if (fullRebuild) {
-        fullRebuild = false;
-        removedNodes.length = 0;
-        var frag = document.createDocumentFragment();
-        for (var i = 0; i < lines.length; i += 1) {
-          var ln = lines[i];
-          ln.node = renderLineNode(ln, i === cursorLineIdx, tab.curCol);
-          ln.dirty = false;
-          frag.appendChild(ln.node);
-        }
-        screenEl.textContent = '';
-        screenEl.appendChild(frag);
-      } else {
-        for (var r = 0; r < removedNodes.length; r += 1) {
-          var rn = removedNodes[r];
-          if (rn && rn.parentNode === screenEl) {
-            screenEl.removeChild(rn);
-          }
-        }
-        removedNodes.length = 0;
-
-        if (
-          prevCursorVisible !== cursorVisible ||
-          prevCursorLineIdx !== cursorLineIdx ||
-          prevCursorCol !== tab.curCol
-        ) {
-          if (prevCursorLineIdx >= 0 && prevCursorLineIdx < lines.length) {
-            lines[prevCursorLineIdx].dirty = true;
-          }
-          if (cursorLineIdx >= 0 && cursorLineIdx < lines.length) {
-            lines[cursorLineIdx].dirty = true;
-          }
-        }
-
-        for (var j = 0; j < lines.length; j += 1) {
-          var line = lines[j];
-          var isCur = j === cursorLineIdx;
-          if (!line.node) {
-            line.node = renderLineNode(line, isCur, tab.curCol);
-            line.dirty = false;
-            if (j === 0) {
-              screenEl.insertBefore(line.node, screenEl.firstChild);
-            } else {
-              var prevNode = lines[j - 1].node;
-              screenEl.insertBefore(line.node, prevNode ? prevNode.nextSibling : null);
-            }
-          } else if (line.dirty) {
-            populateLineNode(line.node, line, isCur, tab.curCol);
-            line.dirty = false;
-          }
-        }
-      }
-
-      prevCursorVisible = cursorVisible;
-      prevCursorLineIdx = cursorLineIdx;
-      prevCursorCol = tab.curCol;
-
-      if (wasNearBottom) {
-        screenEl.scrollTop = screenEl.scrollHeight;
-      }
-    }
-
-    function scheduleRender() {
-      renderPending = true;
-      if (!rafId) {
-        rafId = window.requestAnimationFrame(flushRender);
-      }
-    }
-
-    /* ── 网格列/行尺寸测量 ──────────────────────────────────── */
-
-    function measureCell() {
-      var probe = document.createElement('span');
-      probe.style.position = 'absolute';
-      probe.style.visibility = 'hidden';
-      probe.style.whiteSpace = 'pre';
-      probe.textContent = 'MMMMMMMMMM';
-      screenEl.appendChild(probe);
-      var rect = probe.getBoundingClientRect();
-      screenEl.removeChild(probe);
-      var charW = rect.width > 0 ? rect.width / 10 : 7.8;
-      var lineH = rect.height > 0 ? rect.height : 19;
-      return { charW: charW, lineH: lineH };
-    }
-
-    function computeGrid() {
-      var cell = measureCell();
-      var rect = screenEl.getBoundingClientRect();
-      var style = window.getComputedStyle(screenEl);
-      var padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-      var padY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
-      var w = Math.max(0, rect.width - padX);
-      var h = Math.max(0, rect.height - padY);
-      return {
-        cols: Math.min(512, Math.max(40, Math.floor(w / cell.charW))),
-        rows: Math.min(512, Math.max(12, Math.floor(h / cell.lineH)))
-      };
-    }
-
-    /* ── 键盘与剪贴板输入 ───────────────────────────────────── */
-
-    function sendInputToTab(tab, data) {
-      if (!tab || !tab.connected || tab.termId == null || !data) return;
-      Api.input(tab.termId, data).catch(function () {});
-    }
-
-    function sendPasteText(tab, text) {
-      if (!text) return;
-      var payload = tab && tab.bracketedPaste ? '\x1b[200~' + text + '\x1b[201~' : text;
-      sendInputToTab(tab, payload);
-    }
-
-    function copyTerminalSelection() {
-      var sel = window.getSelection ? window.getSelection().toString() : '';
-      if (!sel) return false;
-      if (Bridge && typeof Bridge.copyText === 'function') {
-        Bridge.copyText(sel).catch(function () {});
-        return true;
-      }
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        navigator.clipboard.writeText(sel).catch(function () {});
-        return true;
-      }
-      return false;
-    }
-
-    function mapKeyEvent(e) {
-      if (e.metaKey) return null;
-
-      if (FKEY_SEQ[e.key]) {
-        return FKEY_SEQ[e.key];
-      }
-
-      if (e.shiftKey && e.key === 'Tab') {
-        return '\x1b[Z';
-      }
-
-      if (e.ctrlKey && !e.altKey && e.key && e.key.length === 1) {
-        var upper = e.key.toUpperCase();
-        var cc = upper.charCodeAt(0);
-        if (cc >= 65 && cc <= 90) {
-          return String.fromCharCode(cc - 64);
-        }
-        if (e.key === '[') return '\x1b';
-        if (e.key === '\\') return '\x1c';
-        if (e.key === ']') return '\x1d';
-        return null;
-      }
-
-      if (e.altKey && !e.ctrlKey && e.key && e.key.length === 1) {
-        return '\x1b' + e.key;
-      }
-
-      if (e.key === 'Enter') return '\r';
-      if (e.key === 'Backspace') return '\x7f';
-      if (e.key === 'Tab') return '\t';
-      if (e.key === 'Escape') return '\x1b';
-      if (e.key === 'ArrowUp') return '\x1b[A';
-      if (e.key === 'ArrowDown') return '\x1b[B';
-      if (e.key === 'ArrowRight') return '\x1b[C';
-      if (e.key === 'ArrowLeft') return '\x1b[D';
-      if (e.key === 'Home') return '\x1b[H';
-      if (e.key === 'End') return '\x1b[F';
-      if (e.key === 'Delete') return '\x1b[3~';
-      if (e.key === 'PageUp') return '\x1b[5~';
-      if (e.key === 'PageDown') return '\x1b[6~';
-
-      if (e.key && e.key.length === 1 && !e.ctrlKey && !e.altKey) {
-        return e.key;
-      }
-      return null;
-    }
-
-    function onKeyDown(e) {
-      if (viewMode !== 'terminal') return;
-      if (renameBackdropEl && !renameBackdropEl.hidden) return;
-      if (fontBackdropEl && !fontBackdropEl.hidden) return;
-      var tab = getActiveTab();
-      if (e.metaKey && (e.key || '').toLowerCase() === 'a') {
-        e.preventDefault();
-        if (window.getSelection && document.createRange) {
-          var range = document.createRange();
-          range.selectNodeContents(screenEl);
-          var sel = window.getSelection();
-          if (sel) {
-            sel.removeAllRanges();
-            sel.addRange(range);
-          }
-        }
-        return;
-      }
-
-      if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey) {
-        var upperCtrl = (e.key || '').toUpperCase();
-        if (upperCtrl === 'C') {
-          if (copyTerminalSelection()) {
-            e.preventDefault();
-            return;
-          }
-        } else if (upperCtrl === 'V') {
-          e.preventDefault();
-          if (
-            navigator.clipboard &&
-            typeof navigator.clipboard.readText === 'function' &&
-            tab &&
-            tab.connected
-          ) {
-            navigator.clipboard
-              .readText()
-              .then(function (txt) {
-                sendPasteText(tab, txt);
-              })
-              .catch(function () {});
-          }
-          return;
-        }
-      }
-
-      if (!tab || !tab.connected || tab.termId == null) return;
-      if (e.isComposing || isComposing || e.keyCode === 229) return;
-
-      var seq = mapKeyEvent(e);
-      if (seq != null) {
-        e.preventDefault();
-        sendInputToTab(tab, seq);
-        if (imeEl) imeEl.value = '';
-      }
-    }
-
-    function onPaste(e) {
-      if (viewMode !== 'terminal') return;
-      var tab = getActiveTab();
-      if (!tab || !tab.connected || tab.termId == null) return;
-      var clip = e.clipboardData || window.clipboardData;
-      var text = clip ? clip.getData('text') : '';
-      if (text) {
-        e.preventDefault();
-        sendPasteText(tab, text);
-        if (imeEl) imeEl.value = '';
-      }
-    }
-
-    screenEl.addEventListener('keydown', onKeyDown);
-    screenEl.addEventListener('paste', onPaste);
-    screenEl.addEventListener('mouseup', function () {
-      var tab = getActiveTab();
-      var sel = window.getSelection ? window.getSelection().toString() : '';
-      if (!sel && tab && tab.connected) {
-        focusTerminal();
+    screenEl.addEventListener('mousedown', function () {
+      if (viewMode === 'terminal' && !isAnyModalOpen()) {
+        window.setTimeout(focusTerminal, 0);
       }
     });
-
-    if (imeEl) {
-      imeEl.addEventListener('keydown', onKeyDown);
-      imeEl.addEventListener('paste', onPaste);
-      imeEl.addEventListener('compositionstart', function () {
-        isComposing = true;
-      });
-      imeEl.addEventListener('compositionend', function (e) {
-        isComposing = false;
-        var data = e.data || imeEl.value || '';
-        imeEl.value = '';
-        var tab = getActiveTab();
-        if (data && tab) {
-          sendInputToTab(tab, data);
-        }
-      });
-      imeEl.addEventListener('input', function () {
-        if (isComposing) return;
-        var val = imeEl.value;
-        if (val) {
-          imeEl.value = '';
-          var tab = getActiveTab();
-          if (tab) sendInputToTab(tab, val);
-        }
-      });
-    }
 
     /* ── 会话创建 / 打开终端 / 返回列表 / 切换动作 ───────────── */
 
@@ -2794,18 +1735,10 @@
         syncLiveChrome();
       }, 6000);
 
-      cancelPendingRender();
-      fullRebuild = true;
-      prevCursorLineIdx = -1;
-      prevCursorCol = -1;
-      prevCursorVisible = false;
-      screenEl.textContent = '';
       hideNotice();
-
       setView('terminal');
-      var grid = computeGrid();
-      lastCols = grid.cols;
-      lastRows = grid.rows;
+      resetXtermView();
+      var grid = computeAndFitGrid(false);
 
       Api.open(grid.cols, grid.rows, null, true).catch(function (err) {
         removePendingOpenKind('attach');
@@ -2824,10 +1757,22 @@
         return;
       }
 
+      var targetId = Number(termId);
+      var existingTab = tabByTermId[String(targetId)];
+      if (
+        activeTermId === targetId &&
+        viewMode === 'terminal' &&
+        existingTab &&
+        (existingTab.connected || existingTab.opening)
+      ) {
+        focusTerminal();
+        return;
+      }
+
       pendingAttachViewTarget = false;
 
       var prevId = activeTermId;
-      if (prevId != null && prevId !== termId) {
+      if (prevId != null && prevId !== targetId) {
         var prevTab = tabByTermId[String(prevId)];
         if (prevTab) {
           prevTab.connected = false;
@@ -2836,20 +1781,16 @@
         Api.detach(prevId).catch(function () {});
       }
 
-      cancelPendingRender();
-      activeTermId = Number(termId);
+      activeTermId = targetId;
       var tab = ensureTab(activeTermId);
       tab.opening = true;
       tab.connected = false;
       tab.disconnectNoticed = false;
-      resetTabBuffer(tab, true);
-      screenEl.textContent = '';
       hideNotice();
 
       setView('terminal');
-      var grid = computeGrid();
-      lastCols = grid.cols;
-      lastRows = grid.rows;
+      resetXtermView();
+      var grid = computeAndFitGrid(false);
 
       var mySeq = ++attachSeq;
       Api.attach(activeTermId, grid.cols, grid.rows).catch(function (err) {
@@ -2864,7 +1805,6 @@
     function returnToListView() {
       closeMoreMenu();
       pendingAttachViewTarget = false;
-      cancelPendingRender();
       var detachId = activeTermId;
       if (detachId != null) {
         var tab = tabByTermId[String(detachId)];
@@ -3042,14 +1982,10 @@
           activeTermId = openedRec.termId;
           openedTab.opening = false;
           openedTab.connected = true;
-          resetTabBuffer(openedTab);
           hideNotice();
           setView('terminal');
-          var latestGrid = computeGrid();
-          lastCols = latestGrid.cols;
-          lastRows = latestGrid.rows;
-          Api.resize(openedRec.termId, lastCols, lastRows).catch(function () {});
-          scheduleRender();
+          resetXtermView();
+          computeAndFitGrid(true);
           focusTerminal();
         } else {
           if (ev.attached) {
@@ -3100,10 +2036,10 @@
         }
         attTab.connected = true;
         attTab.disconnectNoticed = false;
-        resetTabBuffer(attTab);
+        resetXtermView();
         hideNotice();
         syncLiveChrome();
-        scheduleRender();
+        computeAndFitGrid(true);
         focusTerminal();
         return;
       }
@@ -3137,26 +2073,21 @@
 
       if (ev.type === 'output') {
         var outTab = tabByTermId[String(ev.termId)];
-        if (!outTab || !outTab.connected) return;
-        var text;
-        if (outTab.utf8Decoder && Array.isArray(ev.bytes) && ev.bytes.length > 0) {
-          text = outTab.utf8Decoder.decode(new Uint8Array(ev.bytes), { stream: true });
-        } else if (outTab.utf8Decoder && ev.bytes instanceof Uint8Array && ev.bytes.length > 0) {
-          text = outTab.utf8Decoder.decode(ev.bytes, { stream: true });
-        } else {
-          text = ev.textUtf8Lossy || '';
+        if (!outTab || !outTab.connected || ev.termId !== activeTermId) return;
+        var t = mountXtermIfNeeded();
+        if (!t) return;
+        if (Array.isArray(ev.bytes) && ev.bytes.length > 0) {
+          t.write(new Uint8Array(ev.bytes));
+        } else if (ev.bytes instanceof Uint8Array && ev.bytes.length > 0) {
+          t.write(ev.bytes);
+        } else if (ev.textUtf8Lossy) {
+          t.write(ev.textUtf8Lossy);
         }
-        feedText(outTab, text);
         return;
       }
 
       if (ev.type === 'exited') {
         var wasActive = activeTermId === ev.termId;
-        var exTab = tabByTermId[String(ev.termId)];
-        if (exTab && exTab.utf8Decoder) {
-          var tail = exTab.utf8Decoder.decode();
-          if (tail) feedText(exTab, tail);
-        }
         delete tabByTermId[String(ev.termId)];
         sessions = sessions.filter(function (s) {
           return s.termId !== ev.termId;
@@ -3194,7 +2125,7 @@
         var activeTab = getActiveTab();
         if (activeTab && !activeTab.disconnectNoticed) {
           activeTab.disconnectNoticed = true;
-          appendSystemLine(activeTab, '[' + (reasonText || '远控会话已断开') + ']');
+          writeSystemNoticeToXterm('[' + (reasonText || '远控会话已断开') + ']');
         }
         syncLiveChrome();
       } else {
@@ -3290,15 +2221,7 @@
           if (viewMode === 'terminal' && activeTermId != null) {
             openSessionTerminal(activeTermId);
           }
-          if (
-            !fontState.autoRestoredRemote &&
-            fontState.source === 'remote' &&
-            fontState.fontId &&
-            !fontState.loadedAliases[fontState.fontId]
-          ) {
-            fontState.autoRestoredRemote = true;
-            fetchAndApplyRemoteFont(fontState.fontId, fontState.family, fontState.size, false);
-          }
+          maybeAutoRestoreRemoteFont();
         }
         if (viewMode === 'list') renderManagerView();
         else syncLiveChrome();
@@ -3307,55 +2230,19 @@
 
     /* ── ResizeObserver（100ms 防抖） ───────────────────────── */
 
-    function handleResize() {
+    function scheduleFitResize() {
       if (viewMode !== 'terminal') return;
-      var grid = computeGrid();
-      if (grid.cols === lastCols && grid.rows === lastRows) return;
-      lastCols = grid.cols;
-      lastRows = grid.rows;
-      var tab = getActiveTab();
-      if (!tab) return;
-      if (tab.inAltScreen) {
-        while (tab.lines.length > lastRows) {
-          var popped = tab.lines.pop();
-          if (popped && popped.node) {
-            removedNodes.push(popped.node);
-          }
-        }
-        while (tab.lines.length < lastRows) {
-          tab.lines.push(makeLine(false));
-        }
-        tab.curLineIdx = Math.max(0, Math.min(lastRows - 1, tab.curLineIdx));
-        tab.curCol = Math.max(0, Math.min(lastCols - 1, tab.curCol));
-        if (tab.scrollTop >= lastRows) {
-          tab.scrollTop = 0;
-          tab.scrollBottom = -1;
-        }
-        fullRebuild = true;
-        scheduleRender();
-      } else {
-        tab.curCol = Math.max(0, Math.min(lastCols - 1, tab.curCol));
-        if (tab.scrollTop >= lastRows) {
-          tab.scrollTop = 0;
-          tab.scrollBottom = -1;
-        }
-      }
-      if (tab.connected && tab.termId != null) {
-        Api.resize(tab.termId, grid.cols, grid.rows).catch(function () {});
-      }
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(function () {
+        computeAndFitGrid(false);
+      }, RESIZE_DEBOUNCE_MS);
     }
 
     if (typeof window.ResizeObserver === 'function') {
-      var ro = new window.ResizeObserver(function () {
-        window.clearTimeout(resizeTimer);
-        resizeTimer = window.setTimeout(handleResize, RESIZE_DEBOUNCE_MS);
-      });
+      var ro = new window.ResizeObserver(scheduleFitResize);
       ro.observe(screenEl);
     } else {
-      window.addEventListener('resize', function () {
-        window.clearTimeout(resizeTimer);
-        resizeTimer = window.setTimeout(handleResize, RESIZE_DEBOUNCE_MS);
-      });
+      window.addEventListener('resize', scheduleFitResize);
     }
 
     /* ── 窗口关闭仅脱离 UI（保持被控端后台 PTY 存活） ─────────── */

@@ -111,16 +111,18 @@
         <svg class="sn-ico" width="18" height="18" aria-hidden="true"><use href="#i-shield" /></svg>
       </button>
       <span class="sn-bar__sep" aria-hidden="true" data-tauri-drag-region></span>
-      <div class="sn-screen-group" data-tauri-drag-region>
-        <!-- 屏幕 tab：选中白底胶囊卡 + SHADOW_CARD，文字超宽 320 尾部截断；右键切换分辨率 -->
-        <div class="sn-screen-tab" id="screen-tab"
-             aria-haspopup="menu" aria-expanded="false"
-             title="显示屏1 (Built-in Retina Display) — 右键切换分辨率">
-          <svg class="sn-ico" width="16" height="16" aria-hidden="true"><use href="#i-monitor" /></svg>
-          <span class="sn-screen-tab__text" id="screen-name">显示屏1 (Built-in Retina Display)</span>
+      <div class="sn-screen-group" id="screen-group" data-tauri-drag-region>
+        <!-- 动态显示器选项卡容器（支持物理多屏 + 虚拟屏切换；右键活动屏切换分辨率） -->
+        <div class="sn-screen-tabs" id="screen-tabs">
+          <div class="sn-screen-tab is-active" id="screen-tab"
+               aria-haspopup="menu" aria-expanded="false"
+               title="显示屏1 (Built-in Retina Display) — 右键切换分辨率">
+            <svg class="sn-ico" width="16" height="16" aria-hidden="true"><use href="#i-monitor" /></svg>
+            <span class="sn-screen-tab__text" id="screen-name">显示屏1 (Built-in Retina Display)</span>
+          </div>
         </div>
-        <!-- + ghost：禁用态（08 §6 S1） -->
-        <button type="button" class="sn-bar__btn" id="btn-add-screen" disabled aria-label="添加屏幕">
+        <!-- + ghost：创建虚拟屏 -->
+        <button type="button" class="sn-bar__btn" id="btn-add-screen" aria-label="创建虚拟屏" title="创建虚拟屏">
           <svg class="sn-ico" width="18" height="18" aria-hidden="true"><use href="#i-plus" /></svg>
         </button>
       </div>
@@ -172,8 +174,8 @@
     <span class="sn-popover__arrow" aria-hidden="true"></span>
     <div class="sn-pop__head">
       <h2 class="sn-pop__title">安全状态</h2>
-      <!-- 「需关注」判定：防窥=关闭 或 自动锁屏=关 时显示 -->
-      <span class="sn-pill sn-pill--warning" id="security-warning">
+      <!-- 「需关注」判定：仅当防窥模式=关闭 且 自动锁屏=关 时显示 -->
+      <span class="sn-pill sn-pill--warning" id="security-warning" hidden>
         <svg class="sn-ico" width="12" height="12" aria-hidden="true"><use href="#i-triangle-alert" /></svg>
         <span>需关注</span>
       </span>
@@ -243,7 +245,7 @@
       <span class="sn-menu__chevron"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-chevron-right" /></svg></span>
     </button>
     <button type="button" class="sn-menu__item" role="menuitem" data-action="next-screen"
-            aria-disabled="true" title="被控端多显示器切换暂未支持" id="menu-next-screen">
+            aria-disabled="true" title="切换下一个屏幕 (⌥⌘N)" id="menu-next-screen">
       <svg class="sn-ico" width="16" height="16" aria-hidden="true"><use href="#i-arrow-right-left" /></svg>
       <span class="sn-menu__label">切换下一个屏幕</span>
       <span class="sn-menu__shortcut">⌥⌘N</span>
@@ -442,9 +444,25 @@
       <span class="sn-menu__label">立即锁定被控端屏幕</span>
       <span class="sn-menu__shortcut">⌃⌘Q</span>
     </button>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
     <button type="button" class="sn-submenu__item" role="menuitemcheckbox" id="opt-auto-lock-exit" aria-checked="false">
       <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
-      <span>退出时锁定被控端</span>
+      <span>远程结束后，被控端自动锁屏</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemcheckbox" id="opt-host-mute" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>被控端静音运行</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemcheckbox" id="opt-host-restore-audio" aria-checked="true">
+      <span class="sn-check"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>远程结束后，恢复被控端声音设置</span>
+    </button>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
+    <button type="button" class="sn-submenu__item" role="menuitem" id="menu-privacy-mode"
+            aria-haspopup="menu" aria-expanded="false">
+      <span class="sn-menu__label">被控端防窥模式</span>
+      <span class="sn-menu__shortcut" id="menu-privacy-mode-val">不启用</span>
+      <span class="sn-menu__chevron"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-chevron-right" /></svg></span>
     </button>
     <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
     <div class="sn-submenu__row">
@@ -456,9 +474,50 @@
     </div>
   </section>
 
-  <!-- ── S3 外设子菜单（远控 macOS 快捷键） ── -->
+  <!-- ── S3 被控端防窥模式三级菜单 ── -->
+  <section class="sn-popover sn-submenu sn-submenu--nested" id="privacy-mode-menu" role="menu"
+           aria-label="被控端防窥模式" hidden>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-privacy-opt="off" aria-checked="true">
+      <span class="sn-check"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>不启用</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-privacy-opt="privacy" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>隐私屏保</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-privacy-opt="black" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>黑屏防窥</span>
+    </button>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
+    <button type="button" class="sn-submenu__item" role="menuitem" id="btn-open-privacy-modal">
+      <svg class="sn-ico" width="15" height="15" aria-hidden="true"><use href="#i-image" /></svg>
+      <span>设置隐私屏保</span>
+    </button>
+  </section>
+
+  <!-- ── S3 外设子菜单（键盘系统快捷键 + 鼠标模式 + 常用组合键） ── -->
   <section class="sn-popover sn-submenu" id="peripherals-menu" role="menu"
            aria-label="外设" hidden>
+    <div class="sn-submenu__title">键盘</div>
+    <button type="button" class="sn-submenu__item" role="menuitemcheckbox" id="opt-send-sys-shortcuts" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span>发送系统快捷键到被控端</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitem" id="btn-config-shortcuts">
+      <span class="sn-check" hidden></span>
+      <span class="sn-menu__label">配置快捷键</span>
+    </button>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
+    <div class="sn-submenu__title">鼠标</div>
+    <button type="button" class="sn-submenu__item" role="menuitem" id="menu-mouse-mode"
+            aria-haspopup="menu" aria-expanded="false">
+      <span class="sn-menu__label">鼠标模式</span>
+      <span class="sn-menu__shortcut" id="menu-mouse-mode-val">智能鼠标</span>
+      <span class="sn-menu__chevron"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-chevron-right" /></svg></span>
+    </button>
+    <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
+    <div class="sn-submenu__title">快捷发送组合键</div>
     <button type="button" class="sn-submenu__item" role="menuitem" data-combo="spotlight">
       <span class="sn-menu__label">Spotlight</span>
       <span class="sn-menu__shortcut">⌘Space</span>
@@ -478,6 +537,23 @@
     <button type="button" class="sn-submenu__item" role="menuitem" data-combo="lock-screen">
       <span class="sn-menu__label">锁定屏幕</span>
       <span class="sn-menu__shortcut">⌃⌘Q</span>
+    </button>
+  </section>
+
+  <!-- ── S3 鼠标模式三级菜单 ── -->
+  <section class="sn-popover sn-submenu sn-submenu--nested" id="mouse-mode-menu" role="menu"
+           aria-label="鼠标模式" hidden>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-mouse-mode="smart" aria-checked="true">
+      <span class="sn-check"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span class="sn-res-label">智能鼠标</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-mouse-mode="remote" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span class="sn-res-label">使用被控端鼠标</span>
+    </button>
+    <button type="button" class="sn-submenu__item" role="menuitemradio" data-mouse-mode="local" aria-checked="false">
+      <span class="sn-check" hidden><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
+      <span class="sn-res-label">使用主控端鼠标</span>
     </button>
   </section>
 
@@ -518,6 +594,107 @@
       <span>显示网络状态</span>
     </button>
   </section>
+
+  <!-- ── 设置隐私屏保弹窗 ── -->
+  <div class="sn-modal-backdrop" id="privacy-modal-backdrop" hidden>
+    <div class="sn-modal sn-privacy-modal" role="dialog" aria-modal="true" aria-labelledby="privacy-modal-title">
+      <div class="sn-modal__head">
+        <h2 class="sn-modal__title" id="privacy-modal-title">设置隐私屏保</h2>
+        <button type="button" class="sn-modal__close" id="btn-privacy-modal-close" aria-label="关闭">×</button>
+      </div>
+      <div class="sn-modal__body">
+        <div class="sn-privacy-section">
+          <div class="sn-privacy-section__head">
+            <span class="sn-privacy-section__title">自定义图片</span>
+            <button type="button" class="sn-btn-ghost" id="btn-privacy-upload">编辑 / 选择图片</button>
+            <input type="file" id="privacy-file-input" accept="image/png,image/jpeg,image/webp" hidden />
+          </div>
+          <div class="sn-privacy-custom-card" id="privacy-custom-card" data-preset="custom" tabindex="0">
+            <img class="sn-privacy-custom-card__img" id="privacy-custom-img" alt="自定义隐私屏保" hidden />
+            <div class="sn-privacy-custom-card__empty" id="privacy-custom-empty">点击「编辑 / 选择图片」上传本地 JPG / PNG 图片</div>
+            <span class="sn-privacy-badge" id="privacy-last-used-badge" hidden>上次使用</span>
+            <span class="sn-privacy-check" aria-hidden="true">✓</span>
+          </div>
+        </div>
+
+        <div class="sn-privacy-section">
+          <div class="sn-privacy-section__head">
+            <span class="sn-privacy-section__title">内置预设</span>
+          </div>
+          <div class="sn-privacy-grid" id="privacy-presets-grid">
+            <button type="button" class="sn-privacy-tile is-selected" data-preset="preset-1">
+              <span class="sn-privacy-tile__art sn-privacy-art--1"></span>
+              <span class="sn-privacy-tile__name">守护深蓝</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+            <button type="button" class="sn-privacy-tile" data-preset="preset-2">
+              <span class="sn-privacy-tile__art sn-privacy-art--2"></span>
+              <span class="sn-privacy-tile__name">深邃星空</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+            <button type="button" class="sn-privacy-tile" data-preset="preset-3">
+              <span class="sn-privacy-tile__art sn-privacy-art--3"></span>
+              <span class="sn-privacy-tile__name">静谧森绿</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+            <button type="button" class="sn-privacy-tile" data-preset="preset-4">
+              <span class="sn-privacy-tile__art sn-privacy-art--4"></span>
+              <span class="sn-privacy-tile__name">极光紫夜</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+            <button type="button" class="sn-privacy-tile" data-preset="preset-5">
+              <span class="sn-privacy-tile__art sn-privacy-art--5"></span>
+              <span class="sn-privacy-tile__name">极简石墨</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+            <button type="button" class="sn-privacy-tile" data-preset="preset-6">
+              <span class="sn-privacy-tile__art sn-privacy-art--6"></span>
+              <span class="sn-privacy-tile__name">纯黑防窥</span>
+              <span class="sn-privacy-check" aria-hidden="true">✓</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="sn-modal__foot">
+        <button type="button" class="sn-btn-ghost" id="btn-privacy-preview">预览</button>
+        <span class="sn-modal__spacer"></span>
+        <button type="button" class="sn-btn-ghost" id="btn-privacy-cancel">取消</button>
+        <button type="button" class="sn-btn-primary" id="btn-privacy-confirm">确定并启用隐私屏保</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 隐私屏保全屏预览浮层 ── -->
+  <div class="sn-privacy-preview-overlay" id="privacy-preview-overlay" hidden>
+    <div class="sn-privacy-preview-card" id="privacy-preview-surface">
+      <img class="sn-privacy-preview-img" id="privacy-preview-img" alt="屏保预览" hidden />
+      <div class="sn-privacy-preview-caption" id="privacy-preview-caption">
+        <h3>远程隐私保护中</h3>
+        <p>被控端物理屏幕将被此画面遮挡，主控端仍可正常操作</p>
+      </div>
+      <button type="button" class="sn-btn-primary sn-privacy-preview-close" id="btn-privacy-preview-close">关闭预览</button>
+    </div>
+  </div>
+
+  <!-- ── 配置快捷键例外弹窗 ── -->
+  <div class="sn-modal-backdrop" id="shortcuts-modal-backdrop" hidden>
+    <div class="sn-modal sn-shortcuts-modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-modal-title">
+      <div class="sn-modal__head">
+        <h2 class="sn-modal__title" id="shortcuts-modal-title">配置系统快捷键</h2>
+        <button type="button" class="sn-modal__close" id="btn-shortcuts-modal-close" aria-label="关闭">×</button>
+      </div>
+      <div class="sn-modal__body">
+        <p class="sn-shortcuts-desc">开启「发送系统快捷键到被控端」后，以下勾选的快捷键将保留在<strong>本机</strong>响应，其余系统组合键将直接转发到被控端。</p>
+        <div class="sn-shortcuts-list" id="shortcuts-list"></div>
+      </div>
+      <div class="sn-modal__foot">
+        <button type="button" class="sn-btn-ghost" id="btn-shortcuts-reset">恢复默认</button>
+        <span class="sn-modal__spacer"></span>
+        <button type="button" class="sn-btn-ghost" id="btn-shortcuts-cancel">取消</button>
+        <button type="button" class="sn-btn-primary" id="btn-shortcuts-save">保存配置</button>
+      </div>
+    </div>
+  </div>
 
   <script src="assets/js/bridge.js"></script>
   <script src="assets/js/session.js"></script>

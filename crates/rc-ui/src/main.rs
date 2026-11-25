@@ -30,7 +30,10 @@ use rc_ui::host_bridge::HostUpdate;
 use rc_ui::lan_discovery::{self, LanDiscoveryHandle};
 use rc_ui::metal_attach::{self, DockMenuAction, Frame};
 use rc_ui::server_config::{self, ServerStatusSnapshot};
-use rc_ui::service_ipc::{AgentSnapshot, IpcClient, ServiceRequest, ServiceResponse};
+use rc_ui::service_ipc::{
+    read_or_create_ipc_secret, AgentSnapshot, IpcClient, IpcServer, ServiceRequest,
+    ServiceResponse, ServiceSessionType,
+};
 use rc_ui::service_manager;
 use rc_ui::session_bridge::{LayerLease, SessionUpdate};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
@@ -399,11 +402,17 @@ fn start_background_poller(app: AppHandle) {
                             ended_session = slot.take();
                             state::clear_session_snapshot_locked(&st.last_session_update);
                             portmap_update = Some(Vec::new());
-                        } else if let Some(latest) = updates
-                            .iter()
-                            .rev()
-                            .find(|u| !matches!(u, SessionUpdate::DisplayConfig { .. }))
-                        {
+                        } else if let Some(latest) = updates.iter().rev().find(|u| {
+                            !matches!(
+                                u,
+                                SessionUpdate::DisplayConfig { .. }
+                                    | SessionUpdate::PrivacyState { .. }
+                                    | SessionUpdate::HostMuteState { .. }
+                                    | SessionUpdate::MouseModeState { .. }
+                                    | SessionUpdate::DisplaysState { .. }
+                                    | SessionUpdate::VirtualDisplayError { .. }
+                            )
+                        }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。
                             state::record_session_update_locked(
                                 &st.last_session_update,
@@ -762,7 +771,7 @@ fn start_background_poller(app: AppHandle) {
 /// - 挂载失败（窗口缺失/`ns_view` 失败/`attach_layer` 报错）：回滚状态机为 `None`；
 /// - 挂载期间会话被并发替换/断开：立刻 `detach_layer` 避免残留子层。
 #[cfg(target_os = "macos")]
-fn attach_layer_on_main_thread(
+pub(crate) fn attach_layer_on_main_thread(
     app: &AppHandle,
     sid: u64,
     lease: LayerLease,
@@ -815,7 +824,7 @@ fn attach_layer_on_main_thread(
 
 /// 非 macOS 平台占位实现：回滚待挂载状态。
 #[cfg(not(target_os = "macos"))]
-fn attach_layer_on_main_thread(
+pub(crate) fn attach_layer_on_main_thread(
     app: &AppHandle,
     sid: u64,
     lease: LayerLease,
@@ -942,6 +951,23 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
 fn main() {
     rc_platform_macos::register_all();
 
+    // 单实例守护：若已有控制端 GUI 实例正在监听 `gui.sock`，直接将其主窗口唤起到前台并退出本进程。
+    let gui_sock = config_paths::gui_socket_path();
+    let secret_path = config_paths::ipc_secret_path();
+    if gui_sock.exists()
+        && matches!(
+            IpcClient::call(
+                &gui_sock,
+                &secret_path,
+                ServiceRequest::OpenMainGui,
+                Duration::from_millis(300),
+            ),
+            Ok(ServiceResponse::Ok)
+        )
+    {
+        return;
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .menu(build_app_menu)
@@ -949,8 +975,35 @@ fn main() {
         .setup(|app| {
             let state = app.state::<AppState>();
 
-            // 0) 按当前显示器尺寸自适应主窗口大小并居中（兼容 13"/14" 笔记本与 2K/4K 大屏）。
+            // 0) 按当前显示器尺寸自适应主窗口大小并居中（兼容 13"/14" 笔记本与 2K/4K 大屏），
+            //    并启动 `gui.sock` 单实例唤醒通道供后台菜单栏与重复启动实例直接前置本窗口。
             window::adapt_main_window_on_startup(app.handle());
+            if let Ok(secret) = read_or_create_ipc_secret(&config_paths::ipc_secret_path()) {
+                let app_wake = app.handle().clone();
+                if let Ok(gui_srv) = IpcServer::bind(
+                    config_paths::gui_socket_path(),
+                    secret,
+                    move |req| match req {
+                        ServiceRequest::Ping => ServiceResponse::Pong {
+                            pid: std::process::id(),
+                            session_type: ServiceSessionType::Standalone,
+                            binary_sha256: None,
+                        },
+                        ServiceRequest::OpenMainGui => {
+                            let app_ui = app_wake.clone();
+                            let _ = app_wake.run_on_main_thread(move || {
+                                commands::show_and_focus_main_window(&app_ui);
+                            });
+                            ServiceResponse::Ok
+                        }
+                        _ => ServiceResponse::Error {
+                            message: "gui.sock 仅支持 Ping 与 OpenMainGui".to_string(),
+                        },
+                    },
+                ) {
+                    *state.gui_ipc.lock().unwrap_or_else(|e| e.into_inner()) = Some(gui_srv);
+                }
+            }
 
             // 0.5) 检测是否已安装并运行 macOS 系统后台服务：若已退出过则先唤醒，并探测 agent.sock 进入代理模式。
             if config_paths::is_service_managed() {
@@ -1111,25 +1164,77 @@ fn main() {
                     let _ = win.hide();
                 }
             }
+            WindowEvent::Focused(focused) if win.label() == "session" => {
+                let st = win.app_handle().state::<AppState>();
+                commands::notify_session_window_focus(&st, *focused);
+            }
             WindowEvent::Destroyed => match win.label() {
                 "session" => {
-                    let st = win.app_handle().state::<AppState>();
-                    let cur_epoch = st
-                        .session_open_epoch
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let prog_epoch = st
-                        .programmatic_close_epoch
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let has_session = st
-                        .session
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_some();
-                    if has_session || cur_epoch != prog_epoch {
-                        commands::disconnect_active_session(win.app_handle());
+                    let ah = win.app_handle();
+                    let st = ah.state::<AppState>();
+                    commands::stop_shortcut_tap_runtime(&st);
+                    let has_open_tools = ah.get_webview_window("terminal").is_some()
+                        || ah.get_webview_window("transfer").is_some()
+                        || ah.get_webview_window("portmap").is_some();
+                    if has_open_tools {
+                        // 仍有终端/文件传输/端口映射窗口在使用同一会话：降级回无头模式（摘除 Metal 图层并静音），不断开底层连接。
+                        let detach_lease = {
+                            let mut slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(active) = slot.as_mut() {
+                                active.handle.send(
+                                    rc_client_core::session_bridge::SessionCommand::SetAudioMuted {
+                                        muted: true,
+                                    },
+                                );
+                                active.reset_layer_for_headless()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(lease) = detach_lease {
+                            let _ = ah.run_on_main_thread(move || {
+                                metal_attach::detach_leased_layer(&lease);
+                                std::thread::spawn(move || drop(lease));
+                            });
+                        }
+                    } else {
+                        let cur_epoch = st
+                            .session_open_epoch
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        let prog_epoch = st
+                            .programmatic_close_epoch
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        let has_session = st
+                            .session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
+                        if has_session || cur_epoch != prog_epoch {
+                            commands::disconnect_active_session(ah);
+                        }
                     }
                 }
-                "terminal" => commands::detach_active_terminals(win.app_handle()),
+                "terminal" => {
+                    commands::detach_active_terminals(win.app_handle());
+                    let ah = win.app_handle();
+                    let no_session_or_tools = ah.get_webview_window("session").is_none()
+                        && ah.get_webview_window("transfer").is_none()
+                        && ah.get_webview_window("portmap").is_none();
+                    if no_session_or_tools {
+                        commands::disconnect_active_session(ah);
+                    }
+                }
+                "transfer" | "portmap" => {
+                    let ah = win.app_handle();
+                    let label = win.label();
+                    let no_session_or_tools = ah.get_webview_window("session").is_none()
+                        && ah.get_webview_window("terminal").is_none()
+                        && (label == "transfer" || ah.get_webview_window("transfer").is_none())
+                        && (label == "portmap" || ah.get_webview_window("portmap").is_none());
+                    if no_session_or_tools {
+                        commands::disconnect_active_session(ah);
+                    }
+                }
                 "main" => {
                     let st = win.app_handle().state::<AppState>();
                     let keep_bg = !st.is_quitting() && st.is_service_proxy();
@@ -1195,6 +1300,19 @@ fn main() {
             commands::uninstall_system_service,
             commands::consume_tray_perm_check,
             commands::quit_app_completely,
+            commands::get_client_lock_status,
+            commands::lock_client,
+            commands::unlock_client,
+            commands::change_client_lock_password,
+            commands::get_privacy_custom_image,
+            commands::save_privacy_custom_image,
+            commands::set_session_privacy_mode,
+            commands::set_session_host_mute,
+            commands::set_session_peripherals,
+            commands::list_session_displays,
+            commands::switch_session_display,
+            commands::create_session_virtual_display,
+            commands::remove_session_virtual_display,
             commands::reconnect_last_session,
             commands::send_input_event,
             commands::stage_rect,
@@ -1257,11 +1375,18 @@ fn main() {
             has_visible_windows,
             ..
         } => {
-            if !has_visible_windows {
+            let main_not_visible = app_handle.get_webview_window("main").is_some_and(|w| {
+                !w.is_visible().unwrap_or(true) || w.is_minimized().unwrap_or(false)
+            });
+            if !has_visible_windows || main_not_visible {
                 commands::show_and_focus_main_window(app_handle);
             }
         }
         RunEvent::Exit => {
+            let st = app_handle.state::<AppState>();
+            if let Some(mut srv) = st.gui_ipc.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                srv.stop();
+            }
             commands::shutdown_host_and_lan(app_handle);
             metal_attach::remove_status_bar();
         }

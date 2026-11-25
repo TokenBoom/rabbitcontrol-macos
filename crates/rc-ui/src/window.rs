@@ -178,6 +178,7 @@ pub fn open_tool_window(
     state: State<'_, AppState>,
     kind: String,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     let kind = ToolWindow::parse(&kind).ok_or_else(|| format!("未知窗口类型：{kind}"))?;
     if kind != ToolWindow::Settings {
         state.require_authenticated()?;
@@ -209,6 +210,7 @@ pub fn open_session_window(
     state: State<'_, AppState>,
     watch_only: Option<bool>,
 ) -> Result<(), String> {
+    state.require_unlocked()?;
     state.require_authenticated()?;
     ensure_session_window(&app, &state, watch_only.unwrap_or(false))
 }
@@ -523,17 +525,70 @@ pub(crate) fn set_session_window_title(app: &AppHandle, device_name: &str) {
     }
 }
 
-/// IPC 命令：将已打开的 S1 会话窗口恢复最小化并显示聚焦到前台。
+/// IPC 命令：将已打开的 S1 会话窗口恢复最小化并显示聚焦到前台；
+/// 若当前活动会话是以无头工具模式建立（尚未创建 S1 窗口），则按需创建 S1 窗口并补挂离屏 Metal 图层。
 #[allow(dead_code)]
 #[tauri::command]
 pub fn focus_session_window(app: AppHandle) -> Result<(), String> {
-    app.state::<AppState>().require_authenticated()?;
-    let Some(win) = app.get_webview_window(ToolWindow::Session.label()) else {
-        return Err("会话窗口未打开".to_string());
+    let st = app.state::<AppState>();
+    st.require_unlocked()?;
+    st.require_authenticated()?;
+    if let Some(win) = app.get_webview_window(ToolWindow::Session.label()) {
+        let _ = win.unminimize();
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    // 先读出窗口构造元数据，待 `ensure_session_window` 成功后再推进 `begin_attach`，
+    // 防止窗口创建失败导致 `layer_state` 永久滞留在 `Attaching`。
+    let (watch_only, device_name, video_size) = {
+        let slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = slot.as_ref() else {
+            return Err("会话窗口未打开".to_string());
+        };
+        (
+            active.watch_only,
+            active.meta.device_name.clone(),
+            active.video_size,
+        )
     };
-    let _ = win.unminimize();
-    win.show().map_err(|e| e.to_string())?;
-    win.set_focus().map_err(|e| e.to_string())?;
+    ensure_session_window(&app, &st, watch_only)?;
+    set_session_window_title(&app, &device_name);
+    if let Some((vw, vh)) = video_size {
+        if vw > 0 && vh > 0 {
+            let _ = fit_session_window_to_video(&app, vw, vh, false);
+        }
+    }
+    let attach_req = {
+        let mut slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = slot.as_mut() {
+            // 从无头工具会话升级为 S1 远控窗口：恢复远端音频播放、同步最新显示器列表。
+            if active.meta.audio_enabled {
+                active.handle.send(
+                    rc_client_core::session_bridge::SessionCommand::SetAudioMuted { muted: false },
+                );
+            }
+            active
+                .handle
+                .send_display_ctrl(rc_client_core::display_ctrl::DisplayControlMsg::ListDisplays);
+            let fallback = rc_ui::metal_attach::Frame {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(active.meta.width.max(1)),
+                height: f64::from(active.meta.height.max(1)),
+            };
+            active
+                .handle
+                .layer_lease()
+                .and_then(|lease| active.begin_attach(lease, fallback))
+        } else {
+            None
+        }
+    };
+    if let Some((sid, lease, frame)) = attach_req {
+        crate::attach_layer_on_main_thread(&app, sid, lease, frame);
+    }
+    let _ = crate::commands::sync_shortcut_tap_runtime(&app, &st);
     Ok(())
 }
 
@@ -588,7 +643,9 @@ pub(crate) fn destroy_session_window_if_epoch(app: &AppHandle, expected_epoch: u
 #[allow(dead_code)]
 #[tauri::command]
 pub fn close_session_window(lock_remote: Option<bool>, app: AppHandle) -> Result<(), String> {
-    app.state::<AppState>().require_authenticated()?;
+    let st = app.state::<AppState>();
+    st.require_unlocked()?;
+    st.require_authenticated()?;
     let close_epoch = crate::commands::disconnect_active_session_with_lock(&app, lock_remote);
     destroy_session_window_if_epoch(&app, close_epoch);
     Ok(())

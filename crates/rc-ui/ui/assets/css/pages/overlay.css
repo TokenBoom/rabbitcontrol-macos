@@ -640,6 +640,261 @@ body.rc-preview-mode > #app {
   visibility: hidden;
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * 客户端「安全锁定」：确认弹窗 / 设置安全密码 / 全窗锁屏遮罩
+ * ──────────────────────────────────────────────────────────────── */
+.rc-lock-confirm {
+  width: 312px;
+  padding: 24px 22px 20px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: 22px;
+  background: var(--lock-confirm-bg);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-lock-confirm__badge {
+  width: 56px;
+  height: 56px;
+  margin-bottom: 16px;
+  border-radius: 50%;
+  background: var(--lock-badge-bg);
+  color: var(--on-accent);
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 56px;
+  text-align: center;
+  box-shadow: var(--lock-badge-shadow);
+}
+
+.rc-lock-confirm__title {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
+}
+
+.rc-lock-confirm__desc {
+  margin: 0 0 22px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.rc-lock-confirm__actions {
+  display: flex;
+  gap: 10px;
+}
+
+.rc-lock-confirm__btn {
+  flex: 1;
+  height: 34px;
+  border: 0;
+  border-radius: 999px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.rc-lock-confirm__btn--cancel {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.rc-lock-confirm__btn--cancel:hover {
+  background: var(--bg-active);
+}
+
+.rc-lock-confirm__btn--ok {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.rc-lock-confirm__btn--ok:hover {
+  filter: brightness(0.95);
+}
+
+.rc-lock-pwd {
+  width: 460px;
+  padding: 22px 24px 20px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-lock-pwd__title {
+  margin: 0 0 16px;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.rc-lock-pwd__box {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px 28px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--bg-card);
+}
+
+.rc-lock-pwd__row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.rc-lock-pwd__label {
+  flex: none;
+  width: 60px;
+  text-align: right;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.rc-lock-input-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.rc-lock-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 36px 0 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+}
+
+.rc-lock-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.rc-lock-eye {
+  position: absolute;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.rc-lock-error {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 12px;
+  text-align: center;
+}
+
+.rc-lock-pwd__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.rc-lock-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9500;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--lock-screen-bg);
+  user-select: none;
+}
+
+.rc-lock-screen__drag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 44px;
+}
+
+.rc-lock-screen__body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 340px;
+  text-align: center;
+}
+
+.rc-lock-screen__shield {
+  margin-bottom: 18px;
+  filter: var(--lock-shield-shadow);
+}
+
+.rc-lock-screen__title {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.rc-lock-screen__desc {
+  margin: 0 0 42px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.rc-lock-screen__account {
+  margin-bottom: 14px;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+
+.rc-lock-screen__btn {
+  width: 240px;
+  height: 38px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--lock-btn-bg);
+  color: var(--on-accent);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--lock-btn-shadow);
+}
+
+.rc-lock-screen__btn:hover {
+  filter: brightness(0.96);
+}
+
+.rc-lock-screen__form {
+  width: 260px;
+}
+
+.rc-lock-screen__form-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .rc-popover,
   .rc-tools,

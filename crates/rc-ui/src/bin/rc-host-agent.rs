@@ -251,24 +251,61 @@ fn format_display_addr(actual: SocketAddr) -> String {
 fn launch_main_gui() {
     #[cfg(target_os = "macos")]
     {
-        if let Some(bundle) = service_manager::locate_app_bundle() {
-            let _ = std::process::Command::new("open")
-                .arg("-a")
-                .arg(&bundle)
-                .spawn();
-            return;
+        use std::sync::OnceLock;
+
+        // 防抖：短时间内连续点击菜单或 Dock Reopen 时避免重复触发唤醒/拉起线程。
+        static LAST_SPAWN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let guard_slot = LAST_SPAWN.get_or_init(|| Mutex::new(None));
+        {
+            let mut last = guard_slot.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < Duration::from_millis(600)) {
+                return;
+            }
+            *last = Some(Instant::now());
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                for candidate in ["RabbitControl", "rc-ui"] {
-                    let bin = dir.join(candidate);
-                    if bin.is_file() {
-                        let _ = std::process::Command::new(bin).spawn();
-                        return;
+
+        // 卸载到短生命周期后台线程，避免 350ms 同步 IPC 阻塞 AppKit 主线程并确保 `open` 子进程被 `.status()` 回收防僵尸进程。
+        let _ = std::thread::Builder::new()
+            .name("rc-agent-open-gui".to_string())
+            .spawn(|| {
+                let gui_sock = config_paths::gui_socket_path();
+                let secret_path = config_paths::ipc_secret_path();
+                if gui_sock.exists()
+                    && matches!(
+                        IpcClient::call(
+                            &gui_sock,
+                            &secret_path,
+                            ServiceRequest::OpenMainGui,
+                            Duration::from_millis(350),
+                        ),
+                        Ok(ServiceResponse::Ok)
+                    )
+                {
+                    return;
+                }
+
+                if let Some(bundle) = service_manager::locate_app_bundle() {
+                    // 必须带 `-n`：否则 LaunchServices 会将同 Bundle 下的本 `rc-host-agent` 视为已运行实例，
+                    // 只发 Reopen 而不真正启动 `Contents/MacOS/RabbitControl` 主界面进程。
+                    let _ = std::process::Command::new("open")
+                        .arg("-n")
+                        .arg("-a")
+                        .arg(&bundle)
+                        .status();
+                    return;
+                }
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        for candidate in ["RabbitControl", "rc-ui"] {
+                            let bin = dir.join(candidate);
+                            if bin.is_file() {
+                                let _ = std::process::Command::new(bin).spawn();
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-        }
+            });
     }
 }
 
@@ -769,7 +806,6 @@ impl AgentInner {
         StatusBarDisplay {
             device_id: self.device_id.clone(),
             signal_online: self.signal_online,
-            remote_assist_enabled: self.host.is_some() && self.effective_allow_remote_assist(),
             connected_peer: self.connected_peer.clone(),
             missing_permissions: self.degraded_permissions
                 || (self.permissions.platform_supported && !self.permissions.host_ready),
@@ -1353,67 +1389,15 @@ fn main() {
         let stop_tray = Arc::clone(&stop_flag);
         let secret_tray = ipc_secret.clone();
 
+        // 必须在安装 NSStatusItem 之前将 NSApplication 切为 Accessory（不占 Dock 图标）
+        // 并注册 Reopen Delegate：即便 Finder / Spotlight / Dock 将激活事件误路由到本 Agent，也会自动转发拉起主界面。
+        let _ = metal_attach::init_accessory_app_with_reopen_handler(Arc::new(launch_main_gui));
+
         let _ = metal_attach::install_status_bar(
             initial_tray,
             Arc::new(move |action| match action {
                 StatusBarAction::OpenMainGui => {
                     launch_main_gui();
-                }
-                StatusBarAction::CopyDeviceId => {
-                    let did = agent_tray
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .device_id
-                        .clone();
-                    if let Some(id) = did {
-                        let _ = metal_attach::copy_text_to_pasteboard(&id);
-                    }
-                }
-                StatusBarAction::CheckPermissions => {
-                    let marker = config_paths::run_dir().join("open-perm-check");
-                    let _ = config_paths::write_private_file(&marker, b"1\n");
-                    launch_main_gui();
-                }
-                StatusBarAction::ToggleRemoteAssist(enabled) => {
-                    let agent_bg = Arc::clone(&agent_tray);
-                    let _ = std::thread::Builder::new()
-                        .name("rc-agent-tray-toggle".to_string())
-                        .spawn(move || {
-                            let (authenticated, perm_blocked, retired, tray) = {
-                                let mut guard = agent_bg.lock().unwrap_or_else(|e| e.into_inner());
-                                if !guard.is_authenticated() {
-                                    (false, false, None, None)
-                                } else {
-                                    match guard.set_remote_assist(enabled) {
-                                        Ok((_, retired)) => {
-                                            (true, false, retired, Some(guard.status_bar_display()))
-                                        }
-                                        Err(_) => {
-                                            let blocked = guard.session_type
-                                                == ServiceSessionType::Aqua
-                                                && permissions::ensure_host_ready(
-                                                    &guard.permissions,
-                                                )
-                                                .is_err();
-                                            (true, blocked, None, Some(guard.status_bar_display()))
-                                        }
-                                    }
-                                }
-                            };
-                            if let Some(mut h) = retired {
-                                h.stop();
-                            }
-                            if let Some(t) = tray {
-                                metal_attach::update_status_bar(t);
-                            }
-                            if !authenticated {
-                                launch_main_gui();
-                            } else if perm_blocked {
-                                let marker = config_paths::run_dir().join("open-perm-check");
-                                let _ = config_paths::write_private_file(&marker, b"1\n");
-                                launch_main_gui();
-                            }
-                        });
                 }
                 StatusBarAction::QuitAll => {
                     let agent_bg = Arc::clone(&agent_tray);
@@ -1477,6 +1461,9 @@ fn main() {
     } else {
         ByeReason::Normal
     };
+    // 停机前先在主线程显式清理物理隐私幕布窗口，避免后续 `retired.stop_all` join 被控线程时发生主队列等待超时。
+    #[cfg(target_os = "macos")]
+    rc_capture_macos::clear_privacy_curtain();
     let retired = agent
         .lock()
         .unwrap_or_else(|e| e.into_inner())

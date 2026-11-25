@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use rc_capture::CaptureBackend;
 use rc_client_core::platform::{
-    ClientPlatformHooks, DisplayModeSessionGuard, HardwareRendererOutput, PlatformDisplayMode,
-    PreallocatedRenderSurface,
+    ClientPlatformHooks, DisplayModeSessionGuard, HardwareRendererOutput, PlatformDisplayInfo,
+    PlatformDisplayMode, PreallocatedRenderSurface,
 };
 use rc_decode::Decoder;
 use rc_encode::Encoder;
@@ -50,6 +50,8 @@ impl PlatformMediaProvider for MacosMediaProvider {
         {
             let sck = rc_capture_macos::new_backend(rc_capture_macos::SckConfig {
                 display: 0,
+                display_id: cfg.display_id,
+                shows_cursor: cfg.shows_cursor,
                 fps: cfg.fps,
                 resolution: Some(cfg.resolution.to_even()),
                 origin_us: cfg.clock_origin_us,
@@ -251,6 +253,118 @@ impl ClientPlatformHooks for MacosClientPlatformHooks {
         {
             false
         }
+    }
+
+    fn set_privacy_curtain(
+        &self,
+        mode: &str,
+        preset: &str,
+        custom_image_bytes: Option<&[u8]>,
+    ) -> std::result::Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::set_privacy_curtain(mode, preset, custom_image_bytes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (mode, preset, custom_image_bytes);
+            Err("privacy curtain is only supported on macOS".to_string())
+        }
+    }
+
+    fn clear_privacy_curtain(&self) {
+        #[cfg(target_os = "macos")]
+        rc_capture_macos::clear_privacy_curtain();
+    }
+
+    fn set_host_system_muted(&self, muted: bool) -> std::result::Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_audio_macos::set_host_system_muted(muted)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = muted;
+            Err("host system audio mute is only supported on macOS".to_string())
+        }
+    }
+
+    fn restore_host_system_audio(&self) {
+        #[cfg(target_os = "macos")]
+        rc_audio_macos::restore_host_system_audio();
+    }
+
+    fn clear_host_audio_snapshot(&self) {
+        #[cfg(target_os = "macos")]
+        rc_audio_macos::clear_host_audio_snapshot();
+    }
+
+    fn list_displays(&self) -> Vec<PlatformDisplayInfo> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::list_online_displays()
+                .into_iter()
+                .map(|d| PlatformDisplayInfo {
+                    id: d.id,
+                    name: d.name,
+                    width: d.width,
+                    height: d.height,
+                    origin_x: d.origin_x,
+                    origin_y: d.origin_y,
+                    is_main: d.is_main,
+                    is_virtual: d.is_virtual,
+                })
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+
+    fn create_virtual_display(
+        &self,
+        width: u32,
+        height: u32,
+        hidpi: bool,
+    ) -> std::result::Result<PlatformDisplayInfo, String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::create_virtual_display(width, height, hidpi).map(|d| {
+                PlatformDisplayInfo {
+                    id: d.id,
+                    name: d.name,
+                    width: d.width,
+                    height: d.height,
+                    origin_x: d.origin_x,
+                    origin_y: d.origin_y,
+                    is_main: d.is_main,
+                    is_virtual: d.is_virtual,
+                }
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (width, height, hidpi);
+            Err("virtual display is only supported on macOS".to_string())
+        }
+    }
+
+    fn destroy_virtual_display(&self, display_id: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::destroy_virtual_display(display_id)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = display_id;
+            false
+        }
+    }
+
+    fn destroy_all_virtual_displays(&self) {
+        #[cfg(target_os = "macos")]
+        rc_capture_macos::destroy_all_virtual_displays();
     }
 
     fn create_main_display_injector(&self) -> Option<Box<dyn InputInjector>> {

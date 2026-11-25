@@ -74,6 +74,6 @@ pub use bridge::InputBridge;
 #[cfg(target_os = "macos")]
 pub use capture::CgCapture;
 #[cfg(target_os = "macos")]
-pub use ffi::CgPoster;
+pub use ffi::{normalize_shortcut_id, CgPoster, InterceptedShortcutEvent, SystemShortcutTap};
 #[cfg(target_os = "macos")]
 pub use injector::Injector;

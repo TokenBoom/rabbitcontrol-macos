@@ -18,8 +18,10 @@
 // 见模块文档：本模块是 crate 内唯一允许 unsafe 的地方。
 #![allow(unsafe_code)]
 
+pub(crate) mod shortcut_tap;
 pub(crate) mod tap;
 
+pub use shortcut_tap::{normalize_shortcut_id, InterceptedShortcutEvent, SystemShortcutTap};
 pub(crate) use tap::{spawn_tap_thread, TapCtl};
 
 use std::time::Instant;

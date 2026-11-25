@@ -1165,12 +1165,6 @@ pub fn install_dock_menu_handler(
 pub enum StatusBarAction {
     /// 打开或聚焦前台控制端主界面。
     OpenMainGui,
-    /// 复制当前 9 位本机设备码到系统剪贴板。
-    CopyDeviceId,
-    /// 打开主界面并立即检查系统权限。
-    CheckPermissions,
-    /// 切换「允许他人远程协助」开关（载荷为目标状态）。
-    ToggleRemoteAssist(bool),
     /// 执行「整体退出」：写 `manual-stop` 并关闭所有后台/前台组件。
     QuitAll,
 }
@@ -1182,8 +1176,6 @@ pub struct StatusBarDisplay {
     pub device_id: Option<String>,
     /// 信令服务是否在线。
     pub signal_online: bool,
-    /// 「允许远程协助」开关状态。
-    pub remote_assist_enabled: bool,
     /// 当前已连接远端控制端描述。
     pub connected_peer: Option<String>,
     /// 是否缺失必需 macOS 权限。
@@ -1261,9 +1253,44 @@ mod status_bar_macos {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, NSObject};
     use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     const TRAY_ICON_PNG: &[u8] = include_bytes!("../../rc-host-macos/assets/tray-template.png");
+
+    struct AgentAppDelegateIvars {
+        on_reopen: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    define_class!(
+        // SAFETY:
+        // - 父类 `NSObject` 无额外子类化约束；
+        // - `#[thread_kind = MainThreadOnly]` 将对象生命周期与回调严格限定在 macOS 主线程；
+        // - `AgentAppDelegateIvars` 仅含 `Arc` 回调，析构安全。
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = AgentAppDelegateIvars]
+        struct AgentAppDelegate;
+
+        impl AgentAppDelegate {
+            #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+            fn application_should_handle_reopen(
+                &self,
+                _sender: Option<&AnyObject>,
+                _has_visible_windows: bool,
+            ) -> bool {
+                (self.ivars().on_reopen)();
+                false
+            }
+        }
+    );
+
+    impl AgentAppDelegate {
+        fn new(mtm: MainThreadMarker, on_reopen: Arc<dyn Fn() + Send + Sync>) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(AgentAppDelegateIvars { on_reopen });
+            // SAFETY: 已写入 `AgentAppDelegateIvars` 并将初始化委托给父类 `NSObject::init`。
+            unsafe { msg_send![super(this), init] }
+        }
+    }
 
     #[derive(Clone)]
     enum TargetTag {
@@ -1327,6 +1354,9 @@ mod status_bar_macos {
         // MSRV 1.75 尚不支持 `const { ... }` 内联常量语法。
         #[allow(clippy::missing_const_for_thread_local)]
         static INSTALLED_STATUS_BAR: RefCell<Option<InstalledStatusBar>> = RefCell::new(None);
+        #[allow(clippy::missing_const_for_thread_local)]
+        static INSTALLED_AGENT_DELEGATE: RefCell<Option<Retained<AgentAppDelegate>>> = RefCell::new(None);
+        static ACCESSORY_APP_LAUNCHED: Cell<bool> = const { Cell::new(false) };
     }
 
     fn format_device_id_spaced(raw: &str) -> String {
@@ -1430,46 +1460,6 @@ mod status_bar_macos {
                 "打开 RabbitControl 主界面",
                 Some(StatusBarAction::OpenMainGui),
                 false,
-                targets,
-            );
-            if display
-                .device_id
-                .as_ref()
-                .is_some_and(|s| !s.trim().is_empty())
-            {
-                add_action_item(
-                    menu,
-                    item_cls,
-                    mtm,
-                    "复制本机设备码",
-                    Some(StatusBarAction::CopyDeviceId),
-                    false,
-                    targets,
-                );
-            }
-            add_action_item(
-                menu,
-                item_cls,
-                mtm,
-                if display.missing_permissions {
-                    "检查系统权限…（缺失必需权限）"
-                } else {
-                    "检查系统权限…"
-                },
-                Some(StatusBarAction::CheckPermissions),
-                false,
-                targets,
-            );
-
-            add_action_item(
-                menu,
-                item_cls,
-                mtm,
-                "允许他人远程协助",
-                Some(StatusBarAction::ToggleRemoteAssist(
-                    !display.remote_assist_enabled,
-                )),
-                display.remote_assist_enabled,
                 targets,
             );
 
@@ -1622,6 +1612,36 @@ mod status_bar_macos {
         });
     }
 
+    pub(super) fn init_accessory_app(on_reopen: Arc<dyn Fn() + Send + Sync>) -> Result<(), String> {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return Err(
+                "init_accessory_app_with_reopen_handler 必须在 macOS 主线程调用".to_string(),
+            );
+        };
+        // SAFETY: 必须在访问 NSStatusBar 之前把 NSApplication 设为 Accessory（不占 Dock 图标），
+        // 并安装 Reopen Delegate 拦截系统发往同 Bundle 的激活事件转交真正的前台 GUI。
+        unsafe {
+            let app_cls = AnyClass::get(cstr!("NSApplication"))
+                .ok_or_else(|| "找不到 NSApplication 类".to_string())?;
+            let app: *mut AnyObject = msg_send![app_cls, sharedApplication];
+            if app.is_null() {
+                return Err("NSApplication.sharedApplication 为空".to_string());
+            }
+            // NSApplicationActivationPolicyAccessory = 1（仅展示顶部菜单栏，不占 Dock 栏）
+            let _: bool = msg_send![app, setActivationPolicy: 1_isize];
+            let delegate = AgentAppDelegate::new(mtm, on_reopen);
+            let _: () = msg_send![app, setDelegate: &*delegate];
+            INSTALLED_AGENT_DELEGATE.with(|slot| {
+                *slot.borrow_mut() = Some(delegate);
+            });
+            if !ACCESSORY_APP_LAUNCHED.with(Cell::get) {
+                let _: () = msg_send![app, finishLaunching];
+                ACCESSORY_APP_LAUNCHED.with(|flag| flag.set(true));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn run_accessory_event_loop(
         stop_flag: &std::sync::atomic::AtomicBool,
         mut on_tick: impl FnMut(),
@@ -1641,7 +1661,10 @@ mod status_bar_macos {
             }
             // NSApplicationActivationPolicyAccessory = 1（仅展示顶部菜单栏，不占 Dock 栏）
             let _: bool = msg_send![app, setActivationPolicy: 1_isize];
-            let _: () = msg_send![app, finishLaunching];
+            if !ACCESSORY_APP_LAUNCHED.with(Cell::get) {
+                let _: () = msg_send![app, finishLaunching];
+                ACCESSORY_APP_LAUNCHED.with(|flag| flag.set(true));
+            }
 
             let mode = make_ns_string("kCFRunLoopDefaultMode")
                 .ok_or_else(|| "构造 NSDefaultRunLoopMode 失败".to_string())?;
@@ -1673,31 +1696,53 @@ mod status_bar_macos {
         Ok(())
     }
 
-    pub(super) fn copy_text_to_pasteboard(text: &str) -> Result<(), String> {
+    pub(super) fn activate_app_and_unhide() {
         if MainThreadMarker::new().is_none() {
-            return Err("copy_text_to_pasteboard 必须在主线程调用".to_string());
+            return;
         }
-        // SAFETY: 主线程写入系统通用剪贴板 `NSPasteboard.generalPasteboard`。
+        // SAFETY: 主线程取消隐藏并前置当前 macOS 应用，确保隐藏或后台态主窗口立即可见。
         unsafe {
-            let pb_cls = AnyClass::get(cstr!("NSPasteboard"))
-                .ok_or_else(|| "找不到 NSPasteboard 类".to_string())?;
-            let pb: *mut AnyObject = msg_send![pb_cls, generalPasteboard];
-            if pb.is_null() {
-                return Err("NSPasteboard.generalPasteboard 返回空".to_string());
+            let Some(app_cls) = AnyClass::get(cstr!("NSApplication")) else {
+                return;
+            };
+            let app: *mut AnyObject = msg_send![app_cls, sharedApplication];
+            if app.is_null() {
+                return;
             }
-            let _: isize = msg_send![pb, clearContents];
-            let ns_str = make_ns_string(text).ok_or_else(|| "构造剪贴板文本失败".to_string())?;
-            let pb_type = make_ns_string("public.utf8-plain-text")
-                .ok_or_else(|| "构造剪贴板 UTI 类型失败".to_string())?;
-            let ok: bool = msg_send![pb, setString: &*ns_str, forType: &*pb_type];
-            if ok {
-                Ok(())
-            } else {
-                Err("写入系统剪贴板失败".to_string())
-            }
+            let nil: *const AnyObject = std::ptr::null();
+            let _: () = msg_send![app, unhide: nil];
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
         }
     }
 }
+
+/// 在后台 Agent 主线程先将 `NSApplication` 置为无 Dock 图标的 Accessory 模式并安装 Reopen 转发委托。
+///
+/// 必须在调用 [`install_status_bar`] 之前执行，避免 `NSStatusBar` 隐式以 `Foreground` 签到在 Dock 留下空图标。
+#[cfg(target_os = "macos")]
+pub fn init_accessory_app_with_reopen_handler(
+    on_reopen: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    status_bar_macos::init_accessory_app(on_reopen)
+}
+
+/// 非 macOS 平台占位实现。
+#[cfg(not(target_os = "macos"))]
+pub fn init_accessory_app_with_reopen_handler(
+    _on_reopen: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// 在 macOS 主线程取消隐藏并激活当前应用至最前（供显示主窗口时调用）。
+#[cfg(target_os = "macos")]
+pub fn activate_app_and_unhide() {
+    status_bar_macos::activate_app_and_unhide();
+}
+
+/// 非 macOS 平台占位实现。
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app_and_unhide() {}
 
 /// 在 macOS 主线程安装顶部菜单栏 `NSStatusItem` 图标。
 #[cfg(target_os = "macos")]
@@ -1758,18 +1803,6 @@ pub fn run_agent_app_loop(
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     Ok(())
-}
-
-/// 在 macOS 主线程将纯文本写入系统剪贴板。
-#[cfg(target_os = "macos")]
-pub fn copy_text_to_pasteboard(text: &str) -> Result<(), String> {
-    status_bar_macos::copy_text_to_pasteboard(text)
-}
-
-/// 非 macOS 平台剪贴板占位实现。
-#[cfg(not(target_os = "macos"))]
-pub fn copy_text_to_pasteboard(_text: &str) -> Result<(), String> {
-    Err("copy_text_to_pasteboard 仅支持 macOS".to_string())
 }
 
 #[cfg(test)]
