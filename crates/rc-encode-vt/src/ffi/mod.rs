@@ -43,8 +43,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{
-    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFDictionary,
-    CFNumber, CFRetained, CFString,
+    kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFArray,
+    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString,
 };
 use objc2_core_media::{
     kCMBlockBufferAlwaysCopyDataFlag, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
@@ -55,8 +55,9 @@ use objc2_core_media::{
 };
 use objc2_core_video::CVPixelBufferCreate;
 use objc2_core_video::{
-    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth,
+    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
 };
 
 use crate::annexb;
@@ -192,7 +193,6 @@ mod raw {
             Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_RealTime: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_ProfileLevel: Option<&'static CFString>;
-        pub static kVTProfileLevel_H264_Baseline_AutoLevel: Option<&'static CFString>;
         pub static kVTProfileLevel_H264_High_AutoLevel: Option<&'static CFString>;
         pub static kVTProfileLevel_HEVC_Main_AutoLevel: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_AllowFrameReordering: Option<&'static CFString>;
@@ -200,10 +200,14 @@ mod raw {
         pub static kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_MaxFrameDelayCount: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_AverageBitRate: Option<&'static CFString>;
+        pub static kVTCompressionPropertyKey_DataRateLimits: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_ExpectedFrameRate: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality:
             Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_MaximizePowerEfficiency: Option<&'static CFString>;
+        pub static kVTCompressionPropertyKey_ColorPrimaries: Option<&'static CFString>;
+        pub static kVTCompressionPropertyKey_TransferFunction: Option<&'static CFString>;
+        pub static kVTCompressionPropertyKey_YCbCrMatrix: Option<&'static CFString>;
         pub static kVTEncodeFrameOptionKey_ForceKeyFrame: Option<&'static CFString>;
 
         // —— 会话函数 ——
@@ -275,8 +279,6 @@ enum VtKey {
     RealTime,
     /// ProfileLevel。
     ProfileLevel,
-    /// H.264 Baseline AutoLevel 档位值。
-    ProfileLevelH264BaselineAutoLevel,
     /// H.264 High AutoLevel 档位值。
     ProfileLevelH264HighAutoLevel,
     /// HEVC Main AutoLevel 档位值。
@@ -291,12 +293,20 @@ enum VtKey {
     MaxFrameDelayCount,
     /// AverageBitRate。
     AverageBitRate,
+    /// DataRateLimits（1 秒硬峰值码率上限，抑制静/轻载桌面瞬时码率暴涨）。
+    DataRateLimits,
     /// ExpectedFrameRate。
     ExpectedFrameRate,
     /// PrioritizeEncodingSpeedOverQuality（预设微调）。
     PrioritizeEncodingSpeedOverQuality,
     /// MaximizePowerEfficiency（显式关闭省电降频）。
     MaximizePowerEfficiency,
+    /// ColorPrimaries（显式写入 BT.709 VUI）。
+    ColorPrimaries,
+    /// TransferFunction（显式写入 BT.709 VUI）。
+    TransferFunction,
+    /// YCbCrMatrix（显式写入 BT.709 VUI，与 SCK 及 Metal shader 对齐）。
+    YCbCrMatrix,
     /// 帧选项：ForceKeyFrame（按需 IDR）。
     ForceKeyFrame,
 }
@@ -307,7 +317,6 @@ impl VtKey {
         match self {
             VtKey::RealTime => "kVTCompressionPropertyKey_RealTime",
             VtKey::ProfileLevel => "kVTCompressionPropertyKey_ProfileLevel",
-            VtKey::ProfileLevelH264BaselineAutoLevel => "kVTProfileLevel_H264_Baseline_AutoLevel",
             VtKey::ProfileLevelH264HighAutoLevel => "kVTProfileLevel_H264_High_AutoLevel",
             VtKey::ProfileLevelHevcMainAutoLevel => "kVTProfileLevel_HEVC_Main_AutoLevel",
             VtKey::AllowFrameReordering => "kVTCompressionPropertyKey_AllowFrameReordering",
@@ -317,11 +326,15 @@ impl VtKey {
             }
             VtKey::MaxFrameDelayCount => "kVTCompressionPropertyKey_MaxFrameDelayCount",
             VtKey::AverageBitRate => "kVTCompressionPropertyKey_AverageBitRate",
+            VtKey::DataRateLimits => "kVTCompressionPropertyKey_DataRateLimits",
             VtKey::ExpectedFrameRate => "kVTCompressionPropertyKey_ExpectedFrameRate",
             VtKey::PrioritizeEncodingSpeedOverQuality => {
                 "kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality"
             }
             VtKey::MaximizePowerEfficiency => "kVTCompressionPropertyKey_MaximizePowerEfficiency",
+            VtKey::ColorPrimaries => "kVTCompressionPropertyKey_ColorPrimaries",
+            VtKey::TransferFunction => "kVTCompressionPropertyKey_TransferFunction",
+            VtKey::YCbCrMatrix => "kVTCompressionPropertyKey_YCbCrMatrix",
             VtKey::ForceKeyFrame => "kVTEncodeFrameOptionKey_ForceKeyFrame",
         }
     }
@@ -336,9 +349,6 @@ impl VtKey {
             match self {
                 VtKey::RealTime => raw::kVTCompressionPropertyKey_RealTime,
                 VtKey::ProfileLevel => raw::kVTCompressionPropertyKey_ProfileLevel,
-                VtKey::ProfileLevelH264BaselineAutoLevel => {
-                    raw::kVTProfileLevel_H264_Baseline_AutoLevel
-                }
                 VtKey::ProfileLevelH264HighAutoLevel => raw::kVTProfileLevel_H264_High_AutoLevel,
                 VtKey::ProfileLevelHevcMainAutoLevel => raw::kVTProfileLevel_HEVC_Main_AutoLevel,
                 VtKey::AllowFrameReordering => raw::kVTCompressionPropertyKey_AllowFrameReordering,
@@ -348,6 +358,7 @@ impl VtKey {
                 }
                 VtKey::MaxFrameDelayCount => raw::kVTCompressionPropertyKey_MaxFrameDelayCount,
                 VtKey::AverageBitRate => raw::kVTCompressionPropertyKey_AverageBitRate,
+                VtKey::DataRateLimits => raw::kVTCompressionPropertyKey_DataRateLimits,
                 VtKey::ExpectedFrameRate => raw::kVTCompressionPropertyKey_ExpectedFrameRate,
                 VtKey::PrioritizeEncodingSpeedOverQuality => {
                     raw::kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality
@@ -355,6 +366,9 @@ impl VtKey {
                 VtKey::MaximizePowerEfficiency => {
                     raw::kVTCompressionPropertyKey_MaximizePowerEfficiency
                 }
+                VtKey::ColorPrimaries => raw::kVTCompressionPropertyKey_ColorPrimaries,
+                VtKey::TransferFunction => raw::kVTCompressionPropertyKey_TransferFunction,
+                VtKey::YCbCrMatrix => raw::kVTCompressionPropertyKey_YCbCrMatrix,
                 VtKey::ForceKeyFrame => raw::kVTEncodeFrameOptionKey_ForceKeyFrame,
             }
         };
@@ -591,6 +605,8 @@ pub(crate) struct CompressionSession {
     timescale: i32,
     /// 当前会话是否为 HEVC 编码。
     is_hevc: bool,
+    /// 最近一次生效的 `AverageBitRate`（用于决定升码率时先放宽 `DataRateLimits`、降码率时先降 `AverageBitRate`）。
+    last_bitrate_bps: u32,
     /// 非连续 `CMBlockBuffer` 时的可复用提取暂存区（常规连续缓冲走零拷贝切片）。
     extract_scratch: Vec<u8>,
 }
@@ -722,6 +738,7 @@ impl CompressionSession {
             frame_index: 0,
             timescale,
             is_hevc,
+            last_bitrate_bps: params.bitrate_bps,
             extract_scratch: Vec::new(),
         };
 
@@ -768,21 +785,34 @@ impl CompressionSession {
             CFNumber::new_i64(params.bitrate_bps as i64),
             "",
         )?;
+        s.try_set_data_rate_limits(params.bitrate_bps);
         s.set_number(
             VtKey::ExpectedFrameRate,
             CFNumber::new_i32(params.fps as i32),
             "",
         )?;
+        // H.264 统一启用 High Profile（CABAC + 8×8 DCT），相比 Baseline 在同码率下显著提升桌面文本清晰度并降低码率；
+        // HEVC 启用 Main AutoLevel。
         let profile_key = if is_hevc {
             VtKey::ProfileLevelHevcMainAutoLevel
-        } else if u64::from(params.width) * u64::from(params.height) > 2_073_600 || params.fps > 60
-        {
-            VtKey::ProfileLevelH264HighAutoLevel
         } else {
-            VtKey::ProfileLevelH264BaselineAutoLevel
+            VtKey::ProfileLevelH264HighAutoLevel
         };
         let profile = profile_key.get()?;
         s.set_value(VtKey::ProfileLevel, profile, " (ProfileLevel)")?;
+
+        // 显式写入 BT.709 VUI 色彩元数据，与 SCK BT.709 采集及 Metal shader 严格对齐（Optional，失败容忍）。
+        // SAFETY: 读取 CoreVideo 只读静态 CFString 常量。
+        let (cp709, tf709, ym709) = unsafe {
+            (
+                kCVImageBufferColorPrimaries_ITU_R_709_2,
+                kCVImageBufferTransferFunction_ITU_R_709_2,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            )
+        };
+        let _ = s.set_value_status(VtKey::ColorPrimaries, cp709);
+        let _ = s.set_value_status(VtKey::TransferFunction, tf709);
+        let _ = s.set_value_status(VtKey::YCbCrMatrix, ym709);
 
         // 预设微调（速度优先）：不是延迟红线（RealTime 已经保证延迟），
         // 个别编码器可能不支持（头文件标注 Optional），失败容忍。
@@ -856,13 +886,56 @@ impl CompressionSession {
         }
     }
 
+    /// 尽力设置 1 秒硬峰值码率上限（`1.4× AverageBitRate`），抑制稳态低变动桌面瞬时码率暴冲（Optional，不支持时静默忽略）。
+    fn try_set_data_rate_limits(&mut self, bps: u32) {
+        let peak_bytes_per_sec = ((u64::from(bps).saturating_mul(7)) / 40).max(16_384) as i64;
+        let bytes_num = CFNumber::new_i64(peak_bytes_per_sec);
+        let duration_num = CFNumber::new_f64(1.0);
+        let vals = [
+            &*bytes_num as *const CFNumber as *const c_void,
+            &*duration_num as *const CFNumber as *const c_void,
+        ];
+        // SAFETY: vals 为 2 个有效 CFNumber 指针，kCFTypeArrayCallBacks 为标准 CF 回调表。
+        let Some(arr) = (unsafe {
+            CFArray::new(
+                None,
+                vals.as_ptr() as *mut *const c_void,
+                2,
+                &kCFTypeArrayCallBacks,
+            )
+        }) else {
+            return;
+        };
+        let _ = self.set_value_status(VtKey::DataRateLimits, &*arr);
+    }
+
     /// 动态调整目标码率（自适应码率入口）。
+    ///
+    /// 升码率时先放宽 `DataRateLimits` 再抬高 `AverageBitRate`，降码率时先降 `AverageBitRate` 再收紧
+    /// `DataRateLimits`，避免出现瞬态 `AverageBitRate > DataRateLimits` 倒挂。
     pub(crate) fn set_bitrate(&mut self, bps: u32) -> Result<(), String> {
-        self.set_number(
-            VtKey::AverageBitRate,
-            CFNumber::new_i64(bps as i64),
-            " (set_bitrate)",
-        )
+        if bps > self.last_bitrate_bps {
+            self.try_set_data_rate_limits(bps);
+            self.set_number(
+                VtKey::AverageBitRate,
+                CFNumber::new_i64(bps as i64),
+                " (set_bitrate)",
+            )?;
+        } else {
+            self.set_number(
+                VtKey::AverageBitRate,
+                CFNumber::new_i64(bps as i64),
+                " (set_bitrate)",
+            )?;
+            self.try_set_data_rate_limits(bps);
+        }
+        self.last_bitrate_bps = bps;
+        Ok(())
+    }
+
+    /// 异步流水线当前是否仍有空余在途槽位可提交。
+    pub(crate) fn can_submit(&self) -> bool {
+        self.in_flight.len() < self.max_in_flight
     }
 
     /// E3 真机诊断：重试设置 `MaxFrameDelayCount = 0`，返回**原始 OSStatus**。

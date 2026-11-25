@@ -68,15 +68,8 @@ use rc_types::{Error, FrameKind, Result, Timestamp};
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn caps_for(cfg: &EncoderConfig) -> EncoderCaps {
     let profiles: &'static [u8] = match cfg.codec {
-        rc_encode::Codec::Hevc => &[1], // HEVC Main
-        rc_encode::Codec::H264 => {
-            let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
-            if pixels > 2_073_600 || cfg.fps > 60 {
-                &[100] // High Profile
-            } else {
-                &[66] // Baseline Profile
-            }
-        }
+        rc_encode::Codec::Hevc => &[1],   // HEVC Main
+        rc_encode::Codec::H264 => &[100], // H.264 High Profile (CABAC + 8x8 DCT)
         _ => &[],
     };
     let max_resolution = match cfg.codec {
@@ -115,12 +108,223 @@ pub fn new_encoder(config: EncoderConfig) -> Result<VtEncoder> {
     VtEncoder::new(config)
 }
 
-/// VideoToolbox 硬件 H.264 编码器（实现 [`Encoder`](rc_encode::Encoder)）。
+/// 内容自适应码率控制器（纯 Rust，零堆分配）。
+///
+/// 结合 SCK `dirty` 脏区面积占比与真实帧到达间隔（`frame.timestamp`），在用户/网络设定的
+/// `ceiling_bps` 上限内动态调整 VideoToolbox 目标码率：
+/// - 剧烈运动、大面积更新（脏区 ≥ 35%）或关键帧 IDR：**单帧即时拉满**至 `ceiling_bps`，零延迟、零模糊；
+/// - 轻度办公/打字/终端微更新（脏区 < 15%）：经过防抖帧数与冷却窗口后平滑回落至文本清晰度下限，
+///   消除 60fps 局部小动画/光标闪烁浪费 14–30 Mbps 带宽的问题；
+/// - 当调用方未提供脏区（`dirty == None`，如全帧压测/未知脏区平台）时保持 100% `ceiling_bps`，不做误限流。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct ContentAdaptiveRateController {
+    codec: rc_encode::Codec,
+    frame_pixels: u64,
+    ceiling_bps: u32,
+    active_bps: u32,
+    last_frame_ts_us: Option<u32>,
+    low_demand_streak: u32,
+    low_demand_since_ts_us: Option<u32>,
+    last_decay_ts_us: Option<u32>,
+    frames_since_decay: u32,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl ContentAdaptiveRateController {
+    /// 连续低变动帧最小帧数防抖阈值。
+    const DECAY_STREAK_MIN: u32 = 8;
+    /// 连续低变动最小持续时间（250ms，避免 120–380fps 高刷下 20–67ms 的短暂停顿触发误降码率）。
+    const DECAY_HOLD_US: u32 = 250_000;
+    /// 向下衰减最小冷却间隔（200ms，减少动态属性写入频率并平滑过渡）。
+    const DECAY_COOLDOWN_US: u32 = 200_000;
+    /// 当 `Timestamp` 饱和于 `u32::MAX`（>71.6 分钟长会话）时的帧数冷却兜底。
+    const SATURATED_DECAY_COOLDOWN_FRAMES: u32 = 12;
+
+    pub(crate) fn new(cfg: &EncoderConfig) -> Self {
+        let ceiling = cfg.bitrate_bps.max(1);
+        Self {
+            codec: cfg.codec,
+            frame_pixels: u64::from(cfg.resolution.width.max(1))
+                .saturating_mul(u64::from(cfg.resolution.height.max(1))),
+            ceiling_bps: ceiling,
+            active_bps: ceiling,
+            last_frame_ts_us: None,
+            low_demand_streak: 0,
+            low_demand_since_ts_us: None,
+            last_decay_ts_us: None,
+            frames_since_decay: 0,
+        }
+    }
+
+    /// 规划外部更新码率上限后的目标 `active_bps` 与是否需要调用 VideoToolbox `set_bitrate`：
+    /// - 新上限低于当前 `active_bps`：立即钳制到新上限并下发；
+    /// - 当前处于满额态（未衰减）：直接跟随新上限并下发；
+    /// - 当前处于低变动衰减态且新上限 ≥ 当前 `active_bps`（如中继拥塞把 14M 降至 10.5M 时当前已在 2.5M）：
+    ///   绝不向上暴冲码率，仅更新上限待下次大变动时再抬升。
+    pub(crate) fn plan_ceiling_change(&self, ceiling_bps: u32) -> (u32, bool) {
+        let c = ceiling_bps.max(1);
+        let next_active = if c < self.active_bps || self.active_bps == self.ceiling_bps {
+            c
+        } else {
+            self.active_bps
+        };
+        (next_active, next_active != self.active_bps)
+    }
+
+    /// 在 FFI 下发成功（或无需下发）后原子提交新上限与活动码率。
+    pub(crate) fn commit_ceiling_change(&mut self, ceiling_bps: u32, next_active_bps: u32) {
+        let c = ceiling_bps.max(1);
+        let clamped_active = next_active_bps.min(c).max(1);
+        let changed_active = clamped_active != self.active_bps;
+        self.ceiling_bps = c;
+        self.active_bps = clamped_active;
+        if changed_active {
+            self.low_demand_streak = 0;
+            self.low_demand_since_ts_us = None;
+            self.last_decay_ts_us = None;
+            self.frames_since_decay = 0;
+        }
+    }
+
+    /// 保证局部文本锐利度的最低码率底线（永不超过 `ceiling_bps`）。
+    fn crisp_text_floor_bps(&self) -> u32 {
+        let (per_pixel_num, per_pixel_den, min_bps, max_bps) = match self.codec {
+            // HEVC 同画质效率更高：1080p ≈ 1.35 Mbps，2560×1662 ≈ 2.5 Mbps（在 <5% 脏区上等效 >50 Mbps 密度）
+            rc_encode::Codec::Hevc => (65u64, 100u64, 800_000u64, 2_500_000u64),
+            // H.264 High Profile 文本锐利底线：1080p ≈ 2.0 Mbps，2560×1662 ≈ 3.8 Mbps
+            _ => (100u64, 100u64, 1_200_000u64, 3_800_000u64),
+        };
+        let scaled = self
+            .frame_pixels
+            .saturating_mul(per_pixel_num)
+            .saturating_div(per_pixel_den)
+            .clamp(min_bps, max_bps);
+        (scaled as u32).min(self.ceiling_bps).max(1)
+    }
+
+    /// 编码前评估本帧目标码率：仅当需要调整 VideoToolbox `AverageBitRate` 时返回 `Some(next_bps)`。
+    pub(crate) fn on_frame(
+        &mut self,
+        dirty: Option<rc_types::Rect>,
+        frame_ts_us: u32,
+        force_idr: bool,
+    ) -> Option<u32> {
+        let prev_ts = self.last_frame_ts_us;
+        let dt_us = prev_ts
+            .map(|prev| frame_ts_us.wrapping_sub(prev))
+            .unwrap_or(0);
+        let ts_saturated = prev_ts == Some(u32::MAX) && frame_ts_us == u32::MAX;
+        self.last_frame_ts_us = Some(frame_ts_us);
+
+        // 无脏区信息时保守保持 100% ceiling（不误伤全帧压测/未知脏区场景）。
+        let dirty_ratio = match dirty {
+            Some(rect) => {
+                let area = u64::from(rect.width).saturating_mul(u64::from(rect.height));
+                (area as f64 / self.frame_pixels.max(1) as f64).clamp(0.0, 1.0)
+            }
+            None => 1.0,
+        };
+
+        let mut desired_scale: f64 = if force_idr || dirty_ratio >= 0.35 {
+            1.0
+        } else if dirty_ratio >= 0.15 {
+            0.60
+        } else if dirty_ratio >= 0.04 {
+            0.35
+        } else {
+            0.18
+        };
+
+        // 低频稀疏更新（<= 12.5 fps，例如文档阅读/慢速打字）：适当再降一档避免合成 PTS 过量分配码率。
+        if !force_idr && dirty_ratio < 0.35 && (80_000..10_000_000).contains(&dt_us) {
+            desired_scale = (desired_scale * 0.75).max(0.15);
+        }
+
+        let floor = self.crisp_text_floor_bps();
+        let desired_bps = (((f64::from(self.ceiling_bps) * desired_scale).round()) as u32)
+            .clamp(floor, self.ceiling_bps);
+
+        // 1) 即时抬升（1 帧攻击）：大变动/IDR 立即恢复目标码率，避免任何模糊拖影。
+        if force_idr || desired_bps > self.active_bps {
+            self.low_demand_streak = 0;
+            self.low_demand_since_ts_us = None;
+            self.frames_since_decay = 0;
+            if u64::from(desired_bps).saturating_mul(100)
+                >= u64::from(self.active_bps).saturating_mul(112)
+                || (desired_bps == self.ceiling_bps && self.active_bps < self.ceiling_bps)
+            {
+                self.active_bps = desired_bps;
+                self.last_decay_ts_us = Some(frame_ts_us);
+                return Some(self.active_bps);
+            }
+            return None;
+        }
+
+        // 2) 平滑衰减：连续低变动帧达标、持续时间 >= 250ms 且经过冷却窗口后逐步回落。
+        if desired_bps < self.active_bps {
+            if self.low_demand_streak == 0 {
+                self.low_demand_since_ts_us = Some(frame_ts_us);
+            }
+            self.low_demand_streak = self.low_demand_streak.saturating_add(1);
+            self.frames_since_decay = self.frames_since_decay.saturating_add(1);
+            if self.low_demand_streak < Self::DECAY_STREAK_MIN {
+                return None;
+            }
+            let hold_ok = if ts_saturated {
+                self.low_demand_streak >= Self::SATURATED_DECAY_COOLDOWN_FRAMES
+            } else {
+                self.low_demand_since_ts_us.map_or(true, |since| {
+                    frame_ts_us.wrapping_sub(since) >= Self::DECAY_HOLD_US
+                })
+            };
+            if !hold_ok {
+                return None;
+            }
+            let cooldown_ok = if ts_saturated {
+                self.frames_since_decay >= Self::SATURATED_DECAY_COOLDOWN_FRAMES
+            } else {
+                self.last_decay_ts_us.map_or(true, |last| {
+                    frame_ts_us.wrapping_sub(last) >= Self::DECAY_COOLDOWN_US
+                })
+            };
+            if !cooldown_ok {
+                return None;
+            }
+            // 每拍向 desired_bps 靠拢 max(40% 差值, 12% 当前码率)，差值不足 8% 时不再重复写属性，
+            // 保证既不会在距目标 ~30% 处停滞，也不频繁触发 VTSessionSetProperty。
+            let gap = self.active_bps.saturating_sub(desired_bps);
+            let min_gap = ((u64::from(self.active_bps) * 8) / 100).max(1) as u32;
+            if gap < min_gap {
+                return None;
+            }
+            let min_step = ((u64::from(self.active_bps) * 12) / 100).max(1);
+            let step = ((u64::from(gap) * 40) / 100).max(min_step) as u32;
+            let candidate = self.active_bps.saturating_sub(step).max(desired_bps);
+            self.active_bps = candidate;
+            self.last_decay_ts_us = Some(frame_ts_us);
+            self.frames_since_decay = 0;
+            return Some(self.active_bps);
+        } else {
+            self.low_demand_streak = 0;
+            self.low_demand_since_ts_us = None;
+            self.frames_since_decay = 0;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_bps(&self) -> u32 {
+        self.active_bps
+    }
+}
+
+/// VideoToolbox 硬件视频编码器（H.264 High / HEVC Main，实现 [`Encoder`](rc_encode::Encoder)）。
 ///
 /// - 只接受 [`FrameTexture::CVPixelBuffer`](rc_capture::FrameTexture::CVPixelBuffer)
 ///   输入（SCK 零拷贝路径）；CPU 帧请交给软件编码器（对称于
 ///   `FakeEncoder` 只接受 CPU 帧）；
-/// - 会话属性在构造期逐条落死（M6/E1/E2/E3/无限 GOP，见 crate 文档），
+/// - 会话属性在构造期逐条落死（M6/E1/E2/E3/无限 GOP/BT.709 VUI，见 crate 文档），
 ///   并通过 E6 启动自检；
 /// - 关键帧按需产生：`force_idr` / `request_idr` / 首个正式帧；
 ///   无限 GOP 下不自动插关键帧。
@@ -128,6 +332,7 @@ pub fn new_encoder(config: EncoderConfig) -> Result<VtEncoder> {
 pub struct VtEncoder {
     cfg: EncoderConfig,
     session: ffi::CompressionSession,
+    rate_ctrl: ContentAdaptiveRateController,
     /// `request_idr` 置位，下一次成功编码消费。
     idr_requested: bool,
     /// 首个正式帧强制 IDR：E6 自检帧的输出不进管线（被丢弃），解码端
@@ -184,8 +389,7 @@ static E6_VERIFIED_KEYS: OnceLock<Mutex<Vec<E6CacheKey>>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 fn e6_cache_key(cfg: &EncoderConfig) -> E6CacheKey {
-    let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
-    let high_profile = cfg.codec == rc_encode::Codec::H264 && (pixels > 2_073_600 || cfg.fps > 60);
+    let high_profile = cfg.codec == rc_encode::Codec::H264;
     E6CacheKey {
         codec: cfg.codec,
         high_profile,
@@ -235,9 +439,11 @@ impl VtEncoder {
             speed_over_quality,
         })
         .map_err(Error::Encoder)?;
+        let rate_ctrl = ContentAdaptiveRateController::new(&cfg);
         let mut encoder = Self {
             cfg,
             session,
+            rate_ctrl,
             idr_requested: false,
             first_frame_pending: true,
         };
@@ -364,6 +570,12 @@ impl Encoder for VtEncoder {
         }
 
         let force = force_idr || self.idr_requested || self.first_frame_pending;
+        if let Some(next_bps) = self
+            .rate_ctrl
+            .on_frame(frame.dirty, frame.timestamp.0, force)
+        {
+            let _ = self.session.set_bitrate(next_bps);
+        }
         let started = Instant::now();
         let output =
             match self
@@ -419,7 +631,15 @@ impl Encoder for VtEncoder {
                 "rc-encode-vt: bitrate must be > 0".to_string(),
             ));
         }
-        self.session.set_bitrate(bps).map_err(Error::Encoder)
+        let (next_active, need_vt_update) = self.rate_ctrl.plan_ceiling_change(bps);
+        if need_vt_update {
+            self.session
+                .set_bitrate(next_active)
+                .map_err(Error::Encoder)?;
+        }
+        self.cfg.bitrate_bps = bps;
+        self.rate_ctrl.commit_ceiling_change(bps, next_active);
+        Ok(())
     }
 
     fn request_idr(&mut self) {
@@ -448,7 +668,18 @@ impl Encoder for VtEncoder {
         if budget_us == 0 {
             return Err(Error::Timeout(Duration::ZERO));
         }
+        if !self.session.can_submit() {
+            return Err(Error::Encoder(
+                "pipelined in_flight limit reached".to_string(),
+            ));
+        }
         let force = force_idr || self.idr_requested || self.first_frame_pending;
+        if let Some(next_bps) = self
+            .rate_ctrl
+            .on_frame(frame.dirty, frame.timestamp.0, force)
+        {
+            let _ = self.session.set_bitrate(next_bps);
+        }
         self.session
             .submit_encode(
                 token,
@@ -575,9 +806,9 @@ mod tests {
     }
 
     /// caps 声明与实现严格一致：硬件 H.264、Annex-B（输出侧确实做了
-    /// AVCC → Annex-B 重排）、baseline（与会话 ProfileLevel 一致）。
+    /// AVCC → Annex-B 重排）、High Profile（CABAC + 8×8 DCT，与会话 ProfileLevel 一致）。
     #[test]
-    fn caps_declare_hardware_h264_annexb_baseline() {
+    fn caps_declare_hardware_h264_annexb_high() {
         let caps = caps_for(&EncoderConfig::default());
         assert_eq!(caps.codec, Codec::H264);
         assert!(caps.hardware, "VideoToolbox 是硬件编码器");
@@ -586,7 +817,91 @@ mod tests {
             BitstreamFormat::AnnexB,
             "caps 声明什么，解码端就按什么解析——输出侧重排后必须声明 Annex-B"
         );
-        assert_eq!(caps.profiles, &[66], "profile idc 66 = baseline");
+        assert_eq!(caps.profiles, &[100], "profile idc 100 = High Profile");
+    }
+
+    #[test]
+    fn content_adaptive_rate_controller_backs_off_on_small_dirty_and_attacks_instantly() {
+        let cfg = EncoderConfig {
+            codec: Codec::Hevc,
+            resolution: Resolution::new(2560, 1662),
+            fps: 60,
+            bitrate_bps: 14_000_000,
+            ..EncoderConfig::default()
+        };
+        let mut ctrl = ContentAdaptiveRateController::new(&cfg);
+        assert_eq!(ctrl.active_bps(), 14_000_000);
+
+        // 1) 无脏区信息（None）保持 100% ceiling，不误限流全帧压测
+        for i in 0..30u32 {
+            assert_eq!(ctrl.on_frame(None, i * 16_667, false), None);
+        }
+        assert_eq!(ctrl.active_bps(), 14_000_000);
+
+        // 2) 连续小脏区（~2% 屏幕，如终端打字/光标）经过防抖与冷却后平滑回落至文本清晰度底线附近（<= 4 Mbps）
+        let small_dirty = Some(rc_types::Rect::new(0, 0, 360, 240));
+        let mut ts = 500_000u32;
+        for _ in 0..180 {
+            ts = ts.wrapping_add(16_667);
+            let _ = ctrl.on_frame(small_dirty, ts, false);
+        }
+        assert!(
+            ctrl.active_bps() <= 3_500_000 && ctrl.active_bps() >= 2_000_000,
+            "expected smooth backoff near HEVC crisp-text floor, got {}",
+            ctrl.active_bps()
+        );
+
+        // 3) 突然大幅拖动/滚动（脏区 > 35%）：单帧即时拉满至 14 Mbps
+        ts = ts.wrapping_add(16_667);
+        let full_dirty = Some(rc_types::Rect::new(0, 0, 2000, 1400));
+        assert_eq!(ctrl.on_frame(full_dirty, ts, false), Some(14_000_000));
+        assert_eq!(ctrl.active_bps(), 14_000_000);
+
+        // 4) 衰减后外部拥塞下调上限（14M -> 10.5M）绝不把已衰减的 2.5M 暴冲回 10.5M
+        for _ in 0..180 {
+            ts = ts.wrapping_add(16_667);
+            let _ = ctrl.on_frame(small_dirty, ts, false);
+        }
+        let decayed = ctrl.active_bps();
+        assert!(decayed <= 3_500_000);
+        let (planned, need_vt) = ctrl.plan_ceiling_change(10_500_000);
+        assert_eq!(planned, decayed);
+        assert!(!need_vt);
+        ctrl.commit_ceiling_change(10_500_000, planned);
+        assert_eq!(ctrl.active_bps(), decayed);
+
+        // 5) 外部上限压到比当前 active_bps 还低（1.5M）时立即钳制并下发
+        let (clamped, need_vt_clamp) = ctrl.plan_ceiling_change(1_500_000);
+        assert_eq!(clamped, 1_500_000);
+        assert!(need_vt_clamp);
+        ctrl.commit_ceiling_change(1_500_000, clamped);
+        assert_eq!(ctrl.active_bps(), 1_500_000);
+
+        // 6) 高刷 240fps 下 10 帧（41.7ms < 250ms hold）短暂停顿不得误触发衰减
+        let hi_fps_cfg = EncoderConfig {
+            codec: Codec::Hevc,
+            resolution: Resolution::new(2464, 1600),
+            fps: 240,
+            bitrate_bps: 14_000_000,
+            ..EncoderConfig::default()
+        };
+        let mut hi_ctrl = ContentAdaptiveRateController::new(&hi_fps_cfg);
+        let mut hts = 0u32;
+        for _ in 0..10 {
+            hts = hts.wrapping_add(4_167);
+            assert_eq!(hi_ctrl.on_frame(small_dirty, hts, false), None);
+        }
+        assert_eq!(hi_ctrl.active_bps(), 14_000_000);
+
+        // 7) u32::MAX 时间戳饱和长会话下仍可通过帧数冷却兜底正常衰减
+        for _ in 0..80 {
+            let _ = hi_ctrl.on_frame(small_dirty, u32::MAX, false);
+        }
+        assert!(
+            hi_ctrl.active_bps() <= 3_500_000,
+            "expected saturated-ts fallback decay, got {}",
+            hi_ctrl.active_bps()
+        );
     }
 
     /// 与 FakeEncoder 的 trait 一致性对照：两条管线的码流形态一致

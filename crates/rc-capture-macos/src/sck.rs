@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rc_capture::{CaptureBackend, CapturedFrame, DisplayInfo, FrameTexture, InvalidationReason};
-use rc_types::{CaptureSeq, DisplayId, Error, Resolution, Result, Timestamp};
+use rc_types::{CaptureSeq, DisplayId, Error, Rect, Resolution, Result, Timestamp};
 
 use crate::ffi::{self, FrameEvent, FrameMailbox, FramePayload, StreamHandles};
 
@@ -285,10 +285,15 @@ impl CaptureBackend for SckBackend {
                 let FramePayload {
                     buffer,
                     pts_us,
+                    dirty_ratio,
                     callback_us,
                 } = payload;
                 #[cfg(not(feature = "bench-metrics"))]
-                let FramePayload { buffer, pts_us } = payload;
+                let FramePayload {
+                    buffer,
+                    pts_us,
+                    dirty_ratio,
+                } = payload;
 
                 // C2：优先使用调用方注入的会话时钟原点（与管线同域同零点）；
                 // 未注入时以本流首帧 PTS 为原点。SCK 的 PTS 单调递增。
@@ -336,12 +341,14 @@ impl CaptureBackend for SckBackend {
                         mailbox_overwrites,
                     });
                 }
-                // macOS SCK 无脏区 API：dirty = None，上层用 TileDiff（见 T12
-                // 参考实现表）。SCK 也不会重复交同一帧：is_repeat 恒 false。
+                // 将 SCStreamFrameInfoDirtyRects 面积占比映射为等面积 Rect 供编码器内容自适应码控消费；
+                // 无法解析或接近全屏（>= 99.5%）时返回 None（按全帧处理）。SCK 不会重复交同一帧：is_repeat 恒 false。
+                let dirty =
+                    dirty_ratio.and_then(|r| dirty_ratio_to_rect(r, self.display.resolution));
                 Ok(Some(CapturedFrame {
                     texture,
                     timestamp,
-                    dirty: None,
+                    dirty,
                     seq: self.seq,
                     is_repeat: false,
                     resource_guard: Some(Arc::new(buffer)),
@@ -410,6 +417,20 @@ fn validate_config(config: &SckConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 将脏区面积占比（`0.0..=1.0`）换算为等面积 `Rect`（裁剪在输出分辨率内）。
+///
+/// 占比无效或 `>= 0.995` 时返回 `None`（按全帧变化处理）；极小正占比至少返回 `1×1`。
+pub(crate) fn dirty_ratio_to_rect(ratio: f32, res: Resolution) -> Option<Rect> {
+    if !ratio.is_finite() || ratio <= 0.0 || ratio >= 0.995 || res.width == 0 || res.height == 0 {
+        return None;
+    }
+    let scale = f64::from(ratio.clamp(0.0, 1.0)).sqrt();
+    let w = ((f64::from(res.width) * scale).round() as u32).clamp(1, res.width);
+    let target_area = f64::from(res.width) * f64::from(res.height) * f64::from(ratio);
+    let h = ((target_area / f64::from(w)).round() as u32).clamp(1, res.height);
+    Some(Rect::new(0, 0, w, h))
 }
 
 /// 决定 SCK 实际请求的输出分辨率：显式配置优先（向下取偶），否则按 M9 逻辑分辨率下采样。
@@ -727,5 +748,18 @@ mod tests {
         };
         assert_eq!(skewed.pts_to_callback_us(), 0);
         assert_eq!(skewed.mailbox_wait_us(), 0);
+    }
+
+    #[test]
+    fn dirty_ratio_to_rect_preserves_area_and_bounds() {
+        let res = Resolution::new(2560, 1662);
+        let r = dirty_ratio_to_rect(0.04, res).expect("4% dirty rect");
+        let area_ratio = (f64::from(r.width) * f64::from(r.height))
+            / (f64::from(res.width) * f64::from(res.height));
+        assert!((area_ratio - 0.04).abs() < 0.002, "got {area_ratio}");
+        assert!(r.width <= res.width && r.height <= res.height);
+        assert_eq!(dirty_ratio_to_rect(0.0, res), None);
+        assert_eq!(dirty_ratio_to_rect(1.0, res), None);
+        assert_eq!(dirty_ratio_to_rect(f32::NAN, res), None);
     }
 }

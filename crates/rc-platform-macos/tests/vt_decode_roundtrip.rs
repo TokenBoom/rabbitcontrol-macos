@@ -142,6 +142,91 @@ mod test_support {
         result
     }
 
+    /// 模拟真实办公/终端高对比文本桌面：静态深色 IDE 背景 + 局部区域高速滚动高熵终端字符（每帧变化），
+    /// 返回完整密集 Y 平面供解码后 Y-PSNR 校验。
+    pub(crate) fn write_nv12_office_terminal(
+        buffer: &TestPixelBuffer,
+        frame: u32,
+        active_rect: rc_types::Rect,
+    ) -> Result<Vec<u8>, String> {
+        let width = CVPixelBufferGetWidth(&buffer.0) as u32;
+        let height = CVPixelBufferGetHeight(&buffer.0) as u32;
+        // SAFETY: Lock/Unlock 成对。
+        let lock =
+            unsafe { CVPixelBufferLockBaseAddress(&buffer.0, CVPixelBufferLockFlags::empty()) };
+        if lock != 0 {
+            return Err(format!(
+                "CVPixelBufferLockBaseAddress 失败: CVReturn {lock}"
+            ));
+        }
+        let result = (|| {
+            let base = CVPixelBufferGetBaseAddressOfPlane(&buffer.0, 0);
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer.0, 0);
+            if base.is_null() || stride < width as usize {
+                return Err("Y 平面基址为空或行距小于宽度".to_string());
+            }
+            let mut dense = vec![0u8; (width as usize) * (height as usize)];
+            let rx0 = active_rect.x as usize;
+            let ry0 = active_rect.y as usize;
+            let rx1 = (active_rect.x.saturating_add(active_rect.width)).min(width) as usize;
+            let ry1 = (active_rect.y.saturating_add(active_rect.height)).min(height) as usize;
+            // SAFETY: 锁存期间 base 指向 stride * height 字节合法可写 Y 平面。
+            unsafe {
+                let plane =
+                    std::slice::from_raw_parts_mut(base as *mut u8, stride * height as usize);
+                for y in 0..height as usize {
+                    let row = &mut plane[y * stride..y * stride + width as usize];
+                    let drow = &mut dense[y * width as usize..(y + 1) * width as usize];
+                    let in_y = y >= ry0 && y < ry1;
+                    for x in 0..width as usize {
+                        let v = if in_y && x >= rx0 && x < rx1 {
+                            // 局部高熵滚动终端文本/日志（2×2 笔画密度，抗平滑预测但符合真实代码/日志流）
+                            let gx = (x - rx0) / 2;
+                            let gy = (y - ry0) / 2;
+                            let cell_hash = (gx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                ^ (gy.wrapping_add((frame as usize) * 5) as u64)
+                                    .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                                ^ (frame as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+                            if (cell_hash >> 61) == 0 {
+                                225u8
+                            } else {
+                                26u8
+                            }
+                        } else {
+                            // 静态深色 IDE 边框与只读代码区
+                            let text_row = ((y / 22) & 1) == 0 && (y % 22) >= 5 && (y % 22) <= 13;
+                            if text_row && ((x / 9) % 5 != 0) && ((x & 1) == 0) {
+                                200u8
+                            } else {
+                                32u8
+                            }
+                        };
+                        row[x] = v;
+                        drow[x] = v;
+                    }
+                }
+            }
+            let chroma_base = CVPixelBufferGetBaseAddressOfPlane(&buffer.0, 1);
+            let chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer.0, 1);
+            if !chroma_base.is_null() && chroma_stride > 0 {
+                // SAFETY: 锁存期间 CbCr 平面可写。
+                unsafe {
+                    let plane = std::slice::from_raw_parts_mut(
+                        chroma_base as *mut u8,
+                        chroma_stride * (height as usize / 2).max(1),
+                    );
+                    for row in plane.chunks_mut(chroma_stride) {
+                        row.fill(128);
+                    }
+                }
+            }
+            Ok(dense)
+        })();
+        // SAFETY: 与上面的 Lock 配对。
+        unsafe { CVPixelBufferUnlockBaseAddress(&buffer.0, CVPixelBufferLockFlags::empty()) };
+        result
+    }
+
     /// 一次性 CPU 回读指定像素缓冲的 Y 平面（**仅测试**，D1 红线不适用于此）。
     /// 返回 `(width, height, 密集 Y 平面)`。
     pub(crate) fn read_luma_plane(ptr: *mut c_void) -> Result<(u32, u32, Vec<u8>), String> {
@@ -495,4 +580,108 @@ fn hevc_encode_decode_roundtrip_1080p_and_4k() {
             assert!(p50 <= 3.0, "HEVC 1080p 解码 P50={p50:.2}ms > 3ms");
         }
     }
+}
+
+/// 真机 A/B 实测：2560×1662 HiDPI HEVC 轻度办公桌面（每帧仅 ~2% 局部区域变动），
+/// 对比关闭脏区感知（dirty=None）与开启内容自适应码控（dirty=2%）的实际码率与解码 Y-PSNR。
+#[test]
+#[ignore = "requires macOS + 真实 VideoToolbox 编解码器（内容自适应码控与文本清晰度 A/B 实测）"]
+fn desktop_office_adaptive_bitrate_saves_bandwidth_with_high_psnr() {
+    let width = 2560u32;
+    let height = 1662u32;
+    let fps = 60u32;
+    let ceiling_bps = 14_000_000u32;
+    let total_frames = 150u32; // 2.5s @ 60fps（前 1.5s 含 250ms 防抖与平滑衰减，后 1.0s 测稳态码率）
+    let active_rect = rc_types::Rect::new(120, 120, 640, 260); // ~3.9% of 2560x1662 (终端输出区)
+
+    let run_case = |label: &str, dirty: Option<rc_types::Rect>| -> (f64, f64, f64) {
+        let enc_cfg = rc_encode::EncoderConfig {
+            codec: rc_encode::Codec::Hevc,
+            resolution: rc_types::Resolution::new(width, height),
+            fps,
+            bitrate_bps: ceiling_bps,
+            preset: rc_encode::Preset::Balanced,
+            ..rc_encode::EncoderConfig::default()
+        };
+        let mut encoder = rc_encode_vt::new_encoder(enc_cfg).expect("构造 HEVC 编码器");
+        let mut decoder = VtDecoder::new(VtDecoderConfig {
+            codec: rc_encode::Codec::Hevc,
+            max_resolution: rc_types::Resolution::new(4096, 4096),
+            ..VtDecoderConfig::default()
+        })
+        .expect("构造 HEVC 解码器");
+
+        let buffer = test_support::make_pixel_buffer(width, height).expect("创建像素缓冲");
+        let mut total_bytes_tail = 0usize; // 统计后 60 帧稳态码率（1.0s）
+        let mut enc_ms = Vec::with_capacity(total_frames as usize);
+        let mut last_ptr = std::ptr::null_mut();
+
+        for i in 0..total_frames {
+            let ref_luma = test_support::write_nv12_office_terminal(&buffer, i, active_rect)
+                .expect("写入办公终端图案");
+            let ts = Timestamp(i * (1_000_000 / fps));
+            let frame = CapturedFrame {
+                texture: FrameTexture::CVPixelBuffer(buffer.as_opaque_ptr()),
+                timestamp: ts,
+                dirty,
+                seq: CaptureSeq(u64::from(i)),
+                is_repeat: false,
+                resource_guard: None,
+            };
+            let t0 = Instant::now();
+            let out = encoder
+                .encode(&frame, false, Timestamp(ts.0.saturating_add(50_000)))
+                .unwrap_or_else(|e| panic!("{label} 第 {i} 帧编码失败: {e}"));
+            enc_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            if i >= 90 {
+                total_bytes_tail += out.data.len();
+            }
+            if let DecodeOutput::Frame(f) = decoder
+                .decode(&out.data, out.kind, RELAXED_DEADLINE)
+                .unwrap_or_else(|e| panic!("{label} 第 {i} 帧解码失败: {e}"))
+            {
+                if let FrameTexture::CVPixelBuffer(ptr) = f.texture {
+                    last_ptr = ptr;
+                }
+            }
+            if i + 1 == total_frames {
+                let (w, h, dec_luma) =
+                    test_support::read_luma_plane(last_ptr).expect("回读解码 Y 平面");
+                assert_eq!((w, h), (width, height));
+                let mse = dec_luma
+                    .iter()
+                    .zip(&ref_luma)
+                    .map(|(a, b)| {
+                        let d = i32::from(*a) - i32::from(*b);
+                        (d * d) as f64
+                    })
+                    .sum::<f64>()
+                    / dec_luma.len() as f64;
+                let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                enc_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = enc_ms[enc_ms.len() / 2];
+                let mbps = (total_bytes_tail as f64 * 8.0) / 1e6;
+                eprintln!(
+                    "[{label}] 2560x1662@60 HEVC: tail_bitrate={mbps:.2} Mbps, enc_P50={p50:.2} ms, Y-PSNR={psnr:.2} dB"
+                );
+                return (mbps, p50, psnr);
+            }
+        }
+        unreachable!()
+    };
+
+    let (base_mbps, base_p50, base_psnr) = run_case("baseline_flat_14m", None);
+    let (adapt_mbps, adapt_p50, adapt_psnr) = run_case("adaptive_dirty_4pct", Some(active_rect));
+    let saving_pct = (1.0 - adapt_mbps / base_mbps.max(0.01)) * 100.0;
+    eprintln!(
+        "=== 2K HEVC 办公终端场景 A/B：码率 {base_mbps:.2} -> {adapt_mbps:.2} Mbps (-{saving_pct:.1}%) | 编码 P50 {base_p50:.2} -> {adapt_p50:.2} ms | Y-PSNR {base_psnr:.2} -> {adapt_psnr:.2} dB ==="
+    );
+    assert!(
+        adapt_mbps < base_mbps * 0.45,
+        "期望自适应码控降低至少 55% 码率，实际 {base_mbps:.2} -> {adapt_mbps:.2} Mbps"
+    );
+    assert!(
+        adapt_psnr >= 32.0,
+        "期望自适应码控下高熵局部文本整体 Y-PSNR >= 32 dB，实际 {adapt_psnr:.2} dB"
+    );
 }

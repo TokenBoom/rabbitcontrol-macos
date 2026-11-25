@@ -681,6 +681,7 @@ fn run_single_scenario(
             fps,
             resolution: Some(res),
             origin_us: Some(origin_us),
+            ..SckConfig::default()
         },
         true,
     )

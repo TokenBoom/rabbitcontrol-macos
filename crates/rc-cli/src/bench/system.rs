@@ -456,6 +456,7 @@ pub(super) fn measure_cold_start_ttff(
                 fps: 60,
                 resolution: Some(res),
                 origin_us: Some(origin_us),
+                ..SckConfig::default()
             },
             true,
         )

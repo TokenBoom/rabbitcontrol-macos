@@ -34,6 +34,7 @@ macro_rules! cstr {
     }};
 }
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,7 @@ mod raw {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         pub static kCGDisplayShowDuplicateLowResolutionModes: Option<&'static CFString>;
+        pub static kCGDisplayStreamYCbCrMatrix_ITU_R_709_2: Option<&'static CFString>;
 
         pub fn CGPreflightScreenCaptureAccess() -> bool;
         pub fn CGRequestScreenCaptureAccess() -> bool;
@@ -332,6 +334,25 @@ fn mode_metrics(mode: *const c_void) -> Option<(u32, u32, u32, u32, u32, bool)> 
     };
     let is_hidpi = pw > w;
     Some((w, h, pw, ph, refresh_hz, is_hidpi))
+}
+
+/// 查询指定显示器的真实物理像素分辨率（backing pixels，优先读取 `CGDisplayCopyDisplayMode`）。
+fn display_backing_resolution(display_id: u32) -> Option<Resolution> {
+    // SAFETY: 纯只读查询当前显示模式，返回 +1 所有权 CF 对象或 null，交由 CfOwned 自动释放。
+    let mode = CfOwned::from_raw(unsafe { raw::CGDisplayCopyDisplayMode(display_id) })?;
+    // SAFETY: mode 为有效 CGDisplayModeRef。
+    let (pw, ph) = unsafe {
+        (
+            raw::CGDisplayModeGetPixelWidth(mode.as_ptr()),
+            raw::CGDisplayModeGetPixelHeight(mode.as_ptr()),
+        )
+    };
+    let w = u32::try_from(pw).ok()?;
+    let h = u32::try_from(ph).ok()?;
+    if w < 2 || h < 2 {
+        return None;
+    }
+    Some(Resolution::new(w, h).to_even())
 }
 
 /// 枚举主显示器可用桌面显示模式（960..=3840 × 600..=2160，去重偏好 HiDPI 与高刷）。
@@ -841,6 +862,8 @@ pub(crate) struct FramePayload<B = PixelBufferHandle> {
     pub(crate) buffer: B,
     /// CMSampleBuffer 的 presentation timestamp，微秒（契约 C2 的原始来源）。
     pub(crate) pts_us: u64,
+    /// 本帧 `SCStreamFrameInfoDirtyRects` 累计脏区面积占比（`0.0..=1.0`，无法解析时为 `None` 按全帧处理）。
+    pub(crate) dirty_ratio: Option<f32>,
     /// 帧回调入口采样时刻（微秒，与 PTS 同域；仅 `bench-metrics` 启用）。
     #[cfg(feature = "bench-metrics")]
     pub(crate) callback_us: u64,
@@ -910,11 +933,18 @@ impl<B> FrameMailbox<B> {
         )))
     }
 
-    /// 投递最新视频帧：直接覆写 `latest_frame`、在锁外立即 Drop 旧帧并唤醒等待者。
-    pub(crate) fn push_frame(&self, frame: FramePayload<B>) {
+    /// 投递最新视频帧：合并被覆写旧帧的脏区占比（防止大场景切换帧被后续微小闪烁帧覆盖导致漏升码率），
+    /// 随后直接覆写 `latest_frame`、在锁外立即 Drop 旧帧并唤醒等待者。
+    pub(crate) fn push_frame(&self, mut frame: FramePayload<B>) {
         let (lock, cvar) = &*self.0;
         let displaced = {
             let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = inner.latest_frame.as_ref() {
+                frame.dirty_ratio = match (prev.dirty_ratio, frame.dirty_ratio) {
+                    (Some(a), Some(b)) => Some((a + b).min(1.0)),
+                    _ => None,
+                };
+            }
             let old = inner.latest_frame.replace(frame);
             #[cfg(feature = "bench-metrics")]
             if old.is_some() {
@@ -1141,11 +1171,21 @@ fn rect_has_positive_area(rect: CGRect) -> bool {
         && rect.size.height > 0.0
 }
 
-/// 检查样本附件字典中的 `SCStreamFrameInfoDirtyRects` 是否表明有真实画面变动：
-/// - `None`：附件缺失或不是数组（无法证明无变化，调用方应保守放行）；
-/// - `Some(false)`：附件存在且为空数组，或全部矩形面积均为 0（静态微扰动，可跳过）；
-/// - `Some(true)`：至少存在一个正面积脏区（或存在无法解析的元素），必须放行。
-fn dirty_rects_from_dict(dict: &CFDictionary) -> Option<bool> {
+/// `SCStreamFrameInfoDirtyRects` 汇总结果（零堆分配）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DirtyRectStats {
+    /// 至少存在一个正面积脏区（或存在无法解析的元素需要保守放行）。
+    has_change: bool,
+    /// 所有可解析正面积脏区的累计面积（若存在无法解析元素则为 `None`，保守按全帧处理）。
+    total_area: Option<f64>,
+    /// 所有可解析正面积脏区的最大右/下边界（用于自动识别脏区坐标是输出像素还是 Retina backing 像素）。
+    max_extent: (f64, f64),
+}
+
+/// 从样本附件字典解析 `SCStreamFrameInfoDirtyRects` 统计信息：
+/// - `None`：附件缺失或不是数组（无法证明无变化，调用方保守放行并按全帧处理）；
+/// - `Some(stats)`：`stats.has_change == false` 表示空数组或全零面积（静屏微扰动，可跳过）。
+fn dirty_rect_stats_from_dict(dict: &CFDictionary) -> Option<DirtyRectStats> {
     // SAFETY: SCStreamFrameInfoDirtyRects 是 ScreenCaptureKit 导出的 &'static NSString，
     // NSString 与 CFString toll-free bridged，指针可直接作为 CFDictionary 的键。
     let key: *const c_void = unsafe { std::ptr::addr_of!(*SCStreamFrameInfoDirtyRects) }.cast();
@@ -1157,24 +1197,110 @@ fn dirty_rects_from_dict(dict: &CFDictionary) -> Option<bool> {
     let rects: &CFArray = unsafe { value_ptr.cast::<CFType>().as_ref() }.downcast_ref()?;
     let count = rects.count();
     if count <= 0 {
-        return Some(false);
+        return Some(DirtyRectStats {
+            has_change: false,
+            total_area: Some(0.0),
+            max_extent: (0.0, 0.0),
+        });
     }
+    let mut total_area = 0.0f64;
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = 0.0f64;
+    let mut max_y = 0.0f64;
+    let mut has_change = false;
+    let mut has_unknown = false;
     for i in 0..count {
         // SAFETY: `0 <= i < count`，元素指针在 `rects` 存活期内有效。
         let raw_elem = unsafe { rects.value_at_index(i) };
         let Some(elem_ptr) = NonNull::new(raw_elem.cast_mut()) else {
-            // 空元素无法判定零面积，保守放行。
-            return Some(true);
+            has_change = true;
+            has_unknown = true;
+            continue;
         };
         let Some(rect) = decode_dirty_rect_element(elem_ptr) else {
-            // 未知格式元素无法判定零面积，保守放行（绝不误丢真实帧）。
-            return Some(true);
+            has_change = true;
+            has_unknown = true;
+            continue;
         };
+        if !rect.origin.x.is_finite() || !rect.origin.y.is_finite() {
+            has_change = true;
+            has_unknown = true;
+            continue;
+        }
         if rect_has_positive_area(rect) {
-            return Some(true);
+            has_change = true;
+            let x0 = rect.origin.x.max(0.0);
+            let y0 = rect.origin.y.max(0.0);
+            let x1 = (rect.origin.x + rect.size.width).max(0.0);
+            let y1 = (rect.origin.y + rect.size.height).max(0.0);
+            if x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0 {
+                total_area += (x1 - x0) * (y1 - y0);
+                min_x = min_x.min(x0);
+                min_y = min_y.min(y0);
+                max_x = max_x.max(x1);
+                max_y = max_y.max(y1);
+            }
         }
     }
-    Some(false)
+    if min_x.is_finite() && min_y.is_finite() && max_x > min_x && max_y > min_y {
+        let union_bbox_area = (max_x - min_x) * (max_y - min_y);
+        if union_bbox_area.is_finite() {
+            total_area = total_area.min(union_bbox_area);
+        }
+    }
+    Some(DirtyRectStats {
+        has_change,
+        total_area: (!has_unknown).then_some(total_area),
+        max_extent: (max_x, max_y),
+    })
+}
+
+/// 将 `DirtyRectStats` 换算为当前输出画幅上的脏区面积占比（`0.0..=1.0`）。
+///
+/// 通过流级锁存标志 `dirty_in_backing_space` 记住本流是否以 Retina 物理像素坐标上报脏区
+/// （一旦首帧或任意帧观测到 `max_extent` 超出输出尺寸即锁存为 `true`），消除左上象限 4× 高估与中线抖动；
+/// 若分母不可用或存在未知元素，返回 `None`（保守按全帧处理）。
+fn compute_dirty_ratio(
+    stats: Option<DirtyRectStats>,
+    output_res: Resolution,
+    backing_res: Resolution,
+    dirty_in_backing_space: &AtomicBool,
+) -> Option<f32> {
+    let stats = stats?;
+    let area = stats.total_area?;
+    if !area.is_finite() || area <= 0.0 {
+        return None;
+    }
+    let out_w = f64::from(output_res.width.max(1));
+    let out_h = f64::from(output_res.height.max(1));
+    let back_w = f64::from(backing_res.width.max(output_res.width).max(1));
+    let back_h = f64::from(backing_res.height.max(output_res.height).max(1));
+    let has_larger_backing = back_w > out_w || back_h > out_h;
+    if has_larger_backing
+        && (stats.max_extent.0 > out_w * 1.05 || stats.max_extent.1 > out_h * 1.05)
+    {
+        dirty_in_backing_space.store(true, Ordering::Relaxed);
+    }
+    let in_backing_space = has_larger_backing && dirty_in_backing_space.load(Ordering::Relaxed);
+    let denom = if in_backing_space {
+        back_w * back_h
+    } else {
+        out_w * out_h
+    };
+    if denom <= 0.0 {
+        return None;
+    }
+    Some((area / denom).clamp(0.0, 1.0) as f32)
+}
+
+/// 检查样本附件字典中的 `SCStreamFrameInfoDirtyRects` 是否表明有真实画面变动：
+/// - `None`：附件缺失或不是数组（无法证明无变化，调用方应保守放行）；
+/// - `Some(false)`：附件存在且为空数组，或全部矩形面积均为 0（静态微扰动，可跳过）；
+/// - `Some(true)`：至少存在一个正面积脏区（或存在无法解析的元素），必须放行。
+#[cfg_attr(not(test), allow(dead_code))]
+fn dirty_rects_from_dict(dict: &CFDictionary) -> Option<bool> {
+    dirty_rect_stats_from_dict(dict).map(|s| s.has_change)
 }
 
 /// 读取 `CMSampleBuffer` 的 `SCStreamFrameInfoDirtyRects` 判定是否应放行（仅非空/缺失时放行）。
@@ -1307,13 +1433,16 @@ fn nserror_message(err: &NSError) -> String {
 
 struct HandlerIvars {
     mailbox: FrameMailbox,
+    output_res: Resolution,
+    backing_res: Resolution,
+    dirty_in_backing_space: AtomicBool,
 }
 
 define_class!(
     // SAFETY:
     // - 超类 NSObject 没有子类化要求。
     // - 本类不实现 Drop。
-    // - ivars（FrameMailbox）只在构造线程写入，在 SCStream 的串行 sample handler
+    // - ivars（FrameMailbox 与不可变分辨率）只在构造线程写入，在 SCStream 的串行 sample handler
     //   queue 与 delegate queue 上通过内部 Mutex + Condvar 并发访问；
     //   FrameMailbox 本身是 Send + Sync。
     #[unsafe(super(NSObject))]
@@ -1338,29 +1467,27 @@ define_class!(
             if r#type != SCStreamOutputType::Screen {
                 return;
             }
-            let Some((status, has_dirty_change)) =
-                with_sample_attachment_dict(sample_buffer, |dict| {
-                    let status = frame_status_from_dict(dict)?;
-                    let has_dirty = match status {
-                        SCFrameStatus::Complete => {
-                            let dirty = dirty_rects_from_dict(dict).unwrap_or(true);
-                            #[cfg(feature = "bench-metrics")]
-                            if bench_debug_enabled() {
-                                log_dirty_rects_debug(dict, dirty);
-                            }
-                            dirty
+            let Some((status, dirty_stats)) = with_sample_attachment_dict(sample_buffer, |dict| {
+                let status = frame_status_from_dict(dict)?;
+                let stats = match status {
+                    SCFrameStatus::Complete => {
+                        let s = dirty_rect_stats_from_dict(dict);
+                        #[cfg(feature = "bench-metrics")]
+                        if bench_debug_enabled() {
+                            log_dirty_rects_debug(dict, s.map_or(true, |st| st.has_change));
                         }
-                        _ => true,
-                    };
-                    Some((status, has_dirty))
-                })
-                .flatten()
-            else {
+                        s
+                    }
+                    _ => None,
+                };
+                Some((status, stats))
+            })
+            .flatten() else {
                 return;
             };
             match status {
                 SCFrameStatus::Complete => {
-                    if !has_dirty_change {
+                    if dirty_stats.is_some_and(|s| !s.has_change) {
                         // SCStreamFrameInfoDirtyRects 存在且为空 / 零面积：
                         // 静屏微扰动，不接触像素直接按 Idle 跳过（契约 C1）。
                         return;
@@ -1381,11 +1508,19 @@ define_class!(
             let Some(buffer) = image_buffer(sample_buffer) else {
                 return;
             };
+            let ivars = self.ivars();
+            let dirty_ratio = compute_dirty_ratio(
+                dirty_stats,
+                ivars.output_res,
+                ivars.backing_res,
+                &ivars.dirty_in_backing_space,
+            );
             // 最新帧优先：直接覆写单槽，被覆盖的旧 CVPixelBuffer 立刻 Drop 归还 SCK 池，
             // 绝不阻塞回调队列。
-            self.ivars().mailbox.push_frame(FramePayload {
+            ivars.mailbox.push_frame(FramePayload {
                 buffer,
                 pts_us: pts,
+                dirty_ratio,
                 #[cfg(feature = "bench-metrics")]
                 callback_us,
             });
@@ -1408,8 +1543,17 @@ define_class!(
 
 // 构造方法放在 define_class! 之外：纯 Rust 辅助函数，不暴露给 ObjC。
 impl RcSckStreamHandler {
-    fn new(mailbox: FrameMailbox) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(HandlerIvars { mailbox });
+    fn new(
+        mailbox: FrameMailbox,
+        output_res: Resolution,
+        backing_res: Resolution,
+    ) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(HandlerIvars {
+            mailbox,
+            output_res,
+            backing_res,
+            dirty_in_backing_space: AtomicBool::new(false),
+        });
         // SAFETY: this 是 alloc 出来的本类实例，调用超类 init 完成 NSObject
         // 初始化并移交所有权（返回 +1 的 Retained）。
         unsafe { msg_send![super(this), init] }
@@ -1588,9 +1732,15 @@ fn make_configuration(
     // SAFETY: new 是无参构造。
     let config = unsafe { SCStreamConfiguration::new() };
     // M5：'420v'（NV12 video range）—— VideoToolbox 的原生输入，零拷贝直达
-    // 编码器，无需 CPU 色彩转换。
-    // SAFETY: 纯属性 setter。
-    unsafe { config.setPixelFormat(PIXEL_FORMAT_420V) };
+    // 编码器，无需 CPU 色彩转换；显式指定 BT.709 矩阵，与渲染端 Metal shader
+    // (`fs_nv12_video` BT.709) 及 VideoToolbox BT.709 VUI 严格对齐，消除默认 BT.601 色偏与发灰。
+    // SAFETY: 纯属性 setter，kCGDisplayStreamYCbCrMatrix_ITU_R_709_2 为 CoreGraphics 静态 CFString 常量。
+    unsafe {
+        config.setPixelFormat(PIXEL_FORMAT_420V);
+        if let Some(bt709) = raw::kCGDisplayStreamYCbCrMatrix_ITU_R_709_2 {
+            config.setColorMatrix(bt709);
+        }
+    }
     // M7：默认关闭光标（远端由输入层单独绘制光标）；当控制端选择「使用被控端鼠标」时开启。
     // SAFETY: 纯属性 setter。
     unsafe { config.setShowsCursor(shows_cursor) };
@@ -1732,7 +1882,8 @@ pub(crate) fn build_stream_with_options(
     };
     let config = make_configuration(target, fps, shows_cursor);
     let mailbox = FrameMailbox::new();
-    let handler = RcSckStreamHandler::new(mailbox.clone());
+    let real_backing = display_backing_resolution(display.display_id).unwrap_or(display.backing);
+    let handler = RcSckStreamHandler::new(mailbox.clone(), target, real_backing);
 
     // SAFETY: initWithFilter:configuration:delegate: 标准构造。delegate 参数是
     // unretained 的 —— StreamHandles 持有 handler 强引用且比 stream 活得久
@@ -2123,6 +2274,7 @@ mod tests {
                     dropped: Arc::clone(&dropped),
                 },
                 pts_us,
+                dirty_ratio: Some(0.25),
                 #[cfg(feature = "bench-metrics")]
                 callback_us: pts_us + 50,
             });
@@ -2169,6 +2321,7 @@ mod tests {
                     dropped: dropped_clone,
                 },
                 pts_us: 400,
+                dirty_ratio: None,
                 #[cfg(feature = "bench-metrics")]
                 callback_us: 450,
             });
@@ -2199,6 +2352,7 @@ mod tests {
         mailbox.push_frame(FramePayload {
             buffer: 1,
             pts_us: 100,
+            dirty_ratio: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 110,
         });
@@ -2206,12 +2360,14 @@ mod tests {
         mailbox.push_frame(FramePayload {
             buffer: 2,
             pts_us: 200,
+            dirty_ratio: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 210,
         });
         mailbox.push_frame(FramePayload {
             buffer: 3,
             pts_us: 300,
+            dirty_ratio: Some(0.1),
             #[cfg(feature = "bench-metrics")]
             callback_us: 310,
         });
@@ -2242,6 +2398,7 @@ mod tests {
         mailbox.push_frame(FramePayload {
             buffer: 4,
             pts_us: 400,
+            dirty_ratio: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 410,
         });
@@ -2258,6 +2415,106 @@ mod tests {
             _ => panic!("应取出剩余最新视频帧 4"),
         }
         assert!(mailbox.recv_timeout(Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn compute_dirty_ratio_handles_output_and_backing_coordinates() {
+        let out = Resolution::new(1512, 982);
+        let backing = Resolution::new(3024, 1964);
+        let latched = AtomicBool::new(false);
+        // 1) 输出像素空间下 151x98 ≈ 1% 脏区（未锁存 backing 前按输出尺寸）
+        let small = compute_dirty_ratio(
+            Some(DirtyRectStats {
+                has_change: true,
+                total_area: Some(151.0 * 98.0),
+                max_extent: (200.0, 200.0),
+            }),
+            out,
+            backing,
+            &latched,
+        )
+        .expect("small ratio");
+        assert!((small - 0.01).abs() < 0.002, "expected ~1%, got {small}");
+        assert!(!latched.load(Ordering::Relaxed));
+
+        // 2) 首帧或大帧出现 Retina backing 坐标（超出输出宽高）自动锁存 backing 坐标系
+        let back_half = compute_dirty_ratio(
+            Some(DirtyRectStats {
+                has_change: true,
+                total_area: Some(1512.0 * 1964.0),
+                max_extent: (3024.0, 1964.0),
+            }),
+            out,
+            backing,
+            &latched,
+        )
+        .expect("backing half ratio");
+        assert!(
+            (back_half - 0.5).abs() < 0.01,
+            "expected ~50%, got {back_half}"
+        );
+        assert!(latched.load(Ordering::Relaxed));
+
+        // 3) 锁存后，即便后续局部脏区位于左上象限（max_extent <= out），仍稳定使用 backing 分母（无 4x 误判）
+        let top_left_after_latch = compute_dirty_ratio(
+            Some(DirtyRectStats {
+                has_change: true,
+                total_area: Some(1200.0 * 600.0),
+                max_extent: (1400.0, 800.0),
+            }),
+            out,
+            backing,
+            &latched,
+        )
+        .expect("top-left ratio after latch");
+        assert!(
+            (top_left_after_latch - 0.1212).abs() < 0.01,
+            "expected ~12.1% after latch, got {top_left_after_latch}"
+        );
+
+        // 4) 缺失或无法解析元素返回 None（保守按全帧处理）
+        assert_eq!(compute_dirty_ratio(None, out, backing, &latched), None);
+        assert_eq!(
+            compute_dirty_ratio(
+                Some(DirtyRectStats {
+                    has_change: true,
+                    total_area: None,
+                    max_extent: (0.0, 0.0),
+                }),
+                out,
+                backing,
+                &latched,
+            ),
+            None
+        );
+
+        // 5) FrameMailbox 覆写旧帧时合并脏区占比（防止大场景切换帧被后续小闪烁帧覆盖）
+        let mb = FrameMailbox::<u64>::new();
+        mb.push_frame(FramePayload {
+            buffer: 1,
+            pts_us: 100,
+            dirty_ratio: Some(0.90),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 100,
+        });
+        mb.push_frame(FramePayload {
+            buffer: 2,
+            pts_us: 200,
+            dirty_ratio: Some(0.02),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 200,
+        });
+        match mb.recv_timeout(Duration::from_millis(20)) {
+            Some(FrameEvent::Frame(p)) => {
+                assert_eq!(p.buffer, 2);
+                assert!(
+                    p.dirty_ratio.is_some_and(|r| r >= 0.91),
+                    "expected accumulated dirty_ratio >= 0.91, got {:?}",
+                    p.dirty_ratio
+                );
+            }
+            _ => panic!("expected frame 2"),
+        }
     }
 
     // PTS 节拍过滤（should_emit_pts）已被整段删除：真机实测 SCK 60fps 内容的

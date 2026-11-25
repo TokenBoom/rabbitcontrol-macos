@@ -391,6 +391,7 @@ fn run_single_scenario(
         clock_origin_us: Some(0),
         async_decode: true,
         max_packet_payload: rc_net::quic::max_media_payload(rc_net::quic::DEFAULT_MTU),
+        ..PipelineConfig::default()
     };
 
     let enc = rc_encode_vt::new_encoder(rc_pipeline::default_encoder_config(&pcfg))
