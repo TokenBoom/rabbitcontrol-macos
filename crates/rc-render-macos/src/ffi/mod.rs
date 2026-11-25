@@ -20,10 +20,16 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+#[cfg(feature = "bench-metrics")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "bench-metrics")]
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
+#[cfg(feature = "bench-metrics")]
+use objc2_core_foundation::CFTimeInterval;
 use objc2_core_foundation::{CFRetained, CGSize};
 use objc2_core_video::{
     kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -40,6 +46,8 @@ use objc2_metal::{
     MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLSize,
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
+#[cfg(feature = "bench-metrics")]
+use objc2_quartz_core::CACurrentMediaTime;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use rc_render::cursor::{CursorRect, CursorShape};
 
@@ -57,6 +65,43 @@ type MetalDrawable = Retained<ProtocolObject<dyn CAMetalDrawable>>;
 
 /// 命令缓冲完成回调的 block 类型（释放本帧源引用）。
 type PresentDoneBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>;
+
+/// Drawable 扫描上屏回调的 block 类型（仅 `bench-metrics`）。
+#[cfg(feature = "bench-metrics")]
+type DrawablePresentedBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLDrawable>>)>;
+
+/// 读取与 `MTLDrawable::presentedTime()` / SCK PTS 同域的当前主机时钟（微秒，仅 `bench-metrics`）。
+#[cfg(feature = "bench-metrics")]
+pub(crate) fn media_time_us() -> u64 {
+    cf_time_to_us(CACurrentMediaTime())
+}
+
+#[cfg(feature = "bench-metrics")]
+fn cf_time_to_us(sec: CFTimeInterval) -> u64 {
+    if sec.is_finite() && sec > 0.0 {
+        (sec * 1_000_000.0).round() as u64
+    } else {
+        0
+    }
+}
+
+/// 单帧 Metal GPU 真实扫描上屏样本（由 `MTLDrawable::addPresentedHandler` 回调产出，仅 `bench-metrics`）。
+#[cfg(feature = "bench-metrics")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PresentTimingSample {
+    /// 调用方在 `present` 前通过 `set_next_frame_tag` 关联的帧标识。
+    pub frame_tag: u64,
+    /// 调用 `presentDrawable` 前的主机微秒时钟。
+    pub submit_us: u64,
+    /// `MTLDrawable::presentedTime()` 换算为主机微秒时钟（若被跳过则为 `0`）。
+    pub presented_us: u64,
+    /// `MTLDrawable::drawableID()` 单调序号。
+    pub drawable_id: u64,
+}
+
+/// 真实上屏回调接收器（仅 `bench-metrics`）。
+#[cfg(feature = "bench-metrics")]
+pub type PresentTimingSink = Arc<dyn Fn(PresentTimingSample) + Send + Sync>;
 
 /// 呈现一帧所需的 GPU 纹理（由 [`GpuContext::wrap_buffer`] 产出）。
 ///
@@ -79,16 +124,28 @@ pub(crate) enum FrameSource {
     },
 }
 
-/// 必须活到 GPU 用完源纹理的引用集合。
+/// 必须活到 GPU 用完源纹理的引用集合（零堆分配内联持有）。
 ///
 /// CoreVideo 要求 `CVMetalTexture` 包装在 MTLTexture 使用期间保持存活；
 /// `CVPixelBuffer`（IOSurface 的持有者）同理。两者随命令缓冲的完成回调
 /// 一并释放（见 [`GpuContext::draw_and_present`]）。
-pub(crate) struct FrameKeepAlive {
-    /// present 期间对源像素缓冲的 +1 retain。
-    _buffer: CFRetained<CVPixelBuffer>,
-    /// CVMetalTexture 包装（plane 0 / plane 1）。
-    _cv_textures: Vec<CFRetained<CVMetalTexture>>,
+pub(crate) enum FrameKeepAlive {
+    /// 单平面 BGRA：持有源 `CVPixelBuffer` 与 plane 0 纹理包装。
+    Bgra {
+        /// present 期间对源像素缓冲的 +1 retain。
+        _buffer: CFRetained<CVPixelBuffer>,
+        /// plane 0 的 `CVMetalTexture` 包装。
+        _plane0: CFRetained<CVMetalTexture>,
+    },
+    /// 双平面 NV12：持有源 `CVPixelBuffer` 与 luma/chroma 两枚纹理包装。
+    Nv12 {
+        /// present 期间对源像素缓冲的 +1 retain。
+        _buffer: CFRetained<CVPixelBuffer>,
+        /// luma（plane 0）的 `CVMetalTexture` 包装。
+        _luma: CFRetained<CVMetalTexture>,
+        /// chroma（plane 1）的 `CVMetalTexture` 包装。
+        _chroma: CFRetained<CVMetalTexture>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,10 +269,21 @@ pub(crate) struct GpuContext {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     cache: CFRetained<CVMetalTextureCache>,
     pipelines: Pipelines,
+    /// 预配置的渲染通道描述符，热路径只更新 target texture 与 loadAction，避免每帧分配对象。
+    render_pass: Retained<MTLRenderPassDescriptor>,
     /// D7 形状缓存：当前光标纹理（同 id 不重传）。放在这里（而非渲染器）
     /// 是为了搭 [`GpuContext`] 既有的 Send 声明便车——光标纹理只在本
     /// 上下文内存活，不单独穿越线程边界。
     cursor_plane: Option<CursorPlane>,
+    /// 是否已注册真实上屏回调（无回调时热路径跳过 `Mutex` 加锁，仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    has_present_sink: AtomicBool,
+    /// 真实上屏回调接收器（仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    present_sink: Arc<Mutex<Option<PresentTimingSink>>>,
+    /// 下一次 `draw_present_commit` 关联的帧 tag（仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    next_frame_tag: Arc<AtomicU64>,
 }
 
 // SAFETY: 这组对象随 MetalRenderer 一起被移动（Send = 跨线程移交所有权）。
@@ -277,8 +345,11 @@ impl GpuContext {
         let cache =
             unsafe { CFRetained::from_raw(NonNull::new(cache_out).ok_or("cache 出参为空")?) };
 
-        // layer 配置：BGRA8 后备缓冲、物理像素 drawableSize、3 个 drawable、
+        // layer 配置：BGRA8 后备缓冲、物理像素 drawableSize、2 个 drawable（双缓冲实测锁定 120Hz 高帧率并将 Hitch 减半，同时压低合成器队列深度）、
         // framebufferOnly=true（drawable 只作渲染目标，性能更优）、
+        // opaque=true（免除合成器与桌面背景的整窗 alpha 混合）、
+        // allowsNextDrawableTimeout=true（遮挡/最小化时保证 D6 可恢复返回 None 而非死锁）、
+        // presentsWithTransaction=false（禁止隐式 CATransaction 同步阻塞）、
         // displaySyncEnabled（D2：false = Present(0) 等价，不等 vblank）。
         // 这些 setter 在绑定层是安全方法（纯属性赋值）。
         layer.setDevice(Some(&device));
@@ -287,11 +358,28 @@ impl GpuContext {
             width: size.0 as f64,
             height: size.1 as f64,
         });
-        layer.setMaximumDrawableCount(3);
+        layer.setMaximumDrawableCount(2);
         layer.setFramebufferOnly(true);
+        layer.setOpaque(true);
+        layer.setAllowsNextDrawableTimeout(true);
+        layer.setPresentsWithTransaction(false);
         layer.setDisplaySyncEnabled(vsync);
 
         let pipelines = build_pipelines(&device)?;
+
+        // 预建渲染通道描述符：视频全屏 quad 覆盖整个 drawable 时用 DontCare，
+        // 若启用 letterbox/pillarbox 则用 Clear + 黑色清屏（由热路径按需切换 loadAction）。
+        let render_pass = MTLRenderPassDescriptor::new();
+        // SAFETY: 索引 0 在 colorAttachments 有效范围内（系统固定 4 个槽位）。
+        let att = unsafe { render_pass.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setLoadAction(MTLLoadAction::DontCare);
+        att.setStoreAction(MTLStoreAction::Store);
+        att.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        });
 
         Ok(GpuContext {
             device,
@@ -299,8 +387,30 @@ impl GpuContext {
             queue,
             cache,
             pipelines,
+            render_pass,
             cursor_plane: None,
+            #[cfg(feature = "bench-metrics")]
+            has_present_sink: AtomicBool::new(false),
+            #[cfg(feature = "bench-metrics")]
+            present_sink: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "bench-metrics")]
+            next_frame_tag: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// 注册真实扫描上屏回调（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    pub(crate) fn set_present_timing_sink(&self, sink: Option<PresentTimingSink>) {
+        self.has_present_sink
+            .store(sink.is_some(), Ordering::Release);
+        let mut guard = self.present_sink.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = sink;
+    }
+
+    /// 设置下一次 `present` 关联的帧 tag（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    pub(crate) fn set_next_frame_tag(&self, tag: u64) {
+        self.next_frame_tag.store(tag, Ordering::Relaxed);
     }
 
     /// 当前 drawable 尺寸（物理像素，`drawableSize` 的单位）。
@@ -327,6 +437,17 @@ impl GpuContext {
     /// 读回 layer 的 `displaySyncEnabled`（测试用真值断言）。
     pub(crate) fn display_sync_enabled(&self) -> bool {
         self.layer.displaySyncEnabled()
+    }
+
+    /// 读回 layer 配置快照 `(maximumDrawableCount, allowsNextDrawableTimeout, presentsWithTransaction, isOpaque)`（测试用）。
+    #[cfg(test)]
+    pub(crate) fn layer_low_latency_flags(&self) -> (usize, bool, bool, bool) {
+        (
+            self.layer.maximumDrawableCount(),
+            self.layer.allowsNextDrawableTimeout(),
+            self.layer.presentsWithTransaction(),
+            self.layer.isOpaque(),
+        )
     }
 
     /// 取一个 drawable（可能阻塞：池空时等 CoreAnimation 回收）。
@@ -456,26 +577,19 @@ impl GpuContext {
         }
         let fmt = CVPixelBufferGetPixelFormatType(&buffer);
 
-        let mut keep = FrameKeepAlive {
-            _buffer: buffer,
-            _cv_textures: Vec::new(),
-        };
-
         match fmt {
             FMT_BGRA => {
-                let (tex, cv) = self.cache_texture(
-                    &keep._buffer,
-                    MTLPixelFormat::BGRA8Unorm,
-                    actual.0,
-                    actual.1,
-                    0,
-                )?;
-                keep._cv_textures.push(cv);
+                let (tex, cv) =
+                    self.cache_texture(&buffer, MTLPixelFormat::BGRA8Unorm, actual.0, actual.1, 0)?;
+                let keep = FrameKeepAlive::Bgra {
+                    _buffer: buffer,
+                    _plane0: cv,
+                };
                 Ok((FrameSource::Bgra { texture: tex }, keep))
             }
             FMT_420V | FMT_420F => {
                 // 双平面校验：'420x' 必须是 2 平面 planar 缓冲。
-                let planes = CVPixelBufferGetPlaneCount(&keep._buffer);
+                let planes = CVPixelBufferGetPlaneCount(&buffer);
                 if planes < 2 {
                     return Err(format!(
                         "NV12 缓冲平面数异常: {} (期望 >= 2), fourcc='{}'",
@@ -486,19 +600,17 @@ impl GpuContext {
                 // luma = plane 0（原尺寸，R8Unorm）；chroma = plane 1（半宽半高，
                 // RG8Unorm）—— 平面尺寸按 CoreVideo 上报取，不用 w/2 推算
                 // （奇数分辨率时两者不同）。
-                let cw = CVPixelBufferGetWidthOfPlane(&keep._buffer, 1) as u32;
-                let ch = CVPixelBufferGetHeightOfPlane(&keep._buffer, 1) as u32;
-                let (luma_tex, luma_cv) = self.cache_texture(
-                    &keep._buffer,
-                    MTLPixelFormat::R8Unorm,
-                    actual.0,
-                    actual.1,
-                    0,
-                )?;
+                let cw = CVPixelBufferGetWidthOfPlane(&buffer, 1) as u32;
+                let ch = CVPixelBufferGetHeightOfPlane(&buffer, 1) as u32;
+                let (luma_tex, luma_cv) =
+                    self.cache_texture(&buffer, MTLPixelFormat::R8Unorm, actual.0, actual.1, 0)?;
                 let (chroma_tex, chroma_cv) =
-                    self.cache_texture(&keep._buffer, MTLPixelFormat::RG8Unorm, cw, ch, 1)?;
-                keep._cv_textures.push(luma_cv);
-                keep._cv_textures.push(chroma_cv);
+                    self.cache_texture(&buffer, MTLPixelFormat::RG8Unorm, cw, ch, 1)?;
+                let keep = FrameKeepAlive::Nv12 {
+                    _buffer: buffer,
+                    _luma: luma_cv,
+                    _chroma: chroma_cv,
+                };
                 Ok((
                     FrameSource::Nv12 {
                         luma: luma_tex,
@@ -570,17 +682,19 @@ impl GpuContext {
     /// 失败（nextDrawable 为空等 device-lost 类）以 `Err(String)` 上抛，
     /// 由 `renderer.rs` 映射为可恢复错误（D6）。
     pub(crate) fn draw_and_present(
-        &self,
+        &mut self,
         source: FrameSource,
         keep: FrameKeepAlive,
         overlay: Option<CursorDraw>,
     ) -> Result<(), String> {
-        // 离屏 layer 也能取 drawable；为空通常是层不可见 / 尺寸为 0 /
-        // 设备异常 —— 对应 Windows 侧「窗口最小化时 Present 失败」的可恢复路径。
-        let drawable = self.next_drawable().ok_or_else(|| {
-            "nextDrawable 返回空（层不可见 / drawableSize 为 0 / 设备异常）".to_string()
-        })?;
-        self.draw_present_commit(&drawable, source, keep, overlay)
+        autoreleasepool(|_| {
+            // 离屏 layer 也能取 drawable；为空通常是层不可见 / 尺寸为 0 /
+            // 设备异常 —— 对应 Windows 侧「窗口最小化时 Present 失败」的可恢复路径。
+            let drawable = self.next_drawable().ok_or_else(|| {
+                "nextDrawable 返回空（层不可见 / drawableSize 为 0 / 设备异常）".to_string()
+            })?;
+            self.draw_present_commit(&drawable, source, keep, overlay)
+        })
     }
 
     /// present 调用本体（drawable 已由调用方取得）：编码一次全屏绘制 +
@@ -597,61 +711,91 @@ impl GpuContext {
     /// 失败（编码器拿不到等 device-lost 类）以 `Err(String)` 上抛，
     /// 由 `renderer.rs` 映射为可恢复错误（D6）。
     pub(crate) fn draw_present_commit(
-        &self,
+        &mut self,
         drawable: &MetalDrawable,
         source: FrameSource,
         keep: FrameKeepAlive,
         overlay: Option<CursorDraw>,
     ) -> Result<(), String> {
-        // 渲染通道：以 drawable 纹理为目标，清屏后画视频 quad + 光标叠加。
-        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
-        // SAFETY: 索引 0 在 colorAttachments 有效范围内（系统固定 4 个槽位）。
-        let att = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-        att.setTexture(Some(&*drawable.texture()));
-        att.setLoadAction(MTLLoadAction::Clear);
-        att.setStoreAction(MTLStoreAction::Store);
-        att.setClearColor(MTLClearColor {
-            red: 0.0,
-            green: 0.0,
-            blue: 0.0,
-            alpha: 1.0,
-        });
+        autoreleasepool(|_| {
+            // 渲染通道：视频 quad 完整覆盖 drawable（[-1, 1]² 且不透明），直接用
+            // MTLLoadAction::DontCare 避免 Apple Silicon TBDR 冗余 tile 清屏；
+            // 若未来引入 letterbox/pillarbox 露出黑边，则切回 MTLLoadAction::Clear。
+            // SAFETY: 索引 0 在 colorAttachments 有效范围内（系统固定 4 个槽位）。
+            let att = unsafe {
+                self.render_pass
+                    .colorAttachments()
+                    .objectAtIndexedSubscript(0)
+            };
+            att.setTexture(Some(&*drawable.texture()));
+            att.setLoadAction(load_action_for_video_quad(true));
 
-        let cmd = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| "commandBuffer 创建失败（设备异常）".to_string())?;
-        let enc = cmd
-            .renderCommandEncoderWithDescriptor(&pass)
-            .ok_or_else(|| "renderCommandEncoder 创建失败（设备异常）".to_string())?;
+            let cmd = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| "commandBuffer 创建失败（设备异常）".to_string())?;
+            let enc_opt = cmd.renderCommandEncoderWithDescriptor(&self.render_pass);
+            // 编码器已拷贝通道描述符，立即清除 descriptor 对本帧 drawable 纹理的强引用，
+            // 防止跨帧滞留导致 drawable 池卡死。
+            att.setTexture(None);
+            let enc =
+                enc_opt.ok_or_else(|| "renderCommandEncoder 创建失败（设备异常）".to_string())?;
 
-        self.encode_frame(&enc, &source, &overlay);
-        // endEncoding 是绑定层安全方法。
-        enc.endEncoding();
+            self.encode_frame(&enc, &source, &overlay);
+            // endEncoding 是绑定层安全方法。
+            enc.endEncoding();
 
-        // present 绑定在命令缓冲上：GPU 执行完编码内容后立刻上屏；
-        // displaySyncEnabled=false（D2）时不等待 vblank（等价 Present(0)）。
-        // CAMetalDrawable: MTLDrawable 协议继承，as_ref 做协议对象上转。
-        let drawable_ref: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
-        cmd.presentDrawable(drawable_ref);
+            // present 绑定在命令缓冲上：GPU 执行完编码内容后立刻上屏；
+            // displaySyncEnabled=false（D2）时不等待 vblank（等价 Present(0)）。
+            // CAMetalDrawable: MTLDrawable 协议继承，as_ref 做协议对象上转。
+            let drawable_ref: &ProtocolObject<dyn MTLDrawable> = drawable.as_ref();
+            #[cfg(feature = "bench-metrics")]
+            if self.has_present_sink.load(Ordering::Acquire) {
+                let sink_opt = self
+                    .present_sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(sink) = sink_opt {
+                    let frame_tag = self.next_frame_tag.load(Ordering::Relaxed);
+                    let submit_us = media_time_us();
+                    let block: DrawablePresentedBlock =
+                        RcBlock::new(move |presented: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                            // SAFETY: Metal 保证回调期间 `presented` 指向有效的存活 MTLDrawable。
+                            let d = unsafe { presented.as_ref() };
+                            let presented_us = cf_time_to_us(d.presentedTime());
+                            let drawable_id = d.drawableID() as u64;
+                            sink(PresentTimingSample {
+                                frame_tag,
+                                submit_us,
+                                presented_us,
+                                drawable_id,
+                            });
+                        });
+                    // SAFETY: `block` 为刚创建的有效 RcBlock，Metal 内部按 ObjC 约定拷贝保留至上屏完成。
+                    unsafe { drawable_ref.addPresentedHandler(NonNull::from(&*block).as_ptr()) };
+                }
+            }
+            cmd.presentDrawable(drawable_ref);
 
-        // 完成回调：释放 keep（CVPixelBuffer retain + CVMetalTexture 包装）、
-        // source（MTLTexture 强引用）与 overlay（光标纹理引用）——
-        // CoreVideo 要求包装活到 GPU 用完。
-        // block 签名要求 Fn（不能 move-out 捕获值），经 RefCell<Option> 释放。
-        let release = std::cell::RefCell::new(Some((source, keep, overlay)));
-        let block: PresentDoneBlock =
-            RcBlock::new(move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                // 完成回调恰好触发一次；take 后即释放全部引用。
-                drop(release.borrow_mut().take());
-            });
-        // SAFETY: block 是刚创建的合法 RcBlock，指针在调用期间有效；Metal 按
-        // ObjC 约定拷贝 handler block，随后 RcBlock 的释放不影响回调。
-        unsafe { cmd.addCompletedHandler(NonNull::from(&*block).as_ptr()) };
+            // 完成回调：释放 keep（CVPixelBuffer retain + CVMetalTexture 包装）、
+            // source（MTLTexture 强引用）与 overlay（光标纹理引用）——
+            // CoreVideo 要求包装活到 GPU 用完。
+            // block 签名要求 Fn（不能 move-out 捕获值），经 Cell<Option> 零开销转移所有权。
+            let release = std::cell::Cell::new(Some((source, keep, overlay)));
+            let block: PresentDoneBlock =
+                RcBlock::new(move |_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    // 完成回调恰好触发一次；take 后即释放全部引用。
+                    drop(release.take());
+                });
+            // SAFETY: block 是刚创建的合法 RcBlock，指针在调用期间有效；Metal 按
+            // ObjC 约定拷贝 handler block，随后 RcBlock 的释放不影响回调。
+            unsafe { cmd.addCompletedHandler(NonNull::from(&*block).as_ptr()) };
 
-        // commit 立即返回（不等待 GPU）；present 返回后由 renderer.rs 打点（D8）。
-        cmd.commit();
-        Ok(())
+            // commit 立即返回（不等待 GPU）；present 返回后由 renderer.rs 打点（D8）。
+            cmd.commit();
+            Ok(())
+        })
     }
 
     /// 编码一帧的绘制序列：视频全屏 quad → 可选光标本地叠加（D7）。
@@ -715,6 +859,40 @@ impl GpuContext {
                 enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4)
             };
         }
+    }
+}
+
+/// 根据视频 quad 是否完整覆盖整个 drawable 选择通道 `MTLLoadAction`：
+/// - 完整覆盖且不透明时返回 `DontCare`，免去 Apple Silicon TBDR 冗余 tile 清屏；
+/// - 若存在 letterbox / pillarbox 黑边暴露区域则返回 `Clear`。
+pub(crate) fn load_action_for_video_quad(covers_full_drawable: bool) -> MTLLoadAction {
+    if covers_full_drawable {
+        MTLLoadAction::DontCare
+    } else {
+        MTLLoadAction::Clear
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_action_skips_clear_only_when_quad_covers_full_drawable() {
+        assert_eq!(load_action_for_video_quad(true), MTLLoadAction::DontCare);
+        assert_eq!(load_action_for_video_quad(false), MTLLoadAction::Clear);
+    }
+
+    #[test]
+    fn cametal_layer_properties_configured_for_low_latency() {
+        let gpu = GpuContext::new_offscreen((128, 128), false).expect("需要可用 Metal 设备");
+        assert_eq!(
+            gpu.layer_low_latency_flags(),
+            (2, true, false, true),
+            "应配置 maximumDrawableCount=2, allowsNextDrawableTimeout=true, \
+             presentsWithTransaction=false, isOpaque=true"
+        );
+        assert!(!gpu.display_sync_enabled());
     }
 }
 
@@ -1090,6 +1268,311 @@ pub mod window_bench {
         pub fn leak(self) {
             std::mem::forget(self);
         }
+
+        /// 设置窗口是否忽略鼠标事件（基准接收端小窗开启透传，避免拦截注入点击）。
+        #[cfg(feature = "bench-metrics")]
+        pub fn set_ignores_mouse_events(&self, ignores: bool) {
+            self._window.setIgnoresMouseEvents(ignores);
+        }
+
+        /// 设置窗口是否接收 `MouseMoved` 事件（探针窗开启后用于 `B1/B2/B3` 本地监控）。
+        #[cfg(feature = "bench-metrics")]
+        pub fn set_accepts_mouse_moved(&self, accepts: bool) {
+            self._window.setAcceptsMouseMovedEvents(accepts);
+        }
+
+        /// 设置窗口层级（用于盖住系统菜单栏时钟与确保小号接收窗不被探针窗遮挡）。
+        #[cfg(feature = "bench-metrics")]
+        pub fn set_level(&self, level: isize) {
+            self._window.setLevel(level);
+        }
+
+        /// 将探针窗设为 key window 并置前显示。
+        #[cfg(feature = "bench-metrics")]
+        pub fn make_key_and_order_front(&self) {
+            self._window.makeKeyAndOrderFront(None);
+        }
+    }
+
+    /// 创建指定逻辑坐标与尺寸的无边框窗口，挂载 `CAMetalLayer`（`bench-metrics` 接收端呈现场用）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn window_with_metal_layer_at(
+        mtm: MainThreadMarker,
+        origin: (f64, f64),
+        size: (u32, u32),
+    ) -> Result<BenchWindow, String> {
+        let content_rect = CGRect::new(
+            CGPoint::new(origin.0, origin.1),
+            CGSize::new(size.0 as f64, size.1 as f64),
+        );
+        // SAFETY: 标准 NSWindow 初始化，mtm 保证位于主线程，参数均为值类型。
+        // SAFETY: 标准 NSWindow 全屏初始化，mtm 保证位于主线程，参数均为值类型。
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                content_rect,
+                NSWindowStyleMask::Borderless,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        let view: Retained<NSView> = window
+            .contentView()
+            .ok_or_else(|| "window.contentView 为空".to_string())?;
+        let layer = CAMetalLayer::layer();
+        view.setWantsLayer(true);
+        view.setLayer(Some(layer.as_ref()));
+        window.orderFrontRegardless();
+        Ok(BenchWindow {
+            _window: window,
+            _view: view,
+            _layer: layer,
+        })
+    }
+
+    /// 探针窗捕获到的鼠标事件类型（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum BenchMouseKind {
+        /// 光标移动。
+        Moved,
+        /// 左键按下。
+        LeftDown,
+        /// 左键按住拖拽。
+        LeftDragged,
+        /// 左键抬起。
+        LeftUp,
+        /// 滚轮滚动（行/像素增量，`delta_y` 来自 `scrollingDeltaY` 或 `deltaY`）。
+        ScrollWheel {
+            /// 垂直滚动增量（正值语义同 AppKit `scrollingDeltaY`）。
+            delta_y: f64,
+        },
+    }
+
+    /// 探针窗收到的鼠标事件快照（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct BenchMouseEvent {
+        /// 事件种类。
+        pub kind: BenchMouseKind,
+        /// 左上角逻辑 X 坐标（点）。
+        pub x: f64,
+        /// 左上角逻辑 Y 坐标（点）。
+        pub y: f64,
+        /// AppKit 系统连续点击计数（用于双击识别统计）。
+        pub click_count: isize,
+    }
+
+    /// 本地/全局鼠标事件监听器守卫（仅 `bench-metrics`，`Drop` 时自动卸载）。
+    #[cfg(feature = "bench-metrics")]
+    pub struct MouseMonitorGuard {
+        monitors: Vec<Retained<objc2::runtime::AnyObject>>,
+    }
+
+    #[cfg(feature = "bench-metrics")]
+    impl Drop for MouseMonitorGuard {
+        fn drop(&mut self) {
+            for m in &self.monitors {
+                // SAFETY: 每个 `monitor` 均由 `NSEvent` addLocal/GlobalMonitor 返回且尚未卸载。
+                unsafe { objc2_app_kit::NSEvent::removeMonitor(m) };
+            }
+        }
+    }
+
+    #[cfg(feature = "bench-metrics")]
+    fn dispatch_mouse_event(
+        ev: &objc2_app_kit::NSEvent,
+        screen_height: f64,
+        on_event: &dyn Fn(BenchMouseEvent),
+    ) {
+        use objc2_app_kit::{NSEvent, NSEventType};
+        let pt = NSEvent::mouseLocation();
+        let x = pt.x.max(0.0);
+        let y = (screen_height - pt.y).max(0.0);
+        let ev_type = ev.r#type();
+        let (kind, click_count) = if ev_type == NSEventType::LeftMouseDown {
+            (BenchMouseKind::LeftDown, ev.clickCount())
+        } else if ev_type == NSEventType::LeftMouseDragged {
+            (BenchMouseKind::LeftDragged, ev.clickCount())
+        } else if ev_type == NSEventType::LeftMouseUp {
+            (BenchMouseKind::LeftUp, ev.clickCount())
+        } else if ev_type == NSEventType::ScrollWheel {
+            let dy = ev.scrollingDeltaY();
+            let delta_y = if dy != 0.0 { dy } else { ev.deltaY() };
+            (BenchMouseKind::ScrollWheel { delta_y }, 0)
+        } else {
+            (BenchMouseKind::Moved, 0)
+        };
+        on_event(BenchMouseEvent {
+            kind,
+            x,
+            y,
+            click_count,
+        });
+    }
+
+    /// 安装鼠标监听（`MouseMoved | LeftMouseDown | LeftMouseDragged | LeftMouseUp | ScrollWheel` 并关闭合并），
+    /// 同时挂本地与全局监视器防止窗口失焦或底层窗抢命中时丢事件。
+    #[cfg(feature = "bench-metrics")]
+    pub fn install_local_mouse_monitor(
+        _mtm: MainThreadMarker,
+        screen_height: f64,
+        on_event: std::sync::Arc<dyn Fn(BenchMouseEvent) + Send + Sync>,
+    ) -> Option<MouseMonitorGuard> {
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        NSEvent::setMouseCoalescingEnabled(false);
+
+        let mask = NSEventMask::MouseMoved
+            | NSEventMask::LeftMouseDown
+            | NSEventMask::LeftMouseDragged
+            | NSEventMask::LeftMouseUp
+            | NSEventMask::ScrollWheel;
+        let on_local = std::sync::Arc::clone(&on_event);
+        let local_block: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+            RcBlock::new(move |ev_ptr: NonNull<NSEvent>| -> *mut NSEvent {
+                // SAFETY: AppKit 保证回调期间 `ev_ptr` 指向有效 NSEvent 对象。
+                let ev = unsafe { ev_ptr.as_ref() };
+                dispatch_mouse_event(ev, screen_height, on_local.as_ref());
+                ev_ptr.as_ptr()
+            });
+        // SAFETY: `mask` 合法、`local_block` 为有效 RcBlock 且返回值原样透传 `NSEvent` 指针。
+        let local_mon: Option<Retained<AnyObject>> =
+            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) };
+
+        let global_block: RcBlock<dyn Fn(NonNull<NSEvent>)> =
+            RcBlock::new(move |ev_ptr: NonNull<NSEvent>| {
+                // SAFETY: AppKit 保证回调期间 `ev_ptr` 指向有效 NSEvent 对象。
+                let ev = unsafe { ev_ptr.as_ref() };
+                dispatch_mouse_event(ev, screen_height, on_event.as_ref());
+            });
+        let global_mon: Option<Retained<AnyObject>> =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block);
+
+        let mut monitors = Vec::with_capacity(2);
+        if let Some(m) = local_mon {
+            monitors.push(m);
+        }
+        if let Some(m) = global_mon {
+            monitors.push(m);
+        }
+        if monitors.is_empty() {
+            None
+        } else {
+            Some(MouseMonitorGuard { monitors })
+        }
+    }
+
+    /// 探针窗捕获到的键盘事件类型（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BenchKeyKind {
+        /// 普通按键按下。
+        KeyDown,
+        /// 普通按键抬起。
+        KeyUp,
+        /// 修饰键状态变化（Shift/Ctrl/Option/Command）。
+        FlagsChanged,
+    }
+
+    /// 探针窗捕获到的键盘事件快照（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BenchKeyEvent {
+        /// 事件种类。
+        pub kind: BenchKeyKind,
+        /// macOS 虚拟键码（`NSEvent::keyCode()`）。
+        pub keycode: u16,
+        /// 当前修饰键掩码：bit0=Shift, bit1=Control, bit2=Option, bit3=Command。
+        pub mod_bits: u8,
+    }
+
+    #[cfg(feature = "bench-metrics")]
+    fn parse_bench_key_event(ev: &objc2_app_kit::NSEvent) -> Option<BenchKeyEvent> {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+        let t = ev.r#type();
+        let kind = if t == NSEventType::KeyDown {
+            BenchKeyKind::KeyDown
+        } else if t == NSEventType::KeyUp {
+            BenchKeyKind::KeyUp
+        } else if t == NSEventType::FlagsChanged {
+            BenchKeyKind::FlagsChanged
+        } else {
+            return None;
+        };
+        let flags = ev.modifierFlags();
+        let mut mod_bits = 0u8;
+        if flags.contains(NSEventModifierFlags::Shift) {
+            mod_bits |= 1 << 0;
+        }
+        if flags.contains(NSEventModifierFlags::Control) {
+            mod_bits |= 1 << 1;
+        }
+        if flags.contains(NSEventModifierFlags::Option) {
+            mod_bits |= 1 << 2;
+        }
+        if flags.contains(NSEventModifierFlags::Command) {
+            mod_bits |= 1 << 3;
+        }
+        Some(BenchKeyEvent {
+            kind,
+            keycode: ev.keyCode(),
+            mod_bits,
+        })
+    }
+
+    /// 安装键盘事件监视器（`KeyDown | KeyUp | FlagsChanged`），本地监视器吞掉 `KeyDown`/`KeyUp` 防提示音，
+    /// 同时挂全局监视器避免窗口切焦瞬态漏帧。
+    #[cfg(feature = "bench-metrics")]
+    pub fn install_keyboard_monitor(
+        _mtm: MainThreadMarker,
+        on_key: std::sync::Arc<dyn Fn(BenchKeyEvent) + Send + Sync>,
+    ) -> Option<MouseMonitorGuard> {
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        let mask = NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged;
+        let on_local = std::sync::Arc::clone(&on_key);
+        let local_block: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+            RcBlock::new(move |ev_ptr: NonNull<NSEvent>| -> *mut NSEvent {
+                // SAFETY: AppKit 保证回调期间 `ev_ptr` 指向有效 NSEvent 对象。
+                let ev = unsafe { ev_ptr.as_ref() };
+                if let Some(kev) = parse_bench_key_event(ev) {
+                    on_local(kev);
+                    if kev.kind != BenchKeyKind::FlagsChanged {
+                        return std::ptr::null_mut();
+                    }
+                }
+                ev_ptr.as_ptr()
+            });
+        // SAFETY: `mask` 合法、`local_block` 为有效 RcBlock，吞键时返回 NULL 属 AppKit 文档约定。
+        let local_mon: Option<Retained<AnyObject>> =
+            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) };
+
+        let global_block: RcBlock<dyn Fn(NonNull<NSEvent>)> =
+            RcBlock::new(move |ev_ptr: NonNull<NSEvent>| {
+                // SAFETY: AppKit 保证回调期间 `ev_ptr` 指向有效 NSEvent 对象。
+                let ev = unsafe { ev_ptr.as_ref() };
+                if let Some(kev) = parse_bench_key_event(ev) {
+                    on_key(kev);
+                }
+            });
+        let global_mon: Option<Retained<AnyObject>> =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block);
+
+        let mut monitors = Vec::with_capacity(2);
+        if let Some(m) = local_mon {
+            monitors.push(m);
+        }
+        if let Some(m) = global_mon {
+            monitors.push(m);
+        }
+        if monitors.is_empty() {
+            None
+        } else {
+            Some(MouseMonitorGuard { monitors })
+        }
     }
 
     /// 创建铺满主屏的无边框窗口（隐私幕布，`tests/curtain.rs` 用）。
@@ -1106,6 +1589,7 @@ pub mod window_bench {
         let screen = NSScreen::mainScreen(mtm).ok_or_else(|| "mainScreen 为空".to_string())?;
         // frame 是安全属性 getter，返回值类型（CGRect）拷贝走。
         let rect = screen.frame();
+        // SAFETY: 标准 NSWindow 全屏初始化，mtm 保证位于主线程，参数均为值类型。
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1152,6 +1636,7 @@ pub mod window_bench {
         // 参数全是值类型（无别名 / 所有权陷阱），返回 +1 强引用；
         // Borderless + Buffered + 不延迟创建是窗口基准的常规组合。
         // mtm 保证本调用发生在主线程（AppKit 的 MainThreadOnly 契约）。
+        // SAFETY: 标准 NSWindow 全屏初始化，mtm 保证位于主线程，参数均为值类型。
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1294,19 +1779,22 @@ pub mod window_bench {
                 // Y 平面：黑底（video range 16）。整帧重涂（≤2MB memset），
                 // 保证上一帧的灰块痕迹不留。
                 for row in 0..h {
+                    // SAFETY: `y_base` 来自已锁定的平面 0，`row < h` 且 `w <= y_stride`。
                     unsafe { std::ptr::write_bytes(y_base.add(row * y_stride), 16, w) };
                 }
                 // 移动灰块 64×64（Y=180），轨迹互质不重复。
                 let bw = 64usize;
                 let bh = 64usize;
-                let x = ((frame as usize * 13) % (w - bw)) as usize;
-                let y = ((frame as usize * 7) % (h - bh)) as usize;
+                let x = (frame as usize * 13) % (w - bw);
+                let y = (frame as usize * 7) % (h - bh);
                 for row in 0..bh {
+                    // SAFETY: `x + bw <= w <= y_stride` 且 `y + row < h`。
                     unsafe { std::ptr::write_bytes(y_base.add((y + row) * y_stride + x), 180, bw) };
                 }
                 // 帧计数块 16×16：灰度随帧号变（保证每帧 damage，与灰块位置无关）。
                 let cval: u8 = 60 + (frame % 128) as u8;
                 for row in 0..16usize {
+                    // SAFETY: `8 + 16 <= w <= y_stride` 且 `row + 8 < h`。
                     unsafe {
                         std::ptr::write_bytes(y_base.add((row + 8) * y_stride + 8), cval, 16)
                     };
@@ -1314,6 +1802,7 @@ pub mod window_bench {
                 if first {
                     // UV 平面（w/2 × h/2 交错）：中性色度 128，一次性。
                     for row in 0..(h / 2) {
+                        // SAFETY: `uv_base` 来自已锁定的平面 1，`row < h/2` 且 `w <= uv_stride`。
                         unsafe { std::ptr::write_bytes(uv_base.add(row * uv_stride), 128, w) };
                     }
                 }
@@ -1324,10 +1813,107 @@ pub mod window_bench {
         pub fn paint_black(&self) -> Result<(), String> {
             self.with_locked_planes(|y_base, y_stride, w, h, uv_base, uv_stride, first| {
                 for row in 0..h {
+                    // SAFETY: `y_base` 来自已锁定的 NV12 平面 0，`row < h` 且 `w <= y_stride`。
                     unsafe { std::ptr::write_bytes(y_base.add(row * y_stride), 16, w) };
                 }
                 if first {
                     for row in 0..(h / 2) {
+                        // SAFETY: `uv_base` 来自已锁定的 NV12 平面 1，`row < h/2` 且 `w <= uv_stride`。
+                        unsafe { std::ptr::write_bytes(uv_base.add(row * uv_stride), 128, w) };
+                    }
+                }
+            })
+        }
+
+        /// 基准探针帧绘制：黑底 + 左上角 Y 平面条码 + 可选高亮光标块 + 可选运动灰块 + 可选刺激横带（仅 `bench-metrics`）。
+        #[cfg(feature = "bench-metrics")]
+        pub fn paint_bench_frame(
+            &self,
+            barcode_y: &[u8],
+            barcode_w: usize,
+            barcode_h: usize,
+            cursor: Option<(u32, u32)>,
+            anim_frame: Option<u64>,
+            extra_band: Option<(u32, u8)>,
+        ) -> Result<(), String> {
+            if barcode_y.len() < barcode_w * barcode_h {
+                return Err("barcode_y 缓冲长度不足".to_string());
+            }
+            self.with_locked_planes(|y_base, y_stride, w, h, uv_base, uv_stride, first| {
+                for row in 0..h {
+                    // SAFETY: `y_base` 来自已锁定的平面 0，`row < h` 且 `w <= y_stride`。
+                    unsafe { std::ptr::write_bytes(y_base.add(row * y_stride), 16, w) };
+                }
+                if let Some((band_y, luma)) = extra_band {
+                    let bw = 200usize.min(w);
+                    let bh = 24usize.min(h);
+                    if w >= bw && h >= bh {
+                        let min_y = (crate::barcode::BARCODE_OFFSET_Y
+                            + crate::barcode::BARCODE_HEIGHT
+                            + 16)
+                            .min(h - bh);
+                        let y0 = (band_y as usize).clamp(min_y, h - bh);
+                        let x0 = (w - bw) / 2;
+                        for row in 0..bh {
+                            // SAFETY: `x0 + bw <= w <= y_stride` 且 `y0 + row < h`。
+                            unsafe {
+                                std::ptr::write_bytes(
+                                    y_base.add((y0 + row) * y_stride + x0),
+                                    luma,
+                                    bw,
+                                )
+                            };
+                        }
+                    }
+                }
+                if let Some(frame) = anim_frame {
+                    let bw = 64usize.min(w);
+                    let bh = 64usize.min(h);
+                    if w > bw && h > bh {
+                        let x = (frame as usize * 13) % (w - bw);
+                        let y = (frame as usize * 7) % (h - bh);
+                        for row in 0..bh {
+                            // SAFETY: `x + bw <= w <= y_stride` 且 `y + row < h`。
+                            unsafe {
+                                std::ptr::write_bytes(y_base.add((y + row) * y_stride + x), 180, bw)
+                            };
+                        }
+                    }
+                }
+                if let Some((cx, cy)) = cursor {
+                    let bw = 32usize.min(w);
+                    let bh = 32usize.min(h);
+                    let x0 = (cx as usize)
+                        .saturating_sub(bw / 2)
+                        .min(w.saturating_sub(bw));
+                    let y0 = (cy as usize)
+                        .saturating_sub(bh / 2)
+                        .min(h.saturating_sub(bh));
+                    for row in 0..bh {
+                        // SAFETY: `x0 + bw <= w <= y_stride` 且 `y0 + row < h`。
+                        unsafe {
+                            std::ptr::write_bytes(y_base.add((y0 + row) * y_stride + x0), 210, bw)
+                        };
+                    }
+                }
+                let off_x = crate::barcode::BARCODE_OFFSET_X.min(w.saturating_sub(1));
+                let off_y = crate::barcode::BARCODE_OFFSET_Y.min(h.saturating_sub(1));
+                let copy_w = barcode_w.min(w.saturating_sub(off_x));
+                let copy_h = barcode_h.min(h.saturating_sub(off_y));
+                for row in 0..copy_h {
+                    let src = &barcode_y[row * barcode_w..row * barcode_w + copy_w];
+                    // SAFETY: `off_y + row < h` 且 `off_x + copy_w <= w <= y_stride`，目标已锁定。
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            y_base.add((off_y + row) * y_stride + off_x),
+                            copy_w,
+                        )
+                    };
+                }
+                if first {
+                    for row in 0..(h / 2) {
+                        // SAFETY: `uv_base` 来自已锁定的平面 1，`row < h/2` 且 `w <= uv_stride`。
                         unsafe { std::ptr::write_bytes(uv_base.add(row * uv_stride), 128, w) };
                     }
                 }
@@ -1346,9 +1932,9 @@ pub mod window_bench {
                 CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
                 CVPixelBufferUnlockBaseAddress,
             };
+            let buf = &self._buf;
             // SAFETY: buf 是本源持有的合法 CVPixelBuffer；lock/unlock 配对，
             // flags=empty（读写锁）；plane 0/1 是 '420v' 双平面布局的合法下标。
-            let buf = &self._buf;
             let rv = unsafe { CVPixelBufferLockBaseAddress(buf, CVPixelBufferLockFlags::empty()) };
             if rv != kCVReturnSuccess {
                 return Err(format!("CVPixelBufferLockBaseAddress 失败: CVReturn={rv}"));

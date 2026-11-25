@@ -57,7 +57,13 @@ pub(crate) fn nal_unit_types(annexb: &[u8]) -> Vec<u8> {
                 // 至少越过 NAL 头字节，继续找下一个起始码。
                 pos = header_pos + 1;
             }
-            None => pos += 1,
+            None => {
+                if pos + 2 < annexb.len() && annexb[pos + 2] > 1 {
+                    pos += 3;
+                } else {
+                    pos += 1;
+                }
+            }
         }
     }
     types
@@ -81,7 +87,14 @@ pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
                 let payload_start = pos + code_len;
                 // 载荷延伸到下一个起始码（或流尾）。
                 let mut next = payload_start;
-                while next < annexb.len() && start_code_len_at(annexb, next).is_none() {
+                while next < annexb.len() {
+                    if next + 2 < annexb.len() && annexb[next + 2] > 1 {
+                        next += 3;
+                        continue;
+                    }
+                    if start_code_len_at(annexb, next).is_some() {
+                        break;
+                    }
                     next += 1;
                 }
                 if let Some((header, payload)) = annexb
@@ -93,7 +106,13 @@ pub(crate) fn nal_payloads(annexb: &[u8]) -> Vec<(u8, &[u8])> {
                 // next >= payload_start = pos + code_len >= pos + 3：必然前进。
                 pos = next;
             }
-            None => pos += 1,
+            None => {
+                if pos + 2 < annexb.len() && annexb[pos + 2] > 1 {
+                    pos += 3;
+                } else {
+                    pos += 1;
+                }
+            }
         }
     }
     out
@@ -169,7 +188,8 @@ pub(crate) fn normalize_to_annexb(
 
 /// 把 SPS/PPS（裸 NAL 字节，无起始码、无长度前缀）插入 Annex-B 流头部。
 ///
-/// 只对 IDR 帧调用：P 帧不需要内联参数集，重复携带纯属浪费带宽。
+/// 生产快速路径已通过 [`write_avcc_as_annexb`] 单遍内联参数集；保留本函数供单测对照验证。
+#[cfg(test)]
 pub(crate) fn prepend_parameter_sets(data: &mut Vec<u8>, parameter_sets: &[&[u8]]) {
     let mut with_ps =
         Vec::with_capacity(data.len() + parameter_sets.iter().map(|p| p.len() + 4).sum::<usize>());
@@ -190,7 +210,14 @@ fn normalize_annexb(input: &[u8]) -> Option<Vec<u8>> {
         let payload_start = pos + code_len;
         // 载荷延伸到下一个起始码（或流尾）。
         let mut next = payload_start;
-        while next < input.len() && start_code_len_at(input, next).is_none() {
+        while next < input.len() {
+            if next + 2 < input.len() && input[next + 2] > 1 {
+                next += 3;
+                continue;
+            }
+            if start_code_len_at(input, next).is_some() {
+                break;
+            }
             next += 1;
         }
         let payload = input.get(payload_start..next)?;
@@ -207,6 +234,79 @@ fn normalize_annexb(input: &[u8]) -> Option<Vec<u8>> {
     } else {
         Some(out)
     }
+}
+
+/// 严格 AVCC 预检：O(NAL 个数) 校验长度前缀结构并判定是否含 IDR（type 5），
+/// 同时返回输出 Annex-B 体（不含外插 SPS/PPS）的精确字节数。
+///
+/// 与 [`convert_avcc`] 采用完全相同的严格判定规则：不合法或疑似 Annex-B 返回 `None`。
+pub(crate) fn inspect_avcc(input: &[u8], length_size: usize) -> Option<(bool, usize)> {
+    if length_size == 0 || length_size > 8 || input.is_empty() {
+        return None;
+    }
+    if length_size == 4 && input.len() == 5 && input.starts_with(&ANNEXB_START_CODE) {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut is_idr_frame = false;
+    let mut annexb_body_len = 0usize;
+    while pos < input.len() {
+        let len_bytes = input.get(pos..pos + length_size)?;
+        let mut nal_len = 0usize;
+        for &b in len_bytes {
+            nal_len = (nal_len << 8) | b as usize;
+        }
+        if nal_len == 0 {
+            return None;
+        }
+        let payload_start = pos.checked_add(length_size)?;
+        let end = payload_start.checked_add(nal_len)?;
+        let header = *input.get(payload_start)?;
+        if end > input.len() {
+            return None;
+        }
+        if nal_unit_type(header) == 5 {
+            is_idr_frame = true;
+        }
+        annexb_body_len = annexb_body_len.checked_add(4)?.checked_add(nal_len)?;
+        pos = end;
+    }
+    if annexb_body_len == 0 {
+        None
+    } else {
+        Some((is_idr_frame, annexb_body_len))
+    }
+}
+
+/// 单次分配、单次拷贝把已通过 [`inspect_avcc`] 校验的 AVCC 字节流（及可选前置 SPS/PPS）
+/// 写入 Annex-B 缓冲。
+///
+/// 调用前须确保 `input` 已由 `inspect_avcc(input, length_size)` 返回 `Some((_, body_len))`。
+pub(crate) fn write_avcc_as_annexb(
+    input: &[u8],
+    length_size: usize,
+    parameter_sets: &[&[u8]],
+    body_len: usize,
+) -> Vec<u8> {
+    let ps_len: usize = parameter_sets.iter().map(|p| 4 + p.len()).sum();
+    let mut out = Vec::with_capacity(ps_len + body_len);
+    for ps in parameter_sets {
+        out.extend_from_slice(&ANNEXB_START_CODE);
+        out.extend_from_slice(ps);
+    }
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let mut nal_len = 0usize;
+        for &b in &input[pos..pos + length_size] {
+            nal_len = (nal_len << 8) | b as usize;
+        }
+        let payload_start = pos + length_size;
+        let end = payload_start + nal_len;
+        out.extend_from_slice(&ANNEXB_START_CODE);
+        out.extend_from_slice(&input[payload_start..end]);
+        pos = end;
+    }
+    out
 }
 
 /// 严格 AVCC 输入转换：`[长度前缀][NAL]...` → `[起始码][NAL]...`。
@@ -456,5 +556,35 @@ mod tests {
         assert_eq!(fmt2, SourceFormat::Avcc);
         assert_eq!(out2, annexb_stream(&[sei, p_mid]));
         assert_eq!(nal_unit_types(&out2), vec![6, 1]);
+    }
+
+    #[test]
+    fn fast_avcc_path_matches_reference_for_idr_and_p_frames() {
+        let sps = nal(0x67, &[1, 2, 3]);
+        let pps = nal(0x68, &[4, 5]);
+        let idr = nal(0x65, &[9; 24]);
+        let p = nal(0x41, &[7; 327]);
+
+        let idr_avcc = avcc_stream(std::slice::from_ref(&idr));
+        let (is_idr_flag, body_len) = inspect_avcc(&idr_avcc, 4).expect("IDR AVCC 合法");
+        assert!(is_idr_flag);
+        assert_eq!(body_len, idr_avcc.len());
+        let fast_idr = write_avcc_as_annexb(&idr_avcc, 4, &[&sps, &pps], body_len);
+        let (mut ref_idr, _) = normalize_to_annexb(&idr_avcc, 4).unwrap();
+        prepend_parameter_sets(&mut ref_idr, &[&sps, &pps]);
+        assert_eq!(fast_idr, ref_idr);
+
+        let p_avcc = avcc_stream(std::slice::from_ref(&p));
+        let (is_p_idr, p_body_len) = inspect_avcc(&p_avcc, 4).expect("P AVCC 合法");
+        assert!(!is_p_idr);
+        assert_eq!(p_body_len, p_avcc.len());
+        let fast_p = write_avcc_as_annexb(&p_avcc, 4, &[], p_body_len);
+        let (ref_p, _) = normalize_to_annexb(&p_avcc, 4).unwrap();
+        assert_eq!(fast_p, ref_p);
+
+        // Annex-B 输入不被 inspect_avcc 误认
+        let annexb_single = annexb_stream(std::slice::from_ref(&idr));
+        assert!(inspect_avcc(&annexb_single, 4).is_none());
+        assert!(inspect_avcc(&[0x00, 0x00, 0x00, 0x01, 0x65], 4).is_none());
     }
 }

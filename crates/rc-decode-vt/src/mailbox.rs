@@ -57,18 +57,23 @@ impl<T> FrameMailbox<T> {
         let mut guard = lock(&self.slots);
         guard.push_back((frame_id, value));
         drop(guard);
-        self.cond.notify_all();
+        self.cond.notify_one();
     }
 
     /// 等待线程按帧号取件：等到 `deadline` 仍无该帧号则返回 `None`。
     ///
-    /// 其他帧号的结果（如迟到回调）留在邮箱里不动——按号取件不会误取。
-    /// 不无限阻塞：剩余预算归零立即返回。
+    /// 其他帧号的结果：严格大于 `frame_id` 的结果留在邮箱里不动（按号取件不会误取），
+    /// 严格小于 `frame_id` 的迟到残留会在同一次持锁中顺带清理，防止早先超时帧的
+    /// `CVPixelBuffer` 引用计数滞留。不无限阻塞：剩余预算归零立即返回。
     pub(crate) fn take(&self, frame_id: u64, deadline: Instant) -> Option<T> {
         let mut guard = lock(&self.slots);
         loop {
             if let Some(pos) = guard.iter().position(|(id, _)| *id == frame_id) {
-                return guard.remove(pos).map(|(_, value)| value);
+                let value = guard.remove(pos).map(|(_, value)| value);
+                if !guard.is_empty() {
+                    guard.retain(|(id, _)| *id > frame_id);
+                }
+                return value;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -131,5 +136,44 @@ mod tests {
         assert_eq!(mbox.clear(), 2);
         assert_eq!(mbox.clear(), 0, "清空后无残留");
         assert_eq!(mbox.take(3, Instant::now() + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn mailbox_take_drops_older_late_entries_without_touching_newer_entries() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropWatch(Arc<AtomicBool>);
+        impl Drop for DropWatch {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mbox = FrameMailbox::new();
+        let late_dropped = Arc::new(AtomicBool::new(false));
+        let newer_dropped = Arc::new(AtomicBool::new(false));
+
+        // 模拟帧 1 超时后在帧 2 完成前迟到，同时帧 3 也已先到。
+        mbox.post(1, (1u64, DropWatch(Arc::clone(&late_dropped))));
+        mbox.post(3, (3u64, DropWatch(Arc::clone(&newer_dropped))));
+        mbox.post(2, (2u64, DropWatch(Arc::new(AtomicBool::new(false)))));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let got2 = mbox.take(2, deadline).expect("frame 2 present");
+        assert_eq!(got2.0, 2);
+        assert!(
+            late_dropped.load(Ordering::SeqCst),
+            "严格小于 frame_id=2 的迟到残留必须在同一次 take 锁内被清理释放"
+        );
+        assert!(
+            !newer_dropped.load(Ordering::SeqCst),
+            "大于 frame_id=2 的帧必须保留"
+        );
+
+        let got3 = mbox.take(3, deadline).expect("frame 3 still present");
+        assert_eq!(got3.0, 3);
+        drop(got3);
+        assert!(newer_dropped.load(Ordering::SeqCst));
+        assert_eq!(mbox.clear(), 0, "邮箱应已完全清空");
     }
 }

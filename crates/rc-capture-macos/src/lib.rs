@@ -44,6 +44,8 @@ pub mod sck;
 
 #[cfg(target_os = "macos")]
 pub use permission::{PermissionKind, PermissionStatus};
+#[cfg(all(target_os = "macos", feature = "bench-metrics"))]
+pub use sck::CaptureFrameTiming;
 #[cfg(target_os = "macos")]
 pub use sck::{SckBackend, SckConfig};
 
@@ -264,6 +266,25 @@ pub fn lock_screen_now() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         false
+    }
+}
+
+/// 从已采集的 `CVPixelBuffer` 读取左上角最多 `max_w × max_h` 像素的 Y 平面亮度切片（仅 `bench-metrics`）。
+///
+/// 返回 `(实际宽, 实际高, 连续 Y 字节)`；非 `CVPixelBuffer` 纹理返回显式错误。
+#[cfg(all(target_os = "macos", feature = "bench-metrics"))]
+pub fn read_pixel_buffer_y_region(
+    frame: &rc_capture::CapturedFrame,
+    max_w: usize,
+    max_h: usize,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    match &frame.texture {
+        rc_capture::FrameTexture::CVPixelBuffer(ptr) => {
+            ffi::read_pixel_buffer_y_region(ptr.cast_const(), max_w, max_h)
+        }
+        other => Err(format!(
+            "仅支持 CVPixelBuffer 纹理读取 Y 平面，实际收到: {other:?}"
+        )),
     }
 }
 

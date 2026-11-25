@@ -18,8 +18,8 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -364,20 +364,27 @@ impl AudioChunker {
         }
     }
 
-    fn push_samples_with_rate(&mut self, sample_rate: u32, samples: &[i16]) {
+    fn push_samples_with_rate(&mut self, sample_rate: u32, samples: &[i16]) -> usize {
         self.set_sample_rate(sample_rate);
-        self.push_samples(samples);
+        self.push_samples(samples)
     }
 
-    fn push_samples(&mut self, samples: &[i16]) {
+    fn push_samples(&mut self, samples: &[i16]) -> usize {
         if self.stopped || samples.is_empty() {
-            return;
+            return 0;
         }
         let chunk_samples = self.chunk_samples();
         self.pending.extend_from_slice(samples);
 
+        let mut emitted = 0usize;
         while self.pending.len() >= chunk_samples {
-            let chunk: Vec<i16> = self.pending.drain(..chunk_samples).collect();
+            let mut chunk = Vec::with_capacity(chunk_samples);
+            chunk.extend_from_slice(&self.pending[..chunk_samples]);
+            let remaining = self.pending.len() - chunk_samples;
+            if remaining > 0 {
+                self.pending.copy_within(chunk_samples.., 0);
+            }
+            self.pending.truncate(remaining);
             let timestamp_us =
                 self.emitted_frames
                     .wrapping_mul(u64::from(FRAME_DURATION_MS) * 1_000) as u32;
@@ -392,7 +399,9 @@ impl AudioChunker {
                 timestamp_us,
                 samples: chunk,
             });
+            emitted += 1;
         }
+        emitted
     }
 
     fn pop_frame(&mut self) -> Option<PcmFrame> {
@@ -443,24 +452,29 @@ unsafe fn audio_buffers_from_storage(abl_storage: &[usize]) -> Option<&[raw::Aud
     Some(unsafe { std::slice::from_raw_parts(first_buf_ptr, num_buffers) })
 }
 
-/// 从 `CMSampleBuffer` 提取实际采样率与交错立体声 `i16` 采样。
-fn decode_sample_buffer_to_stereo_i16(sample_buffer: &CMSampleBuffer) -> (u32, Vec<i16>) {
+/// 从 `CMSampleBuffer` 提取实际采样率与交错立体声 `i16` 采样并写入 `out`
+/// （复用调用方缓冲与栈上 `AudioBufferList` / 切片槽位，常规立体声零堆分配）。
+fn decode_sample_buffer_to_stereo_i16_into(
+    sample_buffer: &CMSampleBuffer,
+    out: &mut Vec<i16>,
+) -> u32 {
+    out.clear();
     let sbuf_ptr = ptr::addr_of!(*sample_buffer).cast::<c_void>();
 
     // SAFETY: `sbuf_ptr` 指向回调期间有效的 `CMSampleBuffer`；返回值为借用引用，无需 CFRelease。
     let fmt_desc = unsafe { raw::CMSampleBufferGetFormatDescription(sbuf_ptr) };
     if fmt_desc.is_null() {
-        return (DEFAULT_SAMPLE_RATE, Vec::new());
+        return DEFAULT_SAMPLE_RATE;
     }
     // SAFETY: `fmt_desc` 非空且在 `sample_buffer` 存活期内有效。
     let asbd_ptr = unsafe { raw::CMAudioFormatDescriptionGetStreamBasicDescription(fmt_desc) };
     if asbd_ptr.is_null() {
-        return (DEFAULT_SAMPLE_RATE, Vec::new());
+        return DEFAULT_SAMPLE_RATE;
     }
     // SAFETY: `asbd_ptr` 指向 CoreMedia 管理的只读 `AudioStreamBasicDescription`。
     let asbd = unsafe { *asbd_ptr };
     let Some(spec) = PcmFormatSpec::from_asbd(&asbd) else {
-        return (DEFAULT_SAMPLE_RATE, Vec::new());
+        return DEFAULT_SAMPLE_RATE;
     };
 
     let mut size_needed: usize = 0;
@@ -478,13 +492,21 @@ fn decode_sample_buffer_to_stereo_i16(sample_buffer: &CMSampleBuffer) -> (u32, V
         )
     };
     if size_status != 0 || size_needed < std::mem::size_of::<raw::AudioBufferList>() {
-        return (spec.sample_rate, Vec::new());
+        return spec.sample_rate;
     }
 
-    // 用 `Vec<usize>` 保证至少指针自然对齐（>= align_of::<AudioBufferList>()）。
+    // 优先使用栈上 `[usize; 16]`（128B，覆盖常规立体声 2 缓冲 ABL）；超限时回退堆分配。
+    const STACK_ABL_WORDS: usize = 16;
     let word_size = std::mem::size_of::<usize>();
     let word_count = size_needed.div_ceil(word_size);
-    let mut abl_storage = vec![0usize; word_count];
+    let mut stack_abl = [0usize; STACK_ABL_WORDS];
+    let mut heap_abl: Vec<usize> = Vec::new();
+    let abl_storage: &mut [usize] = if word_count <= STACK_ABL_WORDS {
+        &mut stack_abl[..word_count]
+    } else {
+        heap_abl.resize(word_count, 0);
+        &mut heap_abl[..word_count]
+    };
     let alloc_bytes = word_count * word_size;
     let abl_ptr = abl_storage.as_mut_ptr().cast::<raw::AudioBufferList>();
 
@@ -505,16 +527,19 @@ fn decode_sample_buffer_to_stereo_i16(sample_buffer: &CMSampleBuffer) -> (u32, V
     };
     let _block_guard = RetainedCf(block_buffer_raw);
     if get_status != 0 {
-        return (spec.sample_rate, Vec::new());
+        return spec.sample_rate;
     }
 
     // SAFETY: `CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` 返回 0 表示
     // `abl_storage` 已被有效填充为 `AudioBufferList` 及其全部 `AudioBuffer` 条目。
-    let Some(audio_buffers) = (unsafe { audio_buffers_from_storage(&abl_storage) }) else {
-        return (spec.sample_rate, Vec::new());
+    let Some(audio_buffers) = (unsafe { audio_buffers_from_storage(abl_storage) }) else {
+        return spec.sample_rate;
     };
 
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(audio_buffers.len());
+    const STACK_SLICES: usize = 8;
+    let mut stack_slices: [&[u8]; STACK_SLICES] = [&[]; STACK_SLICES];
+    let mut stack_count = 0usize;
+    let mut heap_slices: Vec<&[u8]> = Vec::new();
     for ab in audio_buffers {
         if !ab.m_data.is_null() && ab.m_data_byte_size > 0 {
             // SAFETY: `ab.m_data` 指向由 `_block_guard` 持有保活的 `CMBlockBuffer` 内部只读内存，
@@ -522,24 +547,85 @@ fn decode_sample_buffer_to_stereo_i16(sample_buffer: &CMSampleBuffer) -> (u32, V
             let slice = unsafe {
                 std::slice::from_raw_parts(ab.m_data.cast::<u8>(), ab.m_data_byte_size as usize)
             };
-            slices.push(slice);
+            if heap_slices.is_empty() && stack_count < STACK_SLICES {
+                stack_slices[stack_count] = slice;
+                stack_count += 1;
+            } else {
+                if heap_slices.is_empty() {
+                    heap_slices.reserve(audio_buffers.len());
+                    heap_slices.extend_from_slice(&stack_slices[..stack_count]);
+                }
+                heap_slices.push(slice);
+            }
         }
     }
 
-    let mut stereo_i16 = Vec::new();
-    extract_stereo_i16_from_buffers(&slices, spec, &mut stereo_i16);
-    (spec.sample_rate, stereo_i16)
+    let slices: &[&[u8]] = if heap_slices.is_empty() {
+        &stack_slices[..stack_count]
+    } else {
+        &heap_slices
+    };
+    extract_stereo_i16_from_buffers(slices, spec, out);
+    spec.sample_rate
+}
+
+/// 采集回调线程与消费线程共享的状态与低抖动 `Condvar` 通知。
+struct CaptureShared {
+    chunker: Mutex<AudioChunker>,
+    cond: Condvar,
+}
+
+impl CaptureShared {
+    fn new(sample_rate: u32, channels: u8) -> Self {
+        Self {
+            chunker: Mutex::new(AudioChunker::new(sample_rate, channels)),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// 阻塞等待直到至少一帧就绪、超时或采集停止（供低抖动唤醒路径使用）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn recv_frame_timeout(&self, timeout: Duration) -> Option<PcmFrame> {
+        let mut guard = self.chunker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(frame) = guard.pop_frame() {
+            return Some(frame);
+        }
+        if guard.stopped || timeout.is_zero() {
+            return None;
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next_guard, _) = self
+                .cond
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+            if let Some(frame) = guard.pop_frame() {
+                return Some(frame);
+            }
+            if guard.stopped {
+                return None;
+            }
+        }
+    }
 }
 
 struct AudioHandlerIvars {
-    chunker: Arc<Mutex<AudioChunker>>,
+    shared: Arc<CaptureShared>,
+    pcm_scratch: Mutex<Vec<i16>>,
 }
 
 define_class!(
     // SAFETY:
     // - 超类 NSObject 无额外子类化约束；
     // - 本类不实现自定义 Drop；
-    // - ivars 为 `Arc<Mutex<AudioChunker>>`，线程安全，在串行 audio sample queue
+    // - ivars 为 `Arc<CaptureShared>` 与 `Mutex<Vec<i16>>`，线程安全，在串行 audio sample queue
     //   与 delegate queue 上仅经由 Mutex 访问。
     #[unsafe(super(NSObject))]
     #[name = "RcAudioSckStreamHandler"]
@@ -561,14 +647,24 @@ define_class!(
                 return;
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let (sample_rate, pcm) = decode_sample_buffer_to_stereo_i16(sample_buffer);
+                let mut pcm = self
+                    .ivars()
+                    .pcm_scratch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let sample_rate = decode_sample_buffer_to_stereo_i16_into(sample_buffer, &mut pcm);
                 if !pcm.is_empty() {
                     let mut guard = self
                         .ivars()
+                        .shared
                         .chunker
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    guard.push_samples_with_rate(sample_rate, &pcm);
+                    let emitted = guard.push_samples_with_rate(sample_rate, &pcm);
+                    drop(guard);
+                    if emitted > 0 {
+                        self.ivars().shared.cond.notify_one();
+                    }
                 }
             }));
         }
@@ -581,18 +677,26 @@ define_class!(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = self
                     .ivars()
+                    .shared
                     .chunker
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 guard.mark_stopped();
+                drop(guard);
+                self.ivars().shared.cond.notify_all();
             }));
         }
     }
 );
 
 impl RcAudioSckStreamHandler {
-    fn new(chunker: Arc<Mutex<AudioChunker>>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(AudioHandlerIvars { chunker });
+    fn new(shared: Arc<CaptureShared>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(AudioHandlerIvars {
+            shared,
+            pcm_scratch: Mutex::new(Vec::with_capacity(
+                (DEFAULT_SAMPLE_RATE as usize / 50) * usize::from(DEFAULT_CHANNELS) * 2,
+            )),
+        });
         // SAFETY: `this` 是新分配的本类实例，调用超类 `init` 完成初始化并返回 +1 `Retained`。
         unsafe { msg_send![super(this), init] }
     }
@@ -677,7 +781,7 @@ impl Drop for AudioStreamHandles {
 /// 基于 macOS ScreenCaptureKit 的系统音频采集器（立体声，20 ms 帧）。
 pub(crate) struct MacOsAudioCapture {
     handles: AudioStreamHandles,
-    chunker: Arc<Mutex<AudioChunker>>,
+    shared: Arc<CaptureShared>,
     channels: u8,
 }
 
@@ -714,11 +818,8 @@ impl MacOsAudioCapture {
             cfg
         };
 
-        let chunker = Arc::new(Mutex::new(AudioChunker::new(
-            DEFAULT_SAMPLE_RATE,
-            DEFAULT_CHANNELS,
-        )));
-        let handler = RcAudioSckStreamHandler::new(Arc::clone(&chunker));
+        let shared = Arc::new(CaptureShared::new(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS));
+        let handler = RcAudioSckStreamHandler::new(Arc::clone(&shared));
 
         // SAFETY: `filter`、`config`、`handler` 有效；`AudioStreamHandles` 持有 `handler`
         // 强引用且在 `stream` 之后释放，满足 delegate 生命周期要求。
@@ -783,20 +884,31 @@ impl MacOsAudioCapture {
                 _queue: queue,
                 stopped: false,
             },
-            chunker,
+            shared,
             channels: DEFAULT_CHANNELS,
         })
+    }
+
+    /// 阻塞等待下一帧 20ms PCM 音频（内部基于 `Condvar` 低抖动唤醒，超时或停止返回 `None`）。
+    #[allow(dead_code)]
+    pub(crate) fn recv_frame_timeout(&mut self, timeout: Duration) -> Option<PcmFrame> {
+        self.shared.recv_frame_timeout(timeout)
     }
 }
 
 impl AudioCapture for MacOsAudioCapture {
     fn try_recv_frame(&mut self) -> Option<PcmFrame> {
-        let mut guard = self.chunker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .shared
+            .chunker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.pop_frame()
     }
 
     fn sample_rate(&self) -> u32 {
-        self.chunker
+        self.shared
+            .chunker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .sample_rate
@@ -808,8 +920,14 @@ impl AudioCapture for MacOsAudioCapture {
 
     fn stop(&mut self) {
         self.handles.stop_stream();
-        let mut guard = self.chunker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .shared
+            .chunker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.mark_stopped();
+        drop(guard);
+        self.shared.cond.notify_all();
     }
 }
 
@@ -1037,5 +1155,62 @@ mod tests {
         assert_eq!(f1.channels, 2);
         assert_eq!(f1.samples.len(), 882 * 2);
         assert_eq!(f1.timestamp_us, 20_000);
+    }
+
+    #[test]
+    fn capture_shared_condvar_wakes_on_emit_and_stop() {
+        let shared = Arc::new(CaptureShared::new(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS));
+        let producer = Arc::clone(&shared);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            let samples = vec![42i16; STEREO_CHUNK_SAMPLES_48K];
+            let mut guard = producer.chunker.lock().unwrap_or_else(|e| e.into_inner());
+            let emitted = guard.push_samples(&samples);
+            drop(guard);
+            if emitted > 0 {
+                producer.cond.notify_one();
+            }
+        });
+
+        let frame = shared
+            .recv_frame_timeout(Duration::from_millis(500))
+            .expect("condvar must wake promptly on emitted frame");
+        assert_eq!(frame.samples.len(), STEREO_CHUNK_SAMPLES_48K);
+        assert_eq!(frame.samples[0], 42);
+        handle.join().expect("producer thread must not panic");
+
+        // Stop wakes waiter cleanly with None.
+        let stopper = Arc::clone(&shared);
+        let stop_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            let mut guard = stopper.chunker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.mark_stopped();
+            drop(guard);
+            stopper.cond.notify_all();
+        });
+        assert!(shared
+            .recv_frame_timeout(Duration::from_millis(500))
+            .is_none());
+        stop_handle.join().expect("stopper thread must not panic");
+    }
+
+    #[test]
+    fn chunker_stamps_monotonic_20ms_timestamps_under_1024_sample_bursts() {
+        let mut chunker = AudioChunker::new(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
+        // CoreAudio/SCK 常见回调为每声道 1024 采样（21.33ms @ 48kHz，交错 2048 个 i16）。
+        let burst = vec![7i16; 1024 * usize::from(DEFAULT_CHANNELS)];
+        let mut timestamps = Vec::new();
+        for _ in 0..16 {
+            chunker.push_samples(&burst);
+            while let Some(frame) = chunker.pop_frame() {
+                assert_eq!(frame.samples.len(), STEREO_CHUNK_SAMPLES_48K);
+                timestamps.push(frame.timestamp_us);
+            }
+        }
+        assert_eq!(timestamps.len(), 17);
+        for (idx, ts) in timestamps.iter().enumerate() {
+            assert_eq!(*ts, (idx as u32) * 20_000);
+        }
     }
 }

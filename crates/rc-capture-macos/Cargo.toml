@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "RabbitControl macOS 采集后端：ScreenCaptureKit（T12）。"
 
+[features]
+default = []
+# 编译期基准埋点开关：默认关闭，生产构建零额外代码与开销。
+bench-metrics = []
+
 [dependencies]
 rc-types = { workspace = true }
 

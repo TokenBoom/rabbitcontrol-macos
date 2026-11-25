@@ -61,6 +61,33 @@ impl Default for SckConfig {
     }
 }
 
+/// 单帧采集内部时序埋点（仅 `bench-metrics` 启用，生产构建完全屏蔽）。
+#[cfg(feature = "bench-metrics")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureFrameTiming {
+    /// SCK `CMSampleBuffer` presentation timestamp（微秒，`CMClockGetHostTimeClock` 域）。
+    pub pts_us: u64,
+    /// `SCStreamOutput` 回调入口采样时刻（微秒，同域）。
+    pub callback_us: u64,
+    /// `SckBackend::next_frame` 从邮箱取出该帧的时刻（微秒，同域）。
+    pub pop_us: u64,
+    /// 截至取出本帧时邮箱累计发生的「旧帧被新帧覆写丢弃」次数。
+    pub mailbox_overwrites: u64,
+}
+
+#[cfg(feature = "bench-metrics")]
+impl CaptureFrameTiming {
+    /// SCK PTS → 回调到达交付延迟（微秒，饱和防下溢）。
+    pub fn pts_to_callback_us(&self) -> u64 {
+        self.callback_us.saturating_sub(self.pts_us)
+    }
+
+    /// 回调入箱 → `next_frame` 出箱滞留耗时（微秒，饱和防下溢）。
+    pub fn mailbox_wait_us(&self) -> u64 {
+        self.pop_us.saturating_sub(self.callback_us)
+    }
+}
+
 /// ScreenCaptureKit 采集后端（实现 [`CaptureBackend`]）。
 ///
 /// 用 [`SckBackend::new`] 创建；失败（无显示器、无权限等）返回
@@ -86,6 +113,12 @@ pub struct SckBackend {
     invalidation_msg: String,
     /// 首帧校验是否已完成（格式 / 分辨率核对）。
     first_frame_checked: bool,
+    /// 是否在 `SCContentFilter` 中排除当前进程窗口（仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    exclude_current_process: bool,
+    /// 最近一帧采集时序快照（仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    last_frame_timing: Option<CaptureFrameTiming>,
 }
 
 /// `display_info` 需要的显示器摘要（plain data，可跨线程）。
@@ -103,7 +136,33 @@ impl SckBackend {
     /// 前置条件：屏幕录制权限已授予（用 [`crate::permission::PermissionStatus::check`]
     /// 先检查）；未授予时启动失败并返回可读错误，不会 panic。
     pub fn new(config: SckConfig) -> Result<Self> {
+        Self::new_inner(config, false)
+    }
+
+    /// 基准测试专用构造：可选排除当前进程自渲染窗口，并启用采集黑盒时序埋点（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn new_for_bench(config: SckConfig, exclude_current_process: bool) -> Result<Self> {
+        Self::new_inner(config, exclude_current_process)
+    }
+
+    /// 最近一帧的采集时序埋点快照（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn last_frame_timing(&self) -> Option<CaptureFrameTiming> {
+        self.last_frame_timing
+    }
+
+    /// 截至目前邮箱累计发生的「旧帧被新帧覆写丢弃」次数（仅 `bench-metrics`）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn mailbox_overwrites(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |(_, mailbox)| mailbox.overwrites())
+    }
+
+    fn new_inner(config: SckConfig, exclude_current_process: bool) -> Result<Self> {
         validate_config(&config)?;
+        #[cfg(not(feature = "bench-metrics"))]
+        let _ = exclude_current_process;
         let mut backend = Self {
             config,
             live: None,
@@ -118,6 +177,10 @@ impl SckBackend {
             invalidation: None,
             invalidation_msg: String::new(),
             first_frame_checked: false,
+            #[cfg(feature = "bench-metrics")]
+            exclude_current_process,
+            #[cfg(feature = "bench-metrics")]
+            last_frame_timing: None,
         };
         backend.establish()?;
         Ok(backend)
@@ -146,8 +209,14 @@ impl SckBackend {
         let target =
             resolve_target_resolution(self.config.resolution, snapshot.backing, snapshot.scale);
 
+        #[cfg(feature = "bench-metrics")]
+        let exclude_self = self.exclude_current_process;
+        #[cfg(not(feature = "bench-metrics"))]
+        let exclude_self = false;
+
         let (handles, mailbox) =
-            ffi::build_stream(snapshot, target, self.config.fps).map_err(unknown_capture_error)?;
+            ffi::build_stream_with_options(snapshot, target, self.config.fps, exclude_self)
+                .map_err(unknown_capture_error)?;
 
         self.display = DisplaySummary {
             id: DisplayId(self.config.display),
@@ -195,8 +264,19 @@ impl CaptureBackend for SckBackend {
         };
 
         let event = mailbox.recv_timeout(timeout);
+        #[cfg(feature = "bench-metrics")]
+        let mailbox_overwrites = mailbox.overwrites();
         match event {
-            Some(FrameEvent::Frame(FramePayload { buffer, pts_us })) => {
+            Some(FrameEvent::Frame(payload)) => {
+                #[cfg(feature = "bench-metrics")]
+                let FramePayload {
+                    buffer,
+                    pts_us,
+                    callback_us,
+                } = payload;
+                #[cfg(not(feature = "bench-metrics"))]
+                let FramePayload { buffer, pts_us } = payload;
+
                 // C2：优先使用调用方注入的会话时钟原点（与管线同域同零点）；
                 // 未注入时以本流首帧 PTS 为原点。SCK 的 PTS 单调递增。
                 let origin = match self.config.origin_us {
@@ -233,6 +313,16 @@ impl CaptureBackend for SckBackend {
                 self.last_buffer_info = Some(buffer.info());
                 let texture = FrameTexture::CVPixelBuffer(buffer.as_opaque_ptr());
                 self.seq = CaptureSeq(next_seq);
+                #[cfg(feature = "bench-metrics")]
+                {
+                    let pop_us = ffi::host_time_us();
+                    self.last_frame_timing = Some(CaptureFrameTiming {
+                        pts_us,
+                        callback_us,
+                        pop_us,
+                        mailbox_overwrites,
+                    });
+                }
                 // macOS SCK 无脏区 API：dirty = None，上层用 TileDiff（见 T12
                 // 参考实现表）。SCK 也不会重复交同一帧：is_repeat 恒 false。
                 Ok(Some(CapturedFrame {
@@ -593,5 +683,27 @@ mod tests {
         }
         // 连续 rebuild（C5 幂等）：第二次同样成功。
         backend.rebuild().expect("连续 rebuild 必须成功（C5 幂等）");
+    }
+
+    #[cfg(feature = "bench-metrics")]
+    #[test]
+    fn capture_frame_timing_saturates_underflow_and_computes_deltas() {
+        let timing = CaptureFrameTiming {
+            pts_us: 10_000,
+            callback_us: 12_500,
+            pop_us: 12_850,
+            mailbox_overwrites: 3,
+        };
+        assert_eq!(timing.pts_to_callback_us(), 2_500);
+        assert_eq!(timing.mailbox_wait_us(), 350);
+
+        let skewed = CaptureFrameTiming {
+            pts_us: 20_000,
+            callback_us: 19_000,
+            pop_us: 18_500,
+            mailbox_overwrites: 0,
+        };
+        assert_eq!(skewed.pts_to_callback_us(), 0);
+        assert_eq!(skewed.mailbox_wait_us(), 0);
     }
 }

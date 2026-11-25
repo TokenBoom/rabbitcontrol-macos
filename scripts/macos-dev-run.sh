@@ -149,6 +149,11 @@ cmd_cli() {
                 build_args+=(--release)
                 shift
                 ;;
+            --features)
+                [[ $# -ge 2 ]] || die "--features 需要提供特性列表"
+                build_args+=(--features "$2")
+                shift 2
+                ;;
             --)
                 shift
                 break
@@ -175,6 +180,11 @@ cmd_test() {
             --release)
                 cargo_args+=(--release)
                 shift
+                ;;
+            --features)
+                [[ $# -ge 2 ]] || die "--features 需要提供特性列表"
+                cargo_args+=(--features "$2")
+                shift 2
                 ;;
             --lib)
                 cargo_args+=(--lib)

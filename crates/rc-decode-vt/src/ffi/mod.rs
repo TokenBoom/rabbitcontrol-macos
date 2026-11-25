@@ -314,6 +314,9 @@ pub(crate) struct DecompressionSession {
     /// ——与 `FrameTexture` 文档「GPU 句柄在下一次采集前有效」的语义对称。
     /// 调用方（渲染器）要跨帧持有必须自行 retain。
     last_output: Option<CFRetained<CVPixelBuffer>>,
+    /// 上一帧是否可能残留迟到/未消费邮箱条目（仅在超时或提交后异常退出时置位，
+    /// 常规单帧同步路径跳过无谓的 `mailbox.clear()` 锁获取）。
+    mailbox_dirty: bool,
 }
 
 // SAFETY: 见类型文档：所有权随 VtDecoder 移动，无并发访问；回调线程只经
@@ -400,6 +403,7 @@ impl DecompressionSession {
             _format_description: desc,
             mailbox,
             last_output: None,
+            mailbox_dirty: false,
         };
 
         // 3. D3 低延迟：RealTime = true（提示解码器为实时优化，可牺牲质量
@@ -449,8 +453,11 @@ impl DecompressionSession {
         // 解码提交/等待按 USER_INTERACTIVE 调度（回调队列 QoS 继承提交线程，
         // 见 QosBump 文档）；guard 在任何退出路径恢复原值。
         let _qos = QosBump::new();
-        // 清掉上一帧的迟到残留（超时被弃的帧不复活）。
-        self.mailbox.clear();
+        // 仅当上一帧超时或提交异常退出时才清邮箱残留（常规帧路径跳过多余 Mutex 锁）。
+        if self.mailbox_dirty {
+            self.mailbox.clear();
+            self.mailbox_dirty = false;
+        }
 
         // 1. AVCC → CMBlockBuffer。
         // 坑（与编码侧 E6 相同）：blockAllocator 传 NULL 是「默认分配器」，
@@ -548,6 +555,7 @@ impl DecompressionSession {
             .checked_add(wait)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
         let Some(payload) = self.mailbox.take(frame_id, deadline) else {
+            self.mailbox_dirty = true;
             return Err(DecodeFailure::Timeout);
         };
         if payload.status != 0 {

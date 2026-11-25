@@ -6,6 +6,8 @@
 //! - 参数解析错误 → 2（clap 默认）
 //! - 无参数运行 → 打印用法，0
 
+#[cfg(feature = "bench-metrics")]
+mod bench;
 mod cmd;
 
 use std::process::ExitCode;

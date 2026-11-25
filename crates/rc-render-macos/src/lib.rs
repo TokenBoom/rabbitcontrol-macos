@@ -53,6 +53,8 @@
 // 每个 unsafe 块必须有 // SAFETY: 注释 —— 只对 ffi 模块有实际约束。
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(all(target_os = "macos", feature = "bench-metrics"))]
+pub mod barcode;
 #[cfg(target_os = "macos")]
 pub(crate) mod ffi;
 #[cfg(target_os = "macos")]
@@ -60,8 +62,16 @@ mod renderer;
 #[cfg(target_os = "macos")]
 mod shader;
 
+#[cfg(all(target_os = "macos", feature = "bench-metrics"))]
+pub use ffi::{PresentTimingSample, PresentTimingSink};
 #[cfg(target_os = "macos")]
 pub use renderer::{MetalRenderer, MetalRendererConfig};
+
+/// 读取与 ScreenCaptureKit PTS / `MTLDrawable::presentedTime()` 同域的单调时钟（微秒，仅 `bench-metrics`）。
+#[cfg(all(target_os = "macos", feature = "bench-metrics"))]
+pub fn media_time_us() -> u64 {
+    ffi::media_time_us()
+}
 
 /// 真实窗口基准的安全封装（`window-bench` feature，非默认开启）。
 ///

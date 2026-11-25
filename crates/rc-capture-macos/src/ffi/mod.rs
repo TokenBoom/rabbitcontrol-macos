@@ -40,17 +40,20 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_foundation::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFArray, CFBoolean,
-    CFDictionary, CFNumber, CFRetained, CFString, CFType,
+    CFDictionary, CFNumber, CFRetained, CFString, CFType, CGRect,
 };
 use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetBytesPerRow,
     CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSValue};
+#[cfg(feature = "bench-metrics")]
+use objc2_screen_capture_kit::SCRunningApplication;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamDelegate, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCStreamDelegate, SCStreamFrameInfoDirtyRects, SCStreamFrameInfoStatus, SCStreamOutput,
+    SCStreamOutputType, SCWindow,
 };
 
 use rc_types::Resolution;
@@ -93,6 +96,14 @@ mod raw {
         ) -> i32;
         pub fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
         pub fn CGCancelDisplayConfiguration(config: *mut c_void) -> i32;
+        pub fn CGRectMakeWithDictionaryRepresentation(
+            dict: *const CFDictionary,
+            rect: *mut objc2_core_foundation::CGRect,
+        ) -> bool;
+        #[cfg(test)]
+        pub fn CGRectCreateDictionaryRepresentation(
+            rect: objc2_core_foundation::CGRect,
+        ) -> *const CFDictionary;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -828,6 +839,9 @@ pub(crate) struct FramePayload<B = PixelBufferHandle> {
     pub(crate) buffer: B,
     /// CMSampleBuffer 的 presentation timestamp，微秒（契约 C2 的原始来源）。
     pub(crate) pts_us: u64,
+    /// 帧回调入口采样时刻（微秒，与 PTS 同域；仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    pub(crate) callback_us: u64,
 }
 
 /// 控制事件（与最新视频帧分槽保存，绝不被新视频帧覆写）。
@@ -859,6 +873,8 @@ pub(crate) enum FrameEvent<B = PixelBufferHandle> {
 struct MailboxInner<B> {
     control: Option<ControlEvent>,
     latest_frame: Option<FramePayload<B>>,
+    #[cfg(feature = "bench-metrics")]
+    overwrites: u64,
 }
 
 /// 线程安全的「最新帧优先单槽邮箱」。
@@ -885,36 +901,52 @@ impl<B> FrameMailbox<B> {
             Mutex::new(MailboxInner {
                 control: None,
                 latest_frame: None,
+                #[cfg(feature = "bench-metrics")]
+                overwrites: 0,
             }),
             Condvar::new(),
         )))
     }
 
-    /// 投递最新视频帧：直接覆写 `latest_frame` 并立即 Drop 旧帧，随后唤醒等待者。
+    /// 投递最新视频帧：直接覆写 `latest_frame`、在锁外立即 Drop 旧帧并唤醒等待者。
     pub(crate) fn push_frame(&self, frame: FramePayload<B>) {
         let (lock, cvar) = &*self.0;
         let displaced = {
             let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
             let old = inner.latest_frame.replace(frame);
-            cvar.notify_one();
+            #[cfg(feature = "bench-metrics")]
+            if old.is_some() {
+                inner.overwrites = inner.overwrites.saturating_add(1);
+            }
             old
         };
-        // 在锁外立刻释放被覆盖的旧帧，第一时间归还 SCK IOSurface 池。
+        // 在锁外唤醒消费者并立即释放被覆盖的旧帧，避免唤醒后立即在互斥锁上碰撞，
+        // 同时第一时间归还 SCK IOSurface 池。
+        cvar.notify_one();
         drop(displaced);
     }
 
-    /// 投递控制事件（`Suspended` / `Stopped`）：写入独立控制槽，绝不被新视频帧覆写，并唤醒等待者。
+    /// 已被新帧覆写丢弃的旧帧累计次数（仅 `bench-metrics` 启用）。
+    #[cfg(feature = "bench-metrics")]
+    pub(crate) fn overwrites(&self) -> u64 {
+        let (lock, _) = &*self.0;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).overwrites
+    }
+
+    /// 投递控制事件（`Suspended` / `Stopped`）：写入独立控制槽，绝不被新视频帧覆写，并在锁外唤醒等待者。
     ///
     /// 若控制槽已有更致命的 `Stopped`，不会被后续 `Suspended` 降级。
     pub(crate) fn push_control(&self, event: ControlEvent) {
         let (lock, cvar) = &*self.0;
-        let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let should_write = !matches!(
-            (&inner.control, &event),
-            (Some(ControlEvent::Stopped { .. }), ControlEvent::Suspended)
-        );
-        if should_write {
-            inner.control = Some(event);
+        {
+            let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let should_write = !matches!(
+                (&inner.control, &event),
+                (Some(ControlEvent::Stopped { .. }), ControlEvent::Suspended)
+            );
+            if should_write {
+                inner.control = Some(event);
+            }
         }
         cvar.notify_one();
     }
@@ -1019,12 +1051,15 @@ pub(crate) const PIXEL_FORMAT_420V: u32 = kCVPixelFormatType_420YpCbCr8BiPlanarV
 // CMSampleBuffer 提取（帧回调里的轻量路径）
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 读取 SCK 附加在 sample buffer 上的帧状态（`SCStreamFrameInfoStatus`）。
+/// 读取 `CMSampleBuffer` 第 0 个样本附件字典并执行只读提取。
 ///
-/// 在 ScreenCaptureKit 中，`SCStreamFrameInfoStatus` 存放在
-/// `CMSampleBufferGetSampleAttachmentsArray(sb, false)` 返回数组的第 0 个
+/// 在 ScreenCaptureKit 中，`SCStreamFrameInfoStatus` / `SCStreamFrameInfoDirtyRects`
+/// 等均存放在 `CMSampleBufferGetSampleAttachmentsArray(sb, false)` 返回数组的第 0 个
 /// `CFDictionary` 里，而不是 sample buffer 顶层附件。
-fn frame_status(sb: &CMSampleBuffer) -> Option<SCFrameStatus> {
+fn with_sample_attachment_dict<T>(
+    sb: &CMSampleBuffer,
+    f: impl FnOnce(&CFDictionary) -> T,
+) -> Option<T> {
     // SAFETY: sb 是有效的 CMSampleBuffer；create_if_necessary = false 只查询
     // 已有附件数组而不修改 sample buffer，返回值已被绑定层 retain。
     let attachments = unsafe { sb.sample_attachments_array(false) }?;
@@ -1037,7 +1072,11 @@ fn frame_status(sb: &CMSampleBuffer) -> Option<SCFrameStatus> {
     // SAFETY: sample attachments array 的非空元素为 CFType 对象，存活期受
     // attachments 保护；随后 downcast_ref 通过 CFGetTypeID 在运行时校验其为 CFDictionary。
     let dict: &CFDictionary = unsafe { dict_ptr.cast::<CFType>().as_ref() }.downcast_ref()?;
+    Some(f(dict))
+}
 
+/// 从样本附件字典读取帧状态（`SCStreamFrameInfoStatus`）。
+fn frame_status_from_dict(dict: &CFDictionary) -> Option<SCFrameStatus> {
     // SAFETY: SCStreamFrameInfoStatus 是 ScreenCaptureKit 导出的 &'static NSString，
     // NSString 与 CFString toll-free bridged，指针可直接作为 CFDictionary 的键。
     let key: *const c_void = unsafe { std::ptr::addr_of!(*SCStreamFrameInfoStatus) }.cast();
@@ -1053,6 +1092,143 @@ fn frame_status(sb: &CMSampleBuffer) -> Option<SCFrameStatus> {
     // Suspended=3, Started=4, Stopped=5）。
     let status = number.as_isize()?;
     Some(SCFrameStatus(status))
+}
+
+/// 读取 SCK 附加在 sample buffer 上的帧状态（`SCStreamFrameInfoStatus`）。
+#[cfg_attr(not(test), allow(dead_code))]
+fn frame_status(sb: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    with_sample_attachment_dict(sb, frame_status_from_dict).flatten()
+}
+
+/// 从 `SCStreamFrameInfoDirtyRects` 数组元素中解码一个 `CGRect`（兼容 `NSValue` 与 `CFDictionary`）。
+fn decode_dirty_rect_element(elem_ptr: NonNull<c_void>) -> Option<CGRect> {
+    // SAFETY: `elem_ptr` 来自存活中的 `CFArray`，指向合法 CF/ObjC 对象。
+    let cf_elem: &CFType = unsafe { elem_ptr.cast::<CFType>().as_ref() };
+    if let Some(rect_dict) = cf_elem.downcast_ref::<CFDictionary>() {
+        let mut rect = CGRect::ZERO;
+        // SAFETY: `rect_dict` 为有效 CFDictionary，`rect` 为有效栈指针。
+        if unsafe { raw::CGRectMakeWithDictionaryRepresentation(rect_dict, &mut rect) } {
+            return Some(rect);
+        }
+        return None;
+    }
+    // SAFETY: 所有 CoreFoundation 对象均是合法 ObjC 对象（toll-free bridged），
+    // `downcast_ref::<NSValue>()` 通过运行时 `isKindOfClass:` 安全验证。
+    let obj_elem: &AnyObject = unsafe { elem_ptr.cast::<AnyObject>().as_ref() };
+    let ns_val = obj_elem.downcast_ref::<NSValue>()?;
+    if let Some(rect) = ns_val.get_rect() {
+        return Some(rect);
+    }
+    // 若系统以不同 struct tag（例如 CGRect vs _NSRect）封装，检查编码后再按 CGRect 读取。
+    if ns_val
+        .encoding()
+        .is_some_and(|enc| enc.starts_with("{CGRect=") || enc.starts_with("{_NSRect="))
+    {
+        // SAFETY: 已在上面验证 objCType 编码为 `{CGRect=...}` 或 `{_NSRect=...}`，
+        // 与 64 位 macOS 上 `CGRect` 内存布局完全一致。
+        return Some(unsafe { ns_val.get::<CGRect>() });
+    }
+    None
+}
+
+/// 判断一个 `CGRect` 是否具有正面积（有限且宽高均大于 0）。
+fn rect_has_positive_area(rect: CGRect) -> bool {
+    rect.size.width.is_finite()
+        && rect.size.height.is_finite()
+        && rect.size.width > 0.0
+        && rect.size.height > 0.0
+}
+
+/// 检查样本附件字典中的 `SCStreamFrameInfoDirtyRects` 是否表明有真实画面变动：
+/// - `None`：附件缺失或不是数组（无法证明无变化，调用方应保守放行）；
+/// - `Some(false)`：附件存在且为空数组，或全部矩形面积均为 0（静态微扰动，可跳过）；
+/// - `Some(true)`：至少存在一个正面积脏区（或存在无法解析的元素），必须放行。
+fn dirty_rects_from_dict(dict: &CFDictionary) -> Option<bool> {
+    // SAFETY: SCStreamFrameInfoDirtyRects 是 ScreenCaptureKit 导出的 &'static NSString，
+    // NSString 与 CFString toll-free bridged，指针可直接作为 CFDictionary 的键。
+    let key: *const c_void = unsafe { std::ptr::addr_of!(*SCStreamFrameInfoDirtyRects) }.cast();
+    // SAFETY: `dict` 是有效的 `CFDictionary`，`key` 为有效键，返回值在 `dict` 存活期内有效。
+    let raw_value = unsafe { dict.value(key) };
+    let value_ptr = NonNull::new(raw_value.cast_mut())?;
+    // SAFETY: 字典内非空附件值是 CFType 对象，存活期受 `dict` 保护；
+    // `downcast_ref::<CFArray>()` 覆盖 `NSArray`（toll-free bridged）。
+    let rects: &CFArray = unsafe { value_ptr.cast::<CFType>().as_ref() }.downcast_ref()?;
+    let count = rects.count();
+    if count <= 0 {
+        return Some(false);
+    }
+    for i in 0..count {
+        // SAFETY: `0 <= i < count`，元素指针在 `rects` 存活期内有效。
+        let raw_elem = unsafe { rects.value_at_index(i) };
+        let Some(elem_ptr) = NonNull::new(raw_elem.cast_mut()) else {
+            // 空元素无法判定零面积，保守放行。
+            return Some(true);
+        };
+        let Some(rect) = decode_dirty_rect_element(elem_ptr) else {
+            // 未知格式元素无法判定零面积，保守放行（绝不误丢真实帧）。
+            return Some(true);
+        };
+        if rect_has_positive_area(rect) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// 读取 `CMSampleBuffer` 的 `SCStreamFrameInfoDirtyRects` 判定是否应放行（仅非空/缺失时放行）。
+#[cfg_attr(not(test), allow(dead_code))]
+fn dirty_rects_indicate_change(sb: &CMSampleBuffer) -> bool {
+    with_sample_attachment_dict(sb, dirty_rects_from_dict)
+        .flatten()
+        .unwrap_or(true)
+}
+
+#[cfg(feature = "bench-metrics")]
+fn bench_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RC_BENCH_DEBUG").is_some())
+}
+
+/// 在 `bench-metrics` + `RC_BENCH_DEBUG` 下打印 `Complete` 帧的 `SCStreamFrameInfoDirtyRects`
+/// 矩形数量与总面积，用于排查静屏微扰动来源。
+#[cfg(feature = "bench-metrics")]
+fn log_dirty_rects_debug(dict: &CFDictionary, has_dirty_change: bool) {
+    // SAFETY: SCStreamFrameInfoDirtyRects 是 ScreenCaptureKit 导出的 &'static NSString。
+    let key: *const c_void = unsafe { std::ptr::addr_of!(*SCStreamFrameInfoDirtyRects) }.cast();
+    // SAFETY: `dict` 是有效的 `CFDictionary`，`key` 为有效键。
+    let raw_value = unsafe { dict.value(key) };
+    let Some(value_ptr) = NonNull::new(raw_value.cast_mut()) else {
+        eprintln!("[rc-capture-macos] dirty_rects=None passed={has_dirty_change}");
+        return;
+    };
+    // SAFETY: 字典内非空附件值是 CFType 对象，存活期受 `dict` 保护。
+    let Some(rects): Option<&CFArray> =
+        unsafe { value_ptr.cast::<CFType>().as_ref() }.downcast_ref()
+    else {
+        eprintln!("[rc-capture-macos] dirty_rects=NonArray passed={has_dirty_change}");
+        return;
+    };
+    let count = rects.count();
+    let mut total_area = 0.0f64;
+    let mut unknown = 0isize;
+    for i in 0..count {
+        // SAFETY: `0 <= i < count`，元素指针在 `rects` 存活期内有效。
+        let raw_elem = unsafe { rects.value_at_index(i) };
+        let Some(elem_ptr) = NonNull::new(raw_elem.cast_mut()) else {
+            unknown += 1;
+            continue;
+        };
+        let Some(rect) = decode_dirty_rect_element(elem_ptr) else {
+            unknown += 1;
+            continue;
+        };
+        if rect_has_positive_area(rect) {
+            total_area += rect.size.width * rect.size.height;
+        }
+    }
+    eprintln!(
+        "[rc-capture-macos] dirty_rects count={count} total_area={total_area:.1} unknown={unknown} passed={has_dirty_change}"
+    );
 }
 
 /// `CMTime` 换算成微秒。无效时间（flags 无 Valid 或 timescale 为 0）返回 None。
@@ -1084,16 +1260,18 @@ pub(crate) fn host_time_us() -> u64 {
 
 /// 计算传给 `SCStreamConfiguration::setMinimumFrameInterval` 的帧间隔（微秒）。
 ///
-/// 在 macOS ProMotion（120Hz，8.33ms 节拍）与 60Hz 显示器上，若严格传 `1/fps`
-/// （如 60fps = 16_667µs），轻微 vsync 抖动就会使 SCK 判定间隔不足而跳过当前刷新
-/// 并顺延到下一节拍（25ms = 40fps），实测帧率跌至 ~47.5fps。
-/// 取标称间隔的 75%（`750_000 / fps`）：
-/// - 60fps → `12_500µs`（严格落在 120Hz 的 8.33ms 与 60Hz 的 16.67ms 中点，既不放行
-///   120Hz 倍频帧，又为 60Hz 刷新留足 4.17ms 抖动容差）；
-/// - 120fps → `6_250µs`；30fps → `25_000µs`。
+/// - `fps >= 120`：返回 `0`（对应 Apple 文档 `kCMTimeZero`），按显示器原生高刷节拍交付，
+///   避免 120Hz ProMotion 下轻微抖动触发 SCK 节流丢帧（`skip_src`）；
+/// - `fps < 120`：取标称间隔的 90%（`900_000 / fps`）：
+///   - 60fps → `15_000µs`（严格落在 120Hz `8.33ms` / 80Hz `12.5ms` 与 60Hz `16.67ms` 之间，
+///     既挡掉 ProMotion 8.33ms/12.5ms 倍频/微扰帧，又保留 `1.67ms` 抖动容差，实测 `S2` 锁定 ~61fps）；
+///   - 30fps → `30_000µs`（保留 `3.33ms` 抖动容差）。
 pub(crate) fn minimum_frame_interval_us(fps: u32) -> i64 {
+    if fps >= 120 {
+        return 0;
+    }
     let fps = i64::from(fps.max(1));
-    (750_000 / fps).max(1)
+    (900_000 / fps).max(1)
 }
 
 /// 取出 sample buffer 里的像素缓冲（retain +1，交给 [`PixelBufferHandle`]）。
@@ -1158,11 +1336,34 @@ define_class!(
             if r#type != SCStreamOutputType::Screen {
                 return;
             }
-            let Some(status) = frame_status(sample_buffer) else {
+            let Some((status, has_dirty_change)) =
+                with_sample_attachment_dict(sample_buffer, |dict| {
+                    let status = frame_status_from_dict(dict)?;
+                    let has_dirty = match status {
+                        SCFrameStatus::Complete => {
+                            let dirty = dirty_rects_from_dict(dict).unwrap_or(true);
+                            #[cfg(feature = "bench-metrics")]
+                            if bench_debug_enabled() {
+                                log_dirty_rects_debug(dict, dirty);
+                            }
+                            dirty
+                        }
+                        _ => true,
+                    };
+                    Some((status, has_dirty))
+                })
+                .flatten()
+            else {
                 return;
             };
             match status {
-                SCFrameStatus::Complete => {}
+                SCFrameStatus::Complete => {
+                    if !has_dirty_change {
+                        // SCStreamFrameInfoDirtyRects 存在且为空 / 零面积：
+                        // 静屏微扰动，不接触像素直接按 Idle 跳过（契约 C1）。
+                        return;
+                    }
+                }
                 SCFrameStatus::Suspended => {
                     // 锁屏/挂起：上报 SessionLocked 语义，入独立控制槽，由上层决定重建。
                     self.ivars().mailbox.push_control(ControlEvent::Suspended);
@@ -1173,6 +1374,8 @@ define_class!(
                 _ => return,
             }
             let pts = pts_us(sample_buffer).unwrap_or(0);
+            #[cfg(feature = "bench-metrics")]
+            let callback_us = host_time_us();
             let Some(buffer) = image_buffer(sample_buffer) else {
                 return;
             };
@@ -1181,6 +1384,8 @@ define_class!(
             self.ivars().mailbox.push_frame(FramePayload {
                 buffer,
                 pts_us: pts,
+                #[cfg(feature = "bench-metrics")]
+                callback_us,
             });
         }
     }
@@ -1226,6 +1431,12 @@ pub(crate) struct DisplaySnapshot {
     pub scale: f32,
     /// 建 SCContentFilter 用的强引用。
     display: Retained<SCDisplay>,
+    /// 当前进程对应的 `SCRunningApplication`（仅 `bench-metrics` 排除自渲染窗用）。
+    #[cfg(feature = "bench-metrics")]
+    self_app: Option<Retained<SCRunningApplication>>,
+    /// 当前进程所属的 `SCWindow` 列表（`self_app` 缺失时的窗口级排除兜底）。
+    #[cfg(feature = "bench-metrics")]
+    self_windows: Vec<Retained<SCWindow>>,
 }
 
 /// 枚举所有可采集显示器（异步获取 `SCShareableContent`，坑 5）。
@@ -1233,6 +1444,25 @@ pub(crate) fn enumerate_displays() -> Result<Vec<DisplaySnapshot>, String> {
     let content = fetch_shareable_content(Duration::from_secs(3))?;
     // SAFETY: displays 是纯属性 getter。
     let displays = unsafe { content.displays() };
+    #[cfg(feature = "bench-metrics")]
+    let (self_app, self_windows) = {
+        let self_pid = std::process::id() as i32;
+        // SAFETY: applications 是纯属性 getter；processID 为只读 pid_t getter。
+        let app = unsafe { content.applications() }
+            .to_vec()
+            .into_iter()
+            .find(|app| unsafe { app.processID() } == self_pid);
+        // SAFETY: windows/owningApplication/processID 均为只读属性 getter。
+        let wins: Vec<Retained<SCWindow>> = unsafe { content.windows() }
+            .to_vec()
+            .into_iter()
+            .filter(|w| unsafe {
+                w.owningApplication()
+                    .is_some_and(|owner| owner.processID() == self_pid)
+            })
+            .collect();
+        (app, wins)
+    };
     // to_vec 是 objc2-foundation 的安全方法（逐个 retain 后返回 Vec）。
     Ok(displays
         .to_vec()
@@ -1256,6 +1486,10 @@ pub(crate) fn enumerate_displays() -> Result<Vec<DisplaySnapshot>, String> {
                     backing: Resolution::new(backing_w, backing_h),
                     scale,
                     display,
+                    #[cfg(feature = "bench-metrics")]
+                    self_app: self_app.clone(),
+                    #[cfg(feature = "bench-metrics")]
+                    self_windows: self_windows.clone(),
                 }
             }
         })
@@ -1352,17 +1586,26 @@ fn make_configuration(target: Resolution, fps: u32) -> Retained<SCStreamConfigur
         config.setHeight(target.height as usize);
         config.setScalesToFit(true);
     }
-    // minimumFrameInterval 带 10% vsync 抖动容差（见 minimum_frame_interval_us），
-    // 消除 ProMotion 120Hz 节拍拍频掉帧；静止画面下回调仍不触发（契约 C1）。
-    // SAFETY: 纯属性 setter。
-    unsafe {
-        config.setMinimumFrameInterval(CMTime {
+    // minimumFrameInterval：60Hz 带 10% vsync 抖动容差（15_000us），120Hz+ 用 kCMTimeZero
+    // 按显示器原生高刷率采集（见 minimum_frame_interval_us）；静止画面下回调仍不触发（契约 C1）。
+    let interval_us = minimum_frame_interval_us(fps);
+    let min_interval = if interval_us == 0 {
+        CMTime {
             epoch: 0,
             flags: CMTimeFlags::Valid,
-            value: minimum_frame_interval_us(fps),
+            value: 0,
+            timescale: 1,
+        }
+    } else {
+        CMTime {
+            epoch: 0,
+            flags: CMTimeFlags::Valid,
+            value: interval_us,
             timescale: 1_000_000,
-        });
-    }
+        }
+    };
+    // SAFETY: 纯属性 setter。
+    unsafe { config.setMinimumFrameInterval(min_interval) };
     // SCK 底层 IOSurface 池容量（见 SCK_SURFACE_POOL_DEPTH 注释，必须严格大于
     // 消费侧保活环 + 回调通道之和，避免池耗尽卡死出帧）。
     // SAFETY: 纯属性 setter。
@@ -1382,15 +1625,87 @@ fn make_filter(display: &DisplaySnapshot) -> Retained<SCContentFilter> {
     }
 }
 
-/// 构建、启动一条全新的 SCStream，返回句柄与最新帧优先单槽邮箱。
+/// 组装排除本进程窗口的 `SCContentFilter`（仅 `bench-metrics` 用，避免自渲染呈现场导致桌面反馈）。
+///
+/// 优先使用 `excludingWindows` 显式剔除同 PID 窗口（即便无 Dock 图标或窗口刚创建也精确生效），
+/// 若暂无可见 `SCWindow` 再回退到 `excludingApplications`。
+#[cfg(feature = "bench-metrics")]
+fn make_filter_excluding_self(display: &DisplaySnapshot) -> Retained<SCContentFilter> {
+    if std::env::var_os("RC_BENCH_DEBUG").is_some() {
+        eprintln!(
+            "[rc-capture-macos] bench filter: self_windows={} self_app={}",
+            display.self_windows.len(),
+            display.self_app.is_some()
+        );
+    }
+    if !display.self_windows.is_empty() {
+        let excluded_wins: Retained<NSArray<SCWindow>> =
+            NSArray::from_retained_slice(&display.self_windows);
+        // SAFETY: alloc + initWithDisplay:excludingWindows: 标准构造，display 与 excluded_wins 有效。
+        unsafe {
+            let allocated = SCContentFilter::alloc();
+            SCContentFilter::initWithDisplay_excludingWindows(
+                allocated,
+                &display.display,
+                &excluded_wins,
+            )
+        }
+    } else if let Some(app) = &display.self_app {
+        let excluded_apps: Retained<NSArray<SCRunningApplication>> = NSArray::from_slice(&[&**app]);
+        let empty_wins: Retained<NSArray<SCWindow>> = NSArray::new();
+        // SAFETY: alloc + initWithDisplay:excludingApplications:exceptingWindows: 标准构造，
+        // display、excluded_apps、empty_wins 均为有效的强引用 ObjC 对象。
+        unsafe {
+            let allocated = SCContentFilter::alloc();
+            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                allocated,
+                &display.display,
+                &excluded_apps,
+                &empty_wins,
+            )
+        }
+    } else {
+        eprintln!(
+            "[rc-capture-macos] bench warning: self_windows and self_app are both empty; capturing unfiltered display"
+        );
+        make_filter(display)
+    }
+}
+
+/// 创建 SCK 帧回调专用的高优先级串行队列（`QOS_CLASS_USER_INTERACTIVE` + 每帧自动释放池）。
+fn create_sck_callback_queue() -> dispatch2::DispatchRetained<dispatch2::DispatchQueue> {
+    let attr = dispatch2::DispatchQueueAttr::with_autorelease_frequency(
+        dispatch2::DispatchQueueAttr::SERIAL,
+        dispatch2::DispatchAutoReleaseFrequency::WORK_ITEM,
+    );
+    let attr = dispatch2::DispatchQueueAttr::with_qos_class(
+        Some(&attr),
+        dispatch2::DispatchQoS::UserInteractive,
+        0,
+    );
+    dispatch2::DispatchQueue::new("rc.capture.sck.frames", Some(&attr))
+}
+
+/// 带 `exclude_self` 选项构建 SCStream（`exclude_self` 仅在 `bench-metrics` 下生效）。
 ///
 /// 调用方（`sck.rs`）保证 `display` 是本次调用栈上刚枚举出来的快照。
-pub(crate) fn build_stream(
+pub(crate) fn build_stream_with_options(
     display: &DisplaySnapshot,
     target: Resolution,
     fps: u32,
+    exclude_self: bool,
 ) -> Result<(StreamHandles, FrameMailbox), String> {
-    let filter = make_filter(display);
+    #[cfg(feature = "bench-metrics")]
+    let filter = if exclude_self {
+        make_filter_excluding_self(display)
+    } else {
+        make_filter(display)
+    };
+    #[cfg(not(feature = "bench-metrics"))]
+    let filter = {
+        let _ = exclude_self;
+        make_filter(display)
+    };
     let config = make_configuration(target, fps);
     let mailbox = FrameMailbox::new();
     let handler = RcSckStreamHandler::new(mailbox.clone());
@@ -1409,12 +1724,7 @@ pub(crate) fn build_stream(
     };
 
     // 坑 6：帧回调走独立串行高优先级（UserInteractive）queue，不占用主队列 / 全局队列。
-    let attr = dispatch2::DispatchQueueAttr::with_qos_class(
-        dispatch2::DispatchQueueAttr::SERIAL,
-        dispatch2::DispatchQoS::UserInteractive,
-        0,
-    );
-    let queue = dispatch2::DispatchQueue::new("rc.capture.sck.frames", Some(&attr));
+    let queue = create_sck_callback_queue();
     // SAFETY: handler 实现了 SCStreamOutput；sample handler queue 为我们创建的
     // 串行队列，回调串行到达，满足协议的线程要求。
     unsafe {
@@ -1457,6 +1767,54 @@ pub(crate) fn build_stream(
         },
         mailbox,
     ))
+}
+
+/// 只读锁定 `'420v'` `CVPixelBuffer` 并拷贝左上角最多 `max_w × max_h` 像素的 Y 平面亮度数据（仅 `bench-metrics`）。
+#[cfg(feature = "bench-metrics")]
+pub(crate) fn read_pixel_buffer_y_region(
+    buf_ptr: *const c_void,
+    max_w: usize,
+    max_h: usize,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    use objc2_core_video::{
+        kCVReturnSuccess, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+        CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    };
+    if buf_ptr.is_null() {
+        return Err("CVPixelBuffer 指针为空".to_string());
+    }
+    if max_w == 0 || max_h == 0 {
+        return Err("读取区域宽高必须大于 0".to_string());
+    }
+    // SAFETY: 调用方传入的指针来自存活中的 `CapturedFrame`（`resource_guard` 保活），
+    // 指向有效 `CVPixelBuffer`。采用 `ReadOnly` 锁定并在退出前配对解锁。
+    let pb: &CVPixelBuffer = unsafe { &*(buf_ptr.cast::<CVPixelBuffer>()) };
+    // SAFETY: `pb` 指向已保活的有效 `CVPixelBuffer`，`ReadOnly` 标志合法且下方配对解锁。
+    let rv = unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    if rv != kCVReturnSuccess {
+        return Err(format!("CVPixelBufferLockBaseAddress(ReadOnly) 失败: {rv}"));
+    }
+    let plane_w = CVPixelBufferGetWidthOfPlane(pb, 0);
+    let plane_h = CVPixelBufferGetHeightOfPlane(pb, 0);
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *const u8;
+    if base.is_null() || plane_w == 0 || plane_h == 0 || stride < plane_w {
+        // SAFETY: 与上方 ReadOnly 加锁配对解锁。
+        unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+        return Err("CVPixelBuffer Y 平面无效或未就绪".to_string());
+    }
+    let w = plane_w.min(max_w);
+    let h = plane_h.min(max_h);
+    let mut out = vec![0u8; w * h];
+    for row in 0..h {
+        // SAFETY: row < plane_h 且 w <= plane_w <= stride，源切片位于已锁定的平面 0 内存内。
+        let src = unsafe { std::slice::from_raw_parts(base.add(row * stride), w) };
+        out[row * w..(row + 1) * w].copy_from_slice(src);
+    }
+    // SAFETY: 与上方 ReadOnly 加锁配对解锁。
+    unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
+    Ok((w, h, out))
 }
 
 #[cfg(test)]
@@ -1542,11 +1900,161 @@ mod tests {
     }
 
     #[test]
+    fn dirty_rects_filter_handles_empty_zero_area_positive_and_missing() {
+        use objc2_core_foundation::{CGPoint, CGSize};
+
+        let sb = make_empty_sample_buffer();
+        // 1. 无样本附件字典 -> 保守放行。
+        assert!(dirty_rects_indicate_change(&sb));
+
+        // SAFETY: sb 有效，create_if_necessary = true 创建附件数组与字典。
+        let attachments = unsafe { sb.sample_attachments_array(true) }
+            .expect("create_if_necessary=true 必须返回 CFArray");
+        // SAFETY: count == 1，索引 0 为可变字典。
+        let raw_dict = unsafe { attachments.value_at_index(0) };
+        let dict_ptr = NonNull::new(raw_dict.cast_mut()).expect("附件字典非空");
+        // SAFETY: 附件数组元素为 CFMutableDictionary，存活期受 attachments 保护。
+        let dict: &CFMutableDictionary = unsafe { dict_ptr.cast::<CFMutableDictionary>().as_ref() };
+        // SAFETY: SCStreamFrameInfoDirtyRects 为系统导出的 &'static NSString。
+        let dirty_key: *const c_void =
+            unsafe { std::ptr::addr_of!(*SCStreamFrameInfoDirtyRects) }.cast();
+
+        // 2. 字典内无 dirtyRects 键 -> None（保守放行）。
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), None);
+        assert!(dirty_rects_indicate_change(&sb));
+
+        // 3. 空 NSArray -> Some(false)（静屏跳过）。
+        let empty_arr: Retained<NSArray<NSValue>> = NSArray::new();
+        let empty_ptr: *const c_void = Retained::as_ptr(&empty_arr).cast();
+        // SAFETY: dict 与 empty_ptr 均为有效 CF/ObjC 对象，set_value 会 retain。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, empty_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(false));
+        assert!(!dirty_rects_indicate_change(&sb));
+
+        // 4. 全部为零面积的 NSValue(CGRect)（0x0 / 宽 0 / 高 0 / 负边）-> Some(false)（静屏跳过）。
+        let zero_rects = [
+            NSValue::new(CGRect::ZERO),
+            NSValue::new(CGRect::new(
+                CGPoint::new(10.0, 20.0),
+                CGSize::new(0.0, 40.0),
+            )),
+            NSValue::new(CGRect::new(
+                CGPoint::new(10.0, 20.0),
+                CGSize::new(40.0, 0.0),
+            )),
+            NSValue::new(CGRect::new(
+                CGPoint::new(10.0, 20.0),
+                CGSize::new(-5.0, 10.0),
+            )),
+        ];
+        let zero_arr = NSArray::from_retained_slice(&zero_rects);
+        let zero_ptr: *const c_void = Retained::as_ptr(&zero_arr).cast();
+        // SAFETY: dict 与 zero_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, zero_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(false));
+        assert!(!dirty_rects_indicate_change(&sb));
+
+        // 5. 包含正面积矩形的 NSValue(CGRect)（即便前面有零面积矩形）-> Some(true)（放行）。
+        let mixed_rects = [
+            NSValue::new(CGRect::ZERO),
+            NSValue::new(CGRect::new(CGPoint::new(4.0, 8.0), CGSize::new(12.0, 6.0))),
+        ];
+        let mixed_arr = NSArray::from_retained_slice(&mixed_rects);
+        let mixed_ptr: *const c_void = Retained::as_ptr(&mixed_arr).cast();
+        // SAFETY: dict 与 mixed_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, mixed_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(true));
+        assert!(dirty_rects_indicate_change(&sb));
+
+        // 6. CFDictionary 表示的 CGRect：零面积跳过、正面积放行。
+        // SAFETY: CGRectCreateDictionaryRepresentation 返回 +1 CFDictionary。
+        let cf_zero_ptr = unsafe { raw::CGRectCreateDictionaryRepresentation(CGRect::ZERO) };
+        // SAFETY: `cf_zero_ptr` 非空且遵循 Create Rule，拥有 +1 引用。
+        let cf_zero_dict =
+            unsafe { CFRetained::from_raw(NonNull::new(cf_zero_ptr.cast_mut()).unwrap()) };
+        let cf_zero_elems = [CFRetained::as_ptr(&cf_zero_dict).as_ptr().cast::<c_void>()];
+        // SAFETY: 1 个有效 CFDictionary 指针的数组。
+        let cf_zero_arr = unsafe {
+            CFArray::new(
+                None,
+                cf_zero_elems.as_ptr() as *mut *const c_void,
+                1,
+                &objc2_core_foundation::kCFTypeArrayCallBacks,
+            )
+        }
+        .unwrap();
+        let cf_zero_arr_ptr: *const c_void = CFRetained::as_ptr(&cf_zero_arr).as_ptr().cast();
+        // SAFETY: dict 与 cf_zero_arr_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, cf_zero_arr_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(false));
+
+        let pos_rect = CGRect::new(CGPoint::new(1.0, 2.0), CGSize::new(64.0, 32.0));
+        // SAFETY: CGRectCreateDictionaryRepresentation 返回 +1 CFDictionary。
+        let cf_pos_ptr = unsafe { raw::CGRectCreateDictionaryRepresentation(pos_rect) };
+        // SAFETY: `cf_pos_ptr` 非空且遵循 Create Rule，拥有 +1 引用。
+        let cf_pos_dict =
+            unsafe { CFRetained::from_raw(NonNull::new(cf_pos_ptr.cast_mut()).unwrap()) };
+        let cf_pos_elems = [CFRetained::as_ptr(&cf_pos_dict).as_ptr().cast::<c_void>()];
+        // SAFETY: 1 个有效 CFDictionary 指针的数组。
+        let cf_pos_arr = unsafe {
+            CFArray::new(
+                None,
+                cf_pos_elems.as_ptr() as *mut *const c_void,
+                1,
+                &objc2_core_foundation::kCFTypeArrayCallBacks,
+            )
+        }
+        .unwrap();
+        let cf_pos_arr_ptr: *const c_void = CFRetained::as_ptr(&cf_pos_arr).as_ptr().cast();
+        // SAFETY: dict 与 cf_pos_arr_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, cf_pos_arr_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(true));
+
+        // 7. 未知数组元素（如 CFNumber）-> 保守放行 Some(true)。
+        let num = CFNumber::new_isize(42);
+        let unknown_elems = [CFRetained::as_ptr(&num).as_ptr().cast::<c_void>()];
+        // SAFETY: 1 个有效 CFNumber 指针的数组。
+        let unknown_arr = unsafe {
+            CFArray::new(
+                None,
+                unknown_elems.as_ptr() as *mut *const c_void,
+                1,
+                &objc2_core_foundation::kCFTypeArrayCallBacks,
+            )
+        }
+        .unwrap();
+        let unknown_arr_ptr: *const c_void = CFRetained::as_ptr(&unknown_arr).as_ptr().cast();
+        // SAFETY: dict 与 unknown_arr_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, unknown_arr_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), Some(true));
+
+        // 8. 非数组值（如 CFNumber）-> None（保守放行）。
+        let num_ptr: *const c_void = CFRetained::as_ptr(&num).as_ptr().cast();
+        // SAFETY: dict 与 num_ptr 均有效。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, num_ptr) };
+        assert_eq!(dirty_rects_from_dict(dict.as_ref()), None);
+        assert!(dirty_rects_indicate_change(&sb));
+    }
+
+    #[test]
+    fn sck_callback_queue_uses_user_interactive_qos() {
+        let queue = create_sck_callback_queue();
+        // SAFETY: `queue` 为有效 DispatchQueue，查询其 QoS class 为只读操作。
+        let qos = unsafe { queue.qos_class(std::ptr::null_mut()) };
+        assert_eq!(qos, dispatch2::DispatchQoS::UserInteractive);
+    }
+
+    #[test]
     fn minimum_frame_interval_leaves_vsync_jitter_margin() {
-        // 60fps: 12.5ms 严格位于 120Hz (8.33ms) 与 60Hz (16.67ms) 中点。
-        assert_eq!(minimum_frame_interval_us(60), 12_500);
-        assert_eq!(minimum_frame_interval_us(120), 6_250);
-        assert_eq!(minimum_frame_interval_us(30), 25_000);
+        // 60fps: 15.0ms 严格大于 120Hz (8.33ms) 与 80Hz (12.5ms)，同时相对 16.67ms 留 1.67ms 容差。
+        assert_eq!(minimum_frame_interval_us(60), 15_000);
+        // 30fps: 30.0ms 相对 33.33ms 留 3.33ms 容差。
+        assert_eq!(minimum_frame_interval_us(30), 30_000);
+        // 120fps+: 0 表示 kCMTimeZero（原生高刷不节流，消除 SCK skip_src 饥饿）。
+        assert_eq!(minimum_frame_interval_us(120), 0);
+        assert_eq!(minimum_frame_interval_us(240), 0);
+        // 0fps 防御性钳位到 1fps。
+        assert_eq!(minimum_frame_interval_us(0), 900_000);
         // host_time_us 返回单调非零微秒。
         let t1 = host_time_us();
         let t2 = host_time_us();
@@ -1591,8 +2099,12 @@ mod tests {
                     dropped: Arc::clone(&dropped),
                 },
                 pts_us,
+                #[cfg(feature = "bench-metrics")]
+                callback_us: pts_us + 50,
             });
         }
+        #[cfg(feature = "bench-metrics")]
+        assert_eq!(mailbox.overwrites(), 2);
         assert_eq!(
             *dropped.lock().unwrap(),
             vec![1, 2],
@@ -1633,6 +2145,8 @@ mod tests {
                     dropped: dropped_clone,
                 },
                 pts_us: 400,
+                #[cfg(feature = "bench-metrics")]
+                callback_us: 450,
             });
         });
         let wake_start = Instant::now();
@@ -1661,15 +2175,21 @@ mod tests {
         mailbox.push_frame(FramePayload {
             buffer: 1,
             pts_us: 100,
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 110,
         });
         mailbox.push_control(ControlEvent::Suspended);
         mailbox.push_frame(FramePayload {
             buffer: 2,
             pts_us: 200,
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 210,
         });
         mailbox.push_frame(FramePayload {
             buffer: 3,
             pts_us: 300,
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 310,
         });
 
         assert!(
@@ -1682,10 +2202,10 @@ mod tests {
 
         // 取出控制事件后，帧槽中保留的仍是最新帧 3。
         match mailbox.recv_timeout(Duration::from_millis(50)) {
-            Some(FrameEvent::Frame(FramePayload {
-                buffer: 3,
-                pts_us: 300,
-            })) => {}
+            Some(FrameEvent::Frame(payload)) => {
+                assert_eq!(payload.buffer, 3);
+                assert_eq!(payload.pts_us, 300);
+            }
             _ => panic!("控制事件取出后，帧槽应保留最新视频帧 3"),
         }
 
@@ -1698,6 +2218,8 @@ mod tests {
         mailbox.push_frame(FramePayload {
             buffer: 4,
             pts_us: 400,
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 410,
         });
 
         match mailbox.recv_timeout(Duration::from_millis(50)) {
@@ -1705,10 +2227,10 @@ mod tests {
             _ => panic!("致命 Stopped 不应被后续 Suspended 或视频帧覆写"),
         }
         match mailbox.recv_timeout(Duration::from_millis(50)) {
-            Some(FrameEvent::Frame(FramePayload {
-                buffer: 4,
-                pts_us: 400,
-            })) => {}
+            Some(FrameEvent::Frame(payload)) => {
+                assert_eq!(payload.buffer, 4);
+                assert_eq!(payload.pts_us, 400);
+            }
             _ => panic!("应取出剩余最新视频帧 4"),
         }
         assert!(mailbox.recv_timeout(Duration::from_millis(10)).is_none());

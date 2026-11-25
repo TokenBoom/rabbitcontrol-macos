@@ -26,7 +26,8 @@ use std::time::Instant;
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+    ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
@@ -209,7 +210,171 @@ impl ClickTracker {
     }
 }
 
-/// [`EventPoster`] 的 CGEvent 生产实现：持有事件源，把 [`PlannedEvent`]
+/// `IOKit/hidsystem/IOLLEvent.h` 中定义的左右修饰键设备相关掩码位。
+///
+/// `core-graphics` 0.24 的 [`CGEventFlags`] 仅声明了设备无关位（`Shift`/`Control`/
+/// `Alternate`/`Command`）；合成 `FlagsChanged` 及组合键事件同时带上左右设备位，
+/// 才能与真实键盘事件布局对齐（例如 LeftShift = `0x0002_0002`、LeftOption = `0x0008_0020`）。
+const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
+const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
+const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
+const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
+const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
+const NX_DEVICERCTLKEYMASK: u64 = 0x0000_2000;
+
+/// 受 [`ModifierTracker`] 管理的全部修饰键标志位（4 个设备无关位 + 8 个左右设备位）。
+///
+/// 写入 `CGEvent` 时只替换这一组位，保留 `NumericPad` / `SecondaryFn` /
+/// `AlphaShift` 等非追踪键位（例如 `Shift + ArrowUp` 仍保留方向键的 `NumericPad | SecondaryFn`）。
+const TRACKED_MODIFIER_MASK: u64 = CGEventFlags::CGEventFlagShift.bits()
+    | CGEventFlags::CGEventFlagControl.bits()
+    | CGEventFlags::CGEventFlagAlternate.bits()
+    | CGEventFlags::CGEventFlagCommand.bits()
+    | NX_DEVICELCTLKEYMASK
+    | NX_DEVICELSHIFTKEYMASK
+    | NX_DEVICERSHIFTKEYMASK
+    | NX_DEVICELCMDKEYMASK
+    | NX_DEVICERCMDKEYMASK
+    | NX_DEVICELALTKEYMASK
+    | NX_DEVICERALTKEYMASK
+    | NX_DEVICERCTLKEYMASK;
+
+#[derive(Debug, Clone, Copy)]
+struct ModifierSpec {
+    keycode: u16,
+    slot_bit: u8,
+    generic_flag: u64,
+    device_flag: u64,
+}
+
+const MODIFIER_SPECS: [ModifierSpec; 8] = [
+    ModifierSpec {
+        keycode: 0x38, // 56: kVK_Shift (LeftShift)
+        slot_bit: 1 << 0,
+        generic_flag: CGEventFlags::CGEventFlagShift.bits(),
+        device_flag: NX_DEVICELSHIFTKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x3C, // 60: kVK_RightShift
+        slot_bit: 1 << 1,
+        generic_flag: CGEventFlags::CGEventFlagShift.bits(),
+        device_flag: NX_DEVICERSHIFTKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x3B, // 59: kVK_Control (LeftControl)
+        slot_bit: 1 << 2,
+        generic_flag: CGEventFlags::CGEventFlagControl.bits(),
+        device_flag: NX_DEVICELCTLKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x3E, // 62: kVK_RightControl
+        slot_bit: 1 << 3,
+        generic_flag: CGEventFlags::CGEventFlagControl.bits(),
+        device_flag: NX_DEVICERCTLKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x3A, // 58: kVK_Option (LeftOption)
+        slot_bit: 1 << 4,
+        generic_flag: CGEventFlags::CGEventFlagAlternate.bits(),
+        device_flag: NX_DEVICELALTKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x3D, // 61: kVK_RightOption
+        slot_bit: 1 << 5,
+        generic_flag: CGEventFlags::CGEventFlagAlternate.bits(),
+        device_flag: NX_DEVICERALTKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x37, // 55: kVK_Command (LeftCommand)
+        slot_bit: 1 << 6,
+        generic_flag: CGEventFlags::CGEventFlagCommand.bits(),
+        device_flag: NX_DEVICELCMDKEYMASK,
+    },
+    ModifierSpec {
+        keycode: 0x36, // 54: kVK_RightCommand
+        slot_bit: 1 << 7,
+        generic_flag: CGEventFlags::CGEventFlagCommand.bits(),
+        device_flag: NX_DEVICERCMDKEYMASK,
+    },
+];
+
+/// 合成修饰键状态追踪器（支持左右 Shift / Ctrl / Option / Command 独立跟踪）。
+///
+/// 按键槽位而非扁平掩码记录，避免「同时按住左右 Shift 时松开一侧误清通用 `Shift` 位」；
+/// 每次查询 [`Self::cg_flags`] 均从当前按住槽位重新汇总设备无关位与左右设备位。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ModifierTracker {
+    held_slots: u8,
+}
+
+impl ModifierTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn spec_for_keycode(keycode: u16) -> Option<&'static ModifierSpec> {
+        MODIFIER_SPECS.iter().find(|spec| spec.keycode == keycode)
+    }
+
+    /// 更新修饰键按下状态；若 `keycode` 为 8 个受管修饰键之一则返回更新后的 `CGEventFlags` 掩码。
+    pub(crate) fn update(&mut self, keycode: u16, pressed: bool) -> Option<u64> {
+        let spec = Self::spec_for_keycode(keycode)?;
+        if pressed {
+            self.held_slots |= spec.slot_bit;
+        } else {
+            self.held_slots &= !spec.slot_bit;
+        }
+        Some(self.cg_flags())
+    }
+
+    /// 当前按住的修饰键对应的 `CGEventFlags` 位掩码（含设备无关位与左右设备位）。
+    pub(crate) fn cg_flags(&self) -> u64 {
+        let mut flags = 0u64;
+        for spec in &MODIFIER_SPECS {
+            if (self.held_slots & spec.slot_bit) != 0 {
+                flags |= spec.generic_flag | spec.device_flag;
+            }
+        }
+        flags
+    }
+
+    /// 是否没有任何修饰键处于按住状态。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held_slots == 0
+    }
+
+    /// 逐个释放仍处于按住状态的修饰键，返回 `(要释放的 keycode, 释放后的残余 flags)`。
+    pub(crate) fn pop_held(&mut self) -> Option<(u16, u64)> {
+        let spec = MODIFIER_SPECS
+            .iter()
+            .find(|spec| (self.held_slots & spec.slot_bit) != 0)?;
+        self.held_slots &= !spec.slot_bit;
+        Some((spec.keycode, self.cg_flags()))
+    }
+}
+
+/// 将 `tracked_flags` 写入 `CGEvent`，同时保留 `NumericPad` / `SecondaryFn` 等非追踪位。
+fn apply_modifier_flags(event: &CGEvent, tracked_flags: u64) {
+    let preserved = event.get_flags().bits() & !TRACKED_MODIFIER_MASK;
+    event.set_flags(CGEventFlags::from_bits_retain(preserved | tracked_flags));
+}
+
+fn new_flags_changed_event(
+    source: CGEventSource,
+    keycode: u16,
+    pressed: bool,
+    tracked_flags: u64,
+) -> Result<CGEvent, InputError> {
+    let event = CGEvent::new_keyboard_event(source, keycode, pressed)
+        .map_err(|_| InputError::EventCreateFailed("keyboard"))?;
+    event.set_type(CGEventType::FlagsChanged);
+    apply_modifier_flags(&event, tracked_flags);
+    Ok(event)
+}
+
+/// [`EventPoster`] 的 CGEvent 生产实现：持有私有事件源，把 [`PlannedEvent`]
 /// 构造成 `CGEvent` 并 `CGEventPost` 到 HID 层事件 tap。
 ///
 /// **前置**：`CGEventPost` 需要辅助功能授权（`AXIsProcessTrusted`），
@@ -218,6 +383,7 @@ impl ClickTracker {
 pub struct CgPoster {
     source: CGEventSource,
     clicks: ClickTracker,
+    modifiers: ModifierTracker,
     origin: Instant,
 }
 
@@ -231,21 +397,26 @@ pub struct CgPoster {
 unsafe impl Send for CgPoster {}
 
 impl CgPoster {
-    /// 创建事件源。用 `HIDSystemState`：合成事件从 HID 层进入系统，
-    /// 对绝大多数应用可见（含要求硬件事件的游戏类）。
+    /// 创建事件源。使用 `Private` 状态表：
+    ///
+    /// - 遵循 Apple `CGEventSource.h` 对远控程序的建议，维护独立于物理硬件的状态表，
+    ///   绝不污染或锁死 `HIDSystemState`（避免 `CGEventSourceFlagsState(HIDSystemState)`
+    ///   残余左 Shift 粘连）；
+    /// - 不继承宿主 `HIDSystemState` / `CombinedSessionState` 可能残留的修饰位；
+    /// - 投递目标仍为 `CGEventTapLocation::HID`，HID / Session `CGEventTap` 与应用窗口均可见。
     pub fn new() -> Result<Self, InputError> {
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        let source = CGEventSource::new(CGEventSourceStateID::Private)
             .map_err(|_| InputError::SourceCreateFailed)?;
         Ok(Self {
             source,
             clicks: ClickTracker::new(),
+            modifiers: ModifierTracker::new(),
             origin: Instant::now(),
         })
     }
-}
 
-impl EventPoster for CgPoster {
-    fn post(&mut self, planned: &PlannedEvent) -> Result<(), InputError> {
+    /// 根据 [`PlannedEvent`] 构造待投递的 `CGEvent` 并同步合成修饰键掩码（不执行 `post`）。
+    pub(crate) fn build_cg_event(&mut self, planned: &PlannedEvent) -> Result<CGEvent, InputError> {
         match planned {
             PlannedEvent::Mouse { kind, button, x, y } => {
                 let t_us = u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -301,22 +472,62 @@ impl EventPoster for CgPoster {
                 )
                 .map_err(|_| InputError::EventCreateFailed("mouse"))?;
                 event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
-                event.post(CGEventTapLocation::HID);
-                Ok(())
+                apply_modifier_flags(&event, self.modifiers.cg_flags());
+                Ok(event)
             }
             PlannedEvent::Scroll { dx, dy } => {
                 let event = new_line_scroll_event(self.source.clone(), *dx, *dy)
                     .map_err(|_| InputError::EventCreateFailed("scroll"))?;
-                event.post(CGEventTapLocation::HID);
-                Ok(())
+                apply_modifier_flags(&event, self.modifiers.cg_flags());
+                Ok(event)
             }
             PlannedEvent::Key { keycode, pressed } => {
-                let event = CGEvent::new_keyboard_event(self.source.clone(), *keycode, *pressed)
-                    .map_err(|_| InputError::EventCreateFailed("keyboard"))?;
-                event.post(CGEventTapLocation::HID);
-                Ok(())
+                if let Some(tracked_flags) = self.modifiers.update(*keycode, *pressed) {
+                    new_flags_changed_event(self.source.clone(), *keycode, *pressed, tracked_flags)
+                } else {
+                    let event =
+                        CGEvent::new_keyboard_event(self.source.clone(), *keycode, *pressed)
+                            .map_err(|_| InputError::EventCreateFailed("keyboard"))?;
+                    apply_modifier_flags(&event, self.modifiers.cg_flags());
+                    Ok(event)
+                }
             }
         }
+    }
+
+    /// 排空仍处于按住状态的修饰键，依次生成 `FlagsChanged` 释放事件（末条掩码必为 `0`）。
+    pub(crate) fn drain_drop_release_events(&mut self) -> Result<Vec<CGEvent>, InputError> {
+        let mut events = Vec::new();
+        while let Some((keycode, remaining_flags)) = self.modifiers.pop_held() {
+            events.push(new_flags_changed_event(
+                self.source.clone(),
+                keycode,
+                false,
+                remaining_flags,
+            )?);
+        }
+        Ok(events)
+    }
+}
+
+impl Drop for CgPoster {
+    fn drop(&mut self) {
+        if self.modifiers.is_empty() {
+            return;
+        }
+        if let Ok(events) = self.drain_drop_release_events() {
+            for event in events {
+                event.post(CGEventTapLocation::HID);
+            }
+        }
+    }
+}
+
+impl EventPoster for CgPoster {
+    fn post(&mut self, planned: &PlannedEvent) -> Result<(), InputError> {
+        let event = self.build_cg_event(planned)?;
+        event.post(CGEventTapLocation::HID);
+        Ok(())
     }
 }
 
@@ -433,5 +644,299 @@ mod tests {
             2
         );
         assert_eq!(tracker.on_up(PointerButtonKind::Right), 2);
+    }
+
+    #[test]
+    fn modifier_tracker_maps_all_eight_modifier_keycodes() {
+        let cases: &[(u16, u64)] = &[
+            (
+                56, // LeftShift (0x38)
+                CGEventFlags::CGEventFlagShift.bits() | NX_DEVICELSHIFTKEYMASK,
+            ),
+            (
+                60, // RightShift (0x3C)
+                CGEventFlags::CGEventFlagShift.bits() | NX_DEVICERSHIFTKEYMASK,
+            ),
+            (
+                59, // LeftControl (0x3B)
+                CGEventFlags::CGEventFlagControl.bits() | NX_DEVICELCTLKEYMASK,
+            ),
+            (
+                62, // RightControl (0x3E)
+                CGEventFlags::CGEventFlagControl.bits() | NX_DEVICERCTLKEYMASK,
+            ),
+            (
+                58, // LeftOption (0x3A)
+                CGEventFlags::CGEventFlagAlternate.bits() | NX_DEVICELALTKEYMASK,
+            ),
+            (
+                61, // RightOption (0x3D)
+                CGEventFlags::CGEventFlagAlternate.bits() | NX_DEVICERALTKEYMASK,
+            ),
+            (
+                55, // LeftCommand (0x37)
+                CGEventFlags::CGEventFlagCommand.bits() | NX_DEVICELCMDKEYMASK,
+            ),
+            (
+                54, // RightCommand (0x36)
+                CGEventFlags::CGEventFlagCommand.bits() | NX_DEVICERCMDKEYMASK,
+            ),
+        ];
+
+        for &(keycode, expected_flags) in cases {
+            let mut tracker = ModifierTracker::new();
+            assert!(tracker.is_empty());
+            assert_eq!(tracker.update(keycode, true), Some(expected_flags));
+            assert_eq!(tracker.cg_flags(), expected_flags);
+            assert!(!tracker.is_empty());
+            assert_eq!(tracker.update(keycode, false), Some(0));
+            assert_eq!(tracker.cg_flags(), 0);
+            assert!(tracker.is_empty());
+        }
+
+        // 非修饰键（A / Escape / CapsLock / Fn）不得被 ModifierTracker 吞为 FlagsChanged
+        let mut tracker = ModifierTracker::new();
+        for non_mod in [0x00u16, 0x35, 0x39, 0x3F] {
+            assert_eq!(tracker.update(non_mod, true), None);
+            assert_eq!(tracker.update(non_mod, false), None);
+        }
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn modifier_tracker_handles_left_right_same_family_and_option_shift_chords() {
+        let mut tracker = ModifierTracker::new();
+        let lshift = CGEventFlags::CGEventFlagShift.bits() | NX_DEVICELSHIFTKEYMASK;
+        let rshift = CGEventFlags::CGEventFlagShift.bits() | NX_DEVICERSHIFTKEYMASK;
+        let lopt = CGEventFlags::CGEventFlagAlternate.bits() | NX_DEVICELALTKEYMASK;
+
+        // 同时按住左右 Shift：松开左侧时通用 Shift 位必须仍由右侧维持
+        assert_eq!(tracker.update(56, true), Some(lshift));
+        assert_eq!(tracker.update(60, true), Some(lshift | rshift));
+        assert_eq!(tracker.update(56, false), Some(rshift));
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.update(60, false), Some(0));
+        assert!(tracker.is_empty());
+
+        // Option + Shift 组合（S13 场景）+ 幂等重复按下/释放 + 干净归零
+        assert_eq!(tracker.update(58, true), Some(lopt));
+        assert_eq!(tracker.update(58, true), Some(lopt));
+        assert_eq!(tracker.update(56, true), Some(lopt | lshift));
+        assert_eq!(tracker.update(56, false), Some(lopt));
+        assert_eq!(tracker.update(56, false), Some(lopt));
+        assert_eq!(tracker.update(58, false), Some(0));
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn cg_poster_builds_flags_changed_chords_and_resets_to_zero() {
+        let mut poster = CgPoster::new().expect("Private CGEventSource 无需辅助功能权限");
+        let lopt = CGEventFlags::CGEventFlagAlternate.bits() | NX_DEVICELALTKEYMASK;
+        let lshift = CGEventFlags::CGEventFlagShift.bits() | NX_DEVICELSHIFTKEYMASK;
+        let chord = lopt | lshift;
+
+        // 1. 初始非修饰键无残留修饰位（即使宿主 HIDSystemState 存在历史粘连）
+        let plain_a = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 0x00,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(plain_a.get_type() as u32, CGEventType::KeyDown as u32);
+        assert_eq!(plain_a.get_flags().bits() & TRACKED_MODIFIER_MASK, 0);
+
+        // 2. Option + Shift 按下：产生 FlagsChanged 且累积掩码准确
+        let opt_down = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 58,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(opt_down.get_type() as u32, CGEventType::FlagsChanged as u32);
+        assert_eq!(
+            opt_down.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+            58
+        );
+        assert_eq!(opt_down.get_flags().bits() & TRACKED_MODIFIER_MASK, lopt);
+
+        let shift_down = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 56,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(
+            shift_down.get_type() as u32,
+            CGEventType::FlagsChanged as u32
+        );
+        assert_eq!(shift_down.get_flags().bits() & TRACKED_MODIFIER_MASK, chord);
+
+        // 3. 组合键期间普通键（A）和方向键（ArrowUp）均携带完整 Option+Shift 掩码，
+        //    且 ArrowUp 保留 NumericPad / SecondaryFn 标志。
+        let chord_a = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 0x00,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(chord_a.get_type() as u32, CGEventType::KeyDown as u32);
+        assert_eq!(chord_a.get_flags().bits() & TRACKED_MODIFIER_MASK, chord);
+
+        let chord_up = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 0x7E,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(chord_up.get_flags().bits() & TRACKED_MODIFIER_MASK, chord);
+        assert!(chord_up
+            .get_flags()
+            .contains(CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn));
+
+        // 4. 逐一松开后修饰位必须干净归零
+        let shift_up = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 56,
+                pressed: false,
+            })
+            .unwrap();
+        assert_eq!(shift_up.get_type() as u32, CGEventType::FlagsChanged as u32);
+        assert_eq!(shift_up.get_flags().bits() & TRACKED_MODIFIER_MASK, lopt);
+
+        let opt_up = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 58,
+                pressed: false,
+            })
+            .unwrap();
+        assert_eq!(opt_up.get_type() as u32, CGEventType::FlagsChanged as u32);
+        assert_eq!(opt_up.get_flags().bits() & TRACKED_MODIFIER_MASK, 0);
+
+        let after_a = poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 0x00,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!(after_a.get_flags().bits() & TRACKED_MODIFIER_MASK, 0);
+        assert!(poster.modifiers.is_empty());
+    }
+
+    #[test]
+    fn cg_poster_carries_modifiers_on_mouse_and_scroll_events() {
+        let mut poster = CgPoster::new().expect("Private CGEventSource 无需辅助功能权限");
+        let lcmd = CGEventFlags::CGEventFlagCommand.bits() | NX_DEVICELCMDKEYMASK;
+
+        poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 55, // LeftCommand down
+                pressed: true,
+            })
+            .unwrap();
+
+        let mv = poster
+            .build_cg_event(&PlannedEvent::Mouse {
+                kind: PlannedMouseKind::Moved,
+                button: PointerButtonKind::Left,
+                x: 100.0,
+                y: 200.0,
+            })
+            .unwrap();
+        assert_eq!(mv.get_flags().bits() & TRACKED_MODIFIER_MASK, lcmd);
+
+        let down = poster
+            .build_cg_event(&PlannedEvent::Mouse {
+                kind: PlannedMouseKind::Down,
+                button: PointerButtonKind::Left,
+                x: 100.0,
+                y: 200.0,
+            })
+            .unwrap();
+        assert_eq!(down.get_flags().bits() & TRACKED_MODIFIER_MASK, lcmd);
+
+        let drag = poster
+            .build_cg_event(&PlannedEvent::Mouse {
+                kind: PlannedMouseKind::Moved,
+                button: PointerButtonKind::Left,
+                x: 120.0,
+                y: 220.0,
+            })
+            .unwrap();
+        assert_eq!(drag.get_type() as u32, CGEventType::LeftMouseDragged as u32);
+        assert_eq!(drag.get_flags().bits() & TRACKED_MODIFIER_MASK, lcmd);
+
+        let up = poster
+            .build_cg_event(&PlannedEvent::Mouse {
+                kind: PlannedMouseKind::Up,
+                button: PointerButtonKind::Left,
+                x: 120.0,
+                y: 220.0,
+            })
+            .unwrap();
+        assert_eq!(up.get_flags().bits() & TRACKED_MODIFIER_MASK, lcmd);
+
+        let scroll = poster
+            .build_cg_event(&PlannedEvent::Scroll { dx: 0, dy: 2 })
+            .unwrap();
+        assert_eq!(scroll.get_flags().bits() & TRACKED_MODIFIER_MASK, lcmd);
+
+        // 释放 Command 后鼠标事件不再携带修饰位
+        poster
+            .build_cg_event(&PlannedEvent::Key {
+                keycode: 55,
+                pressed: false,
+            })
+            .unwrap();
+        let plain_move = poster
+            .build_cg_event(&PlannedEvent::Mouse {
+                kind: PlannedMouseKind::Moved,
+                button: PointerButtonKind::Left,
+                x: 130.0,
+                y: 230.0,
+            })
+            .unwrap();
+        assert_eq!(plain_move.get_flags().bits() & TRACKED_MODIFIER_MASK, 0);
+        assert!(poster.modifiers.is_empty());
+    }
+
+    #[test]
+    fn cg_poster_drop_release_events_clears_held_modifiers() {
+        let mut poster = CgPoster::new().expect("Private CGEventSource 无需辅助功能权限");
+        // 模拟未配对释放即断开连接：LeftShift + LeftOption + RightCommand 仍按住
+        for kc in [56u16, 58, 54] {
+            poster
+                .build_cg_event(&PlannedEvent::Key {
+                    keycode: kc,
+                    pressed: true,
+                })
+                .unwrap();
+        }
+        assert!(!poster.modifiers.is_empty());
+
+        let releases = poster.drain_drop_release_events().unwrap();
+        assert_eq!(releases.len(), 3);
+        for ev in &releases {
+            assert_eq!(ev.get_type() as u32, CGEventType::FlagsChanged as u32);
+        }
+        // 按 MODIFIER_SPECS 顺序依次释放 LeftShift(56) -> LeftOption(58) -> RightCommand(54)
+        assert_eq!(
+            releases[0].get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+            56
+        );
+        assert_eq!(
+            releases[1].get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+            58
+        );
+        assert_eq!(
+            releases[2].get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+            54
+        );
+        assert_eq!(
+            releases[2].get_flags().bits() & TRACKED_MODIFIER_MASK,
+            0,
+            "最后一条释放事件必须将所有修饰位清零"
+        );
+        assert!(poster.modifiers.is_empty());
+        assert!(poster.drain_drop_release_events().unwrap().is_empty());
     }
 }

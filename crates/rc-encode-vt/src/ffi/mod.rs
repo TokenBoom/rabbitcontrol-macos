@@ -263,6 +263,7 @@ mod raw {
             session: *mut c_void,
             complete_until_presentation_time_stamp: CMTime,
         ) -> OSStatus;
+        pub fn VTCompressionSessionPrepareToEncodeFrames(session: *mut c_void) -> OSStatus;
         pub fn VTCompressionSessionInvalidate(session: *mut c_void);
 
         // —— 解码会话（E6 解码验证）——
@@ -458,7 +459,7 @@ unsafe extern "C" fn vt_output_callback(
             .push_back((source_frame_refcon as usize, state));
     }
     drop(guard);
-    shared.cond.notify_all();
+    shared.cond.notify_one();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -588,6 +589,8 @@ pub(crate) struct CompressionSession {
     frame_index: u64,
     /// PTS timescale = fps * 1000，帧间隔恰为 1/fps 秒。
     timescale: i32,
+    /// 非连续 `CMBlockBuffer` 时的可复用提取暂存区（常规连续缓冲走零拷贝切片）。
+    extract_scratch: Vec<u8>,
 }
 
 // SAFETY: 见类型文档：所有权随 VtEncoder 移动，无并发访问；回调线程只经
@@ -702,6 +705,7 @@ impl CompressionSession {
             shared,
             frame_index: 0,
             timescale,
+            extract_scratch: Vec::new(),
         };
 
         // —— 延迟红线逐条落死（失败即构造失败）——
@@ -763,6 +767,12 @@ impl CompressionSession {
         }
         // 显式关闭编码器省电优化，避免长时间 120fps 运行触发 Apple 媒体引擎节能降频（Optional，失败容忍）。
         let _ = s.set_boolean(VtKey::MaximizePowerEfficiency, false, "");
+
+        // 预热硬件编码管线：提前分配内部资源，消除首个正式帧 / 静屏长间隔唤醒冷启动延迟。
+        // SAFETY: `s.session` 是刚配置完所有属性的合法会话句柄。
+        let prepare_status =
+            unsafe { raw::VTCompressionSessionPrepareToEncodeFrames(s.session.as_ptr()) };
+        check_status(prepare_status, "VTCompressionSessionPrepareToEncodeFrames")?;
         Ok(s)
     }
 
@@ -1033,6 +1043,7 @@ impl CompressionSession {
         if self.in_flight.is_empty() {
             return None;
         }
+        let _qos = QosBump::new();
         let deadline = if timeout.is_zero() {
             None
         } else {
@@ -1107,9 +1118,13 @@ impl CompressionSession {
         }
     }
 
-    /// 从 sample buffer 提取 Annex-B 码流：CMBlockBuffer 拷出 → 判定封装 →
-    /// 重排（AVCC）→ IDR 帧内联 SPS/PPS。
-    fn extract(&self, sample: CFRetained<CMSampleBuffer>) -> Result<EncodedOutput, EncodeError> {
+    /// 从 sample buffer 提取 Annex-B 码流：优先直接借用连续 `CMBlockBuffer` 内存
+    /// （零额外拷贝），再单遍校验并重排为 Annex-B；仅在 IDR 帧从格式描述借用 SPS/PPS
+    /// 一次性拼入输出缓冲（P 帧零参数集分配、零全帧字节扫描）。
+    fn extract(
+        &mut self,
+        sample: CFRetained<CMSampleBuffer>,
+    ) -> Result<EncodedOutput, EncodeError> {
         // SAFETY: sample 是 +1 自有引用；三个 getter 均为同步只读调用。
         let block = unsafe { sample.data_buffer() }.ok_or_else(|| {
             EncodeError::Failed("输出 sample buffer 无 CMBlockBuffer".to_string())
@@ -1119,69 +1134,125 @@ impl CompressionSession {
         if len == 0 {
             return Err(EncodeError::Failed("输出 CMBlockBuffer 为空".to_string()));
         }
-        let mut raw = vec![0u8; len];
-        // SAFETY: destination 指向 raw 的合法可写内存，长度与 data_length 匹配；
-        // len > 0 已在上方确认，NonNull::from 对非空切片恒成功。
-        let status =
-            unsafe { block.copy_data_bytes(0, len, NonNull::from(raw.as_mut_slice()).cast()) };
-        if status != 0 {
-            return Err(EncodeError::Failed(format!(
-                "CMBlockBufferCopyDataBytes 失败: OSStatus {status}"
-            )));
-        }
 
-        // 参数集（SPS/PPS）与 AVCC 长度前缀宽度来自格式描述。
-        let mut parameter_sets: Vec<Vec<u8>> = Vec::new();
+        let mut length_at_offset = 0usize;
+        let mut total_length = 0usize;
+        let mut data_ptr: *mut std::ffi::c_char = std::ptr::null_mut();
+        // SAFETY: `block` 为有效的自有 `CMBlockBuffer`；三个出参指针指向本栈帧合法内存。
+        let ptr_status = unsafe {
+            block.data_pointer(
+                0,
+                std::ptr::addr_of_mut!(length_at_offset),
+                std::ptr::addr_of_mut!(total_length),
+                std::ptr::addr_of_mut!(data_ptr),
+            )
+        };
+        let raw_bytes: &[u8] = if ptr_status == 0
+            && length_at_offset == len
+            && total_length == len
+            && !data_ptr.is_null()
+        {
+            // SAFETY: `CMBlockBufferGetDataPointer` 返回 0 且 `length_at_offset == len`，
+            // `[data_ptr, data_ptr + len)` 在 `block` 存活期内只读有效。
+            unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), len) }
+        } else {
+            self.extract_scratch.resize(len, 0);
+            // SAFETY: destination 指向 `extract_scratch` 的合法可写内存，长度与 `len` 匹配；
+            // `len > 0` 已在上方确认，`NonNull::from` 对非空切片恒成功。
+            let status = unsafe {
+                block.copy_data_bytes(
+                    0,
+                    len,
+                    NonNull::from(self.extract_scratch.as_mut_slice()).cast(),
+                )
+            };
+            if status != 0 {
+                return Err(EncodeError::Failed(format!(
+                    "CMBlockBufferCopyDataBytes 失败: OSStatus {status}"
+                )));
+            }
+            &self.extract_scratch[..len]
+        };
+
+        // 仅读取 AVCC 长度前缀宽度（不分配/不拷贝 SPS/PPS，除非确认本帧为 IDR）。
         let mut length_size = 4usize;
         // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
-        if let Some(desc) = unsafe { sample.format_description() } {
-            let mut total = 0usize;
-            for index in 0..16usize {
-                let mut ptr: *const u8 = std::ptr::null();
-                let mut size = 0usize;
-                let mut count_out = 0usize;
-                let mut nal_header_len: c_int = 0;
-                // SAFETY: 全部出参指针指向本栈帧合法内存；desc 在整个循环中
-                // 由 desc（自有引用）保活，参数集指针因此有效。
-                let status = unsafe {
-                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        &desc,
-                        index,
-                        std::ptr::addr_of_mut!(ptr),
-                        std::ptr::addr_of_mut!(size),
-                        std::ptr::addr_of_mut!(count_out),
-                        std::ptr::addr_of_mut!(nal_header_len),
-                    )
-                };
-                if status != 0 {
-                    break;
-                }
-                if index == 0 {
-                    total = count_out;
-                    if nal_header_len > 0 {
-                        length_size = nal_header_len as usize;
-                    }
-                }
-                if size > 0 {
-                    // SAFETY: GetH264ParameterSetAtIndex 成功时 [ptr, ptr+size)
-                    // 是可读内存（指向 desc 内部），上面已确认 desc 保活。
-                    parameter_sets.push(unsafe { std::slice::from_raw_parts(ptr, size).to_vec() });
-                }
-                if total != 0 && index + 1 >= total {
-                    break;
-                }
+        let desc_opt = unsafe { sample.format_description() };
+        if let Some(ref desc) = desc_opt {
+            let mut ptr: *const u8 = std::ptr::null();
+            let mut size = 0usize;
+            let mut count_out = 0usize;
+            let mut nal_header_len: c_int = 0;
+            // SAFETY: 全部出参指向本栈帧合法内存，`desc` 在此调用期间存活。
+            let status = unsafe {
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    desc,
+                    0,
+                    std::ptr::addr_of_mut!(ptr),
+                    std::ptr::addr_of_mut!(size),
+                    std::ptr::addr_of_mut!(count_out),
+                    std::ptr::addr_of_mut!(nal_header_len),
+                )
+            };
+            if status == 0 && nal_header_len > 0 {
+                length_size = nal_header_len as usize;
             }
         }
 
-        // 判定封装并规整为 Annex-B；畸形输出绝不外发。
-        let (mut data, source) = annexb::normalize_to_annexb(&raw, length_size)
+        if let Some((keyframe, body_len)) = annexb::inspect_avcc(raw_bytes, length_size) {
+            let mut ps_slices: [&[u8]; 16] = [&[]; 16];
+            let mut ps_count = 0usize;
+            if keyframe {
+                if let Some(ref desc) = desc_opt {
+                    let mut total = 0usize;
+                    for index in 0..16usize {
+                        let mut ptr: *const u8 = std::ptr::null();
+                        let mut size = 0usize;
+                        let mut count_out = 0usize;
+                        let mut nal_header_len: c_int = 0;
+                        // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在整个循环与随后的
+                        // `write_avcc_as_annexb` 调用期间保持存活，参数集指针只读有效。
+                        let status = unsafe {
+                            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                                desc,
+                                index,
+                                std::ptr::addr_of_mut!(ptr),
+                                std::ptr::addr_of_mut!(size),
+                                std::ptr::addr_of_mut!(count_out),
+                                std::ptr::addr_of_mut!(nal_header_len),
+                            )
+                        };
+                        if status != 0 {
+                            break;
+                        }
+                        if index == 0 {
+                            total = count_out;
+                        }
+                        if size > 0 {
+                            // SAFETY: `GetH264ParameterSetAtIndex` 成功时 `[ptr, ptr+size)`
+                            // 指向 `desc` 内部只读内存，`desc` 存活至本函数末尾。
+                            ps_slices[ps_count] = unsafe { std::slice::from_raw_parts(ptr, size) };
+                            ps_count += 1;
+                        }
+                        if total != 0 && index + 1 >= total {
+                            break;
+                        }
+                    }
+                }
+            }
+            let data = annexb::write_avcc_as_annexb(
+                raw_bytes,
+                length_size,
+                &ps_slices[..ps_count],
+                body_len,
+            );
+            return Ok(EncodedOutput { data, keyframe });
+        }
+
+        // 防御性回退：若输入本身已是 Annex-B 形态，走原有规整与参数集检测逻辑。
+        let (data, _source) = annexb::normalize_to_annexb(raw_bytes, length_size)
             .ok_or_else(|| EncodeError::Failed("输出码流既非合法 AVCC 也非 Annex-B".to_string()))?;
         let keyframe = annexb::is_idr(&data);
-        // 参数集内联只发生在 AVCC 源 + IDR 帧：Annex-B 源自带参数集，P 帧不需要。
-        if keyframe && source == annexb::SourceFormat::Avcc && !parameter_sets.is_empty() {
-            let refs: Vec<&[u8]> = parameter_sets.iter().map(|v| v.as_slice()).collect();
-            annexb::prepend_parameter_sets(&mut data, &refs);
-        }
         Ok(EncodedOutput { data, keyframe })
     }
 }
@@ -1360,7 +1431,7 @@ unsafe extern "C" fn vt_decode_callback(
     let mut guard = lock(&shared.state);
     *guard = state;
     drop(guard);
-    shared.cond.notify_all();
+    shared.cond.notify_one();
 }
 
 /// 拥有 `VTDecompressionSession`（RAII：Drop 时等异步帧 → Invalidate →

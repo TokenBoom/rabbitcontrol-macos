@@ -1,5 +1,7 @@
 //! 子命令定义、值解析函数与派发。
 
+#[cfg(feature = "bench-metrics")]
+pub mod bench;
 pub mod client;
 pub mod host;
 pub mod loopback;
@@ -23,6 +25,8 @@ pub fn dispatch(command: Command) -> CliResult<ExitCode> {
         Command::Probe(args) => probe::run(&args),
         Command::Host(args) => host::run(&args),
         Command::Client(args) => client::run(&args),
+        #[cfg(feature = "bench-metrics")]
+        Command::Bench(args) => bench::run(&args),
         Command::Version => version::run(),
     }
 }
@@ -46,6 +50,9 @@ pub enum Command {
     Host(HostArgs),
     /// 控制端：connect 被控端，跑完整会话并出报告（Gate 通过 exit 0）
     Client(ClientArgs),
+    /// macOS 端采集延迟 / 跟手程度 / 帧节拍基准测试与对比（需 bench-metrics）
+    #[cfg(feature = "bench-metrics")]
+    Bench(bench::BenchArgs),
     /// 打印版本、git commit 与编译时间
     Version,
 }

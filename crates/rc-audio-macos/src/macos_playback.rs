@@ -1,9 +1,10 @@
 //! macOS CoreAudio 低延迟播放后端（基于 `AudioToolbox.framework` `AudioQueue` C API）。
 //!
 //! 设计要点：
-//! - 使用 4 个 20ms 缓冲块组成固定缓冲池（总排队上限 80ms，确保低延迟）；
-//! - 音频播放回调运行在 AudioQueue 内部线程上，通过 `Arc<Mutex<PoolState>>`
-//!   将播放完成的缓冲索引归还给空闲池；
+//! - 使用 4 个 20ms 缓冲块组成固定缓冲池（总排队上限 80ms，确保低延迟），
+//!   首帧入队即触发 `AudioQueueStart`（最小化排队延迟）；
+//! - 音频播放回调运行在 AudioQueue 内部线程上，通过无锁原子位掩码
+//!   `Arc<PlaybackShared>` 将播放完成的缓冲索引归还空闲池，避免实时音频线程持锁；
 //! - 当 4 个缓冲块全部在途时，`push_frame` 直接丢弃当前帧并立即返回，绝不阻塞调用线程；
 //! - `stop()` 与 `Drop` 均同步调用 `AudioQueueStop(q, 1)` + `AudioQueueDispose(q, 1)`，
 //!   在确保系统不再触发任何回调之后才回收用户数据 `Arc`。
@@ -14,7 +15,8 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use rc_audio::codec::FRAME_DURATION_MS;
 use rc_audio::{AudioPlayer, PcmFrame};
@@ -121,19 +123,60 @@ mod raw {
     }
 }
 
-/// 回调线程与调用线程共享的缓冲池空闲状态。
-struct PoolState {
-    /// 可供 `push_frame` 使用的空闲缓冲索引。
-    free_indices: Vec<usize>,
-    /// 4 个 `AudioQueueBufferRef` 的裸地址（仅用于指针比对以映射回索引）。
-    buffer_addrs: [usize; BUFFER_COUNT],
+/// 回调线程与调用线程无锁共享的缓冲池空闲状态。
+struct PlaybackShared {
+    /// 位掩码：第 `i` 位为 1 表示槽位 `i`（`0..BUFFER_COUNT`）当前空闲可入队。
+    ///
+    /// 并发不变量：只有唯一生产者（`&mut MacOsAudioPlayer`）清除位 `i`，
+    /// 只有 AudioQueue 回调线程（或入队失败回滚路径）置位 `i`，二者对同一槽位互斥。
+    free_mask: AtomicU8,
+    /// 4 个 `AudioQueueBufferRef` 的裸地址（初始化后只读，仅用于指针比对映射索引）。
+    buffer_addrs: [AtomicUsize; BUFFER_COUNT],
     /// 队列是否正在销毁或已销毁。
-    disposed: bool,
+    disposed: AtomicBool,
 }
 
-/// AudioQueue 播放完成回调（运行在 AudioToolbox 内部线程）。
+impl PlaybackShared {
+    fn new() -> Self {
+        Self {
+            free_mask: AtomicU8::new((1u8 << BUFFER_COUNT) - 1),
+            buffer_addrs: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+            disposed: AtomicBool::new(false),
+        }
+    }
+
+    /// 弹出一个空闲缓冲索引；若 4 个缓冲全部在途则返回 `None`。
+    #[inline]
+    fn pop_free_buffer(&self) -> Option<usize> {
+        let mask = self.free_mask.load(Ordering::Acquire);
+        if mask == 0 {
+            return None;
+        }
+        let idx = mask.trailing_zeros() as usize;
+        if idx >= BUFFER_COUNT {
+            return None;
+        }
+        self.free_mask.fetch_and(!(1u8 << idx), Ordering::AcqRel);
+        Some(idx)
+    }
+
+    /// 归还空闲缓冲索引（仅在未销毁时置位）。
+    #[inline]
+    fn return_free_buffer(&self, idx: usize) {
+        if idx < BUFFER_COUNT && !self.disposed.load(Ordering::Acquire) {
+            self.free_mask.fetch_or(1u8 << idx, Ordering::Release);
+        }
+    }
+}
+
+/// AudioQueue 播放完成回调（运行在 AudioToolbox 内部实时线程）。
 ///
-/// 绝不 panic，也不获取任何额外所有权：只将已播完的缓冲索引归还到 `free_indices`。
+/// 无锁、绝不 panic，也不获取任何额外所有权：仅通过原子位掩码将已播完的缓冲索引归还空闲池。
 unsafe extern "C" fn audio_queue_output_callback(
     in_user_data: *mut c_void,
     _in_aq: raw::AudioQueueRef,
@@ -145,16 +188,16 @@ unsafe extern "C" fn audio_queue_output_callback(
         }
         // SAFETY: `in_user_data` 由 `Arc::into_raw` 创建并在 `AudioQueueDispose(q, 1)`
         // 同步返回后才通过 `Arc::from_raw` 释放；AudioQueue 保证 dispose 返回前所有回调已结束，
-        // 因此本回调执行期间该 `Mutex<PoolState>` 引用始终有效。
-        let pool = unsafe { &*(in_user_data as *const Mutex<PoolState>) };
-        let mut state = pool.lock().unwrap_or_else(|e| e.into_inner());
-        if state.disposed {
+        // 因此本回调执行期间该 `PlaybackShared` 引用始终有效。
+        let shared = unsafe { &*(in_user_data as *const PlaybackShared) };
+        if shared.disposed.load(Ordering::Acquire) {
             return;
         }
         let target = in_buffer as usize;
-        if let Some(idx) = state.buffer_addrs.iter().position(|&addr| addr == target) {
-            if !state.free_indices.contains(&idx) {
-                state.free_indices.push(idx);
+        for (idx, addr) in shared.buffer_addrs.iter().enumerate() {
+            if addr.load(Ordering::Relaxed) == target {
+                shared.free_mask.fetch_or(1u8 << idx, Ordering::Release);
+                break;
             }
         }
     });
@@ -170,14 +213,14 @@ pub(crate) struct MacOsAudioPlayer {
     muted: bool,
     started: bool,
     disposed: bool,
-    pool: Arc<Mutex<PoolState>>,
+    shared: Arc<PlaybackShared>,
     /// 传给 `AudioQueueNewOutput` 的裸 `Arc` 指针，必须在 `AudioQueueDispose` 返回后释放。
-    user_data_ptr: *const Mutex<PoolState>,
+    user_data_ptr: *const PlaybackShared,
 }
 
 // SAFETY: `MacOsAudioPlayer` 拥有唯一的 `AudioQueueRef` 与缓冲指针所有权；
-// 所有外部操作均经由 `&mut self` 串行调用，回调线程仅通过线程安全的 `Arc<Mutex<PoolState>>`
-// 同步空闲索引，`Drop` 在最终持有线程同步停止并销毁队列。
+// 所有外部操作均经由 `&mut self` 串行调用，回调线程仅通过无锁 `Arc<PlaybackShared>`
+// 同步空闲位掩码，`Drop` 在最终持有线程同步停止并销毁队列。
 unsafe impl Send for MacOsAudioPlayer {}
 
 impl MacOsAudioPlayer {
@@ -215,12 +258,8 @@ impl MacOsAudioPlayer {
         let buffer_capacity_u32 = u32::try_from(buffer_capacity_bytes)
             .map_err(|_| "audio buffer capacity exceeds u32".to_string())?;
 
-        let pool = Arc::new(Mutex::new(PoolState {
-            free_indices: (0..BUFFER_COUNT).collect(),
-            buffer_addrs: [0; BUFFER_COUNT],
-            disposed: false,
-        }));
-        let user_data_ptr = Arc::into_raw(Arc::clone(&pool));
+        let shared = Arc::new(PlaybackShared::new());
+        let user_data_ptr = Arc::into_raw(Arc::clone(&shared));
 
         let mut queue: raw::AudioQueueRef = ptr::null_mut();
         // SAFETY: `asbd` 指向有效的 `AudioStreamBasicDescription`；`user_data_ptr` 是有效
@@ -265,11 +304,8 @@ impl MacOsAudioPlayer {
             *slot = buf;
         }
 
-        {
-            let mut state = pool.lock().unwrap_or_else(|e| e.into_inner());
-            for (idx, &buf) in buffers.iter().enumerate() {
-                state.buffer_addrs[idx] = buf as usize;
-            }
+        for (idx, &buf) in buffers.iter().enumerate() {
+            shared.buffer_addrs[idx].store(buf as usize, Ordering::Release);
         }
 
         Ok(Self {
@@ -281,7 +317,7 @@ impl MacOsAudioPlayer {
             muted: false,
             started: false,
             disposed: false,
-            pool,
+            shared,
             user_data_ptr,
         })
     }
@@ -292,11 +328,7 @@ impl MacOsAudioPlayer {
             return;
         }
         self.disposed = true;
-        {
-            let mut state = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            state.disposed = true;
-            state.free_indices.clear();
-        }
+        self.shared.disposed.store(true, Ordering::Release);
         if !self.queue.is_null() {
             // SAFETY: `self.queue` 有效且只释放一次。`in_immediate = 1` 同步停止并销毁
             // 队列及其所有缓冲，AudioToolbox 保证 `AudioQueueDispose` 返回后不再调用任何回调。
@@ -306,6 +338,7 @@ impl MacOsAudioPlayer {
             }
             self.queue = ptr::null_mut();
         }
+        self.shared.free_mask.store(0, Ordering::Release);
         if !self.user_data_ptr.is_null() {
             // SAFETY: `AudioQueueDispose(q, 1)` 已同步返回，不会再有回调访问 `user_data_ptr`，
             // 因此可安全回收构造时 `Arc::into_raw` 产生的强引用。
@@ -318,17 +351,15 @@ impl MacOsAudioPlayer {
     }
 
     /// 弹出一个空闲缓冲索引，若 4 个缓冲全部在途则返回 `None`。
+    #[inline]
     fn pop_free_buffer(&self) -> Option<usize> {
-        let mut state = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        state.free_indices.pop()
+        self.shared.pop_free_buffer()
     }
 
     /// 入队失败时归还缓冲索引，避免缓冲池泄漏。
+    #[inline]
     fn return_free_buffer(&self, idx: usize) {
-        let mut state = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.disposed && !state.free_indices.contains(&idx) {
-            state.free_indices.push(idx);
-        }
+        self.shared.return_free_buffer(idx);
     }
 }
 
@@ -353,26 +384,9 @@ impl AudioPlayer for MacOsAudioPlayer {
             (max_samples_per_buf / usize::from(self.channels)).max(1) * usize::from(self.channels);
 
         for chunk in frame.samples.chunks(aligned_chunk_samples) {
-            let buf_idx = match self.pop_free_buffer() {
-                Some(idx) => idx,
-                None => {
-                    if !self.started {
-                        // SAFETY: `self.queue` 有效，`in_start_time = null` 表示立即开始播放。
-                        let start_status = unsafe { raw::AudioQueueStart(self.queue, ptr::null()) };
-                        if start_status == 0 {
-                            self.started = true;
-                            return Ok(());
-                        }
-                        // 启动失败：立即重置队列，使已入队缓冲归还 `free_indices`，避免永久卡死。
-                        // SAFETY: `self.queue` 有效，`AudioQueueReset` 冲刷在途缓冲并经回调归还。
-                        unsafe {
-                            let _ = raw::AudioQueueReset(self.queue);
-                        }
-                        return Err(format!("AudioQueueStart failed: OSStatus={start_status}"));
-                    }
-                    // 全部 4 个缓冲都在播放中：直接丢弃，绝不阻塞调用线程。
-                    return Ok(());
-                }
+            let Some(buf_idx) = self.pop_free_buffer() else {
+                // 全部 4 个缓冲都在播放中：直接丢弃以控制排队延迟上界，绝不阻塞调用线程。
+                return Ok(());
             };
             let buf_ptr = self.buffers[buf_idx];
             let byte_len = std::mem::size_of_val(chunk);
@@ -428,7 +442,7 @@ impl AudioPlayer for MacOsAudioPlayer {
                 // SAFETY: `self.queue` 有效，`in_start_time = null` 表示立即开始播放。
                 let start_status = unsafe { raw::AudioQueueStart(self.queue, ptr::null()) };
                 if start_status != 0 {
-                    // 启动失败：立即重置队列，将已入队缓冲归还 `free_indices`，避免后续陷入静默 `Ok(())`。
+                    // 启动失败：立即重置队列，将已入队缓冲归还 `free_mask`，避免后续陷入静默 `Ok(())`。
                     // SAFETY: `self.queue` 有效，`AudioQueueReset` 冲刷在途缓冲并经回调归还。
                     unsafe {
                         let _ = raw::AudioQueueReset(self.queue);
@@ -519,5 +533,26 @@ mod tests {
         assert!(!player.is_muted());
         player.stop();
         assert!(player.push_frame(&silence).is_err());
+    }
+
+    #[test]
+    fn playback_shared_lock_free_mask_tracks_free_and_disposed_slots() {
+        let shared = PlaybackShared::new();
+        let mut taken = Vec::new();
+        while let Some(idx) = shared.pop_free_buffer() {
+            taken.push(idx);
+        }
+        assert_eq!(taken, vec![0, 1, 2, 3]);
+        assert!(shared.pop_free_buffer().is_none());
+
+        // Return slot 2 via lock-free return path.
+        shared.return_free_buffer(2);
+        assert_eq!(shared.pop_free_buffer(), Some(2));
+        assert!(shared.pop_free_buffer().is_none());
+
+        // Once disposed, returns become no-ops.
+        shared.disposed.store(true, Ordering::Release);
+        shared.return_free_buffer(1);
+        assert!(shared.pop_free_buffer().is_none());
     }
 }

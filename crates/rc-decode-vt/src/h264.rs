@@ -52,7 +52,7 @@ pub(crate) fn split_nals(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
     if input.is_empty() {
         return None;
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(4);
     let mut pos = 0;
     while pos < input.len() {
         // 不以起始码开头（首字节起就不匹配）→ 整体拒绝。
@@ -62,9 +62,17 @@ pub(crate) fn split_nals(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
             // 起始码后没有任何字节：不是合法 NAL 序列。
             return None;
         }
-        // 载荷延伸到下一个起始码（或流尾）。
+        // 载荷延伸到下一个起始码（或流尾）；任意起始码仅含 0x00/0x01，
+        // 故 `input[next + 2] > 1` 时可安全跳过 3 字节。
         let mut next = payload_start;
-        while next < input.len() && start_code_len_at(input, next).is_none() {
+        while next < input.len() {
+            if next + 2 < input.len() && input[next + 2] > 1 {
+                next += 3;
+                continue;
+            }
+            if start_code_len_at(input, next).is_some() {
+                break;
+            }
             next += 1;
         }
         let payload = input.get(payload_start..next)?;
@@ -97,6 +105,36 @@ pub(crate) fn parameter_sets<'a>(
     (sps, pps)
 }
 
+/// 将已切分的 NAL 序列转为 4 字节大端长度前缀 AVCC，并**剥离参数集**（SPS=7 / PPS=8），
+/// 直接写入调用方提供的可复用缓冲 `out`（避免二次切分扫描与每帧堆分配）。
+pub(crate) fn nals_to_avcc_into(nals: &[(u8, &[u8])], out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
+    let mut total_bytes = 0usize;
+    let mut slice_count = 0usize;
+    for &(nal_type, payload) in nals {
+        if nal_type == 7 || nal_type == 8 {
+            continue;
+        }
+        if payload.len() > u32::MAX as usize {
+            return None;
+        }
+        slice_count += 1;
+        total_bytes = total_bytes.checked_add(4)?.checked_add(payload.len())?;
+    }
+    if slice_count == 0 {
+        return None;
+    }
+    out.reserve(total_bytes);
+    for &(nal_type, payload) in nals {
+        if nal_type == 7 || nal_type == 8 {
+            continue;
+        }
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    Some(())
+}
+
 /// Annex-B → AVCC：每个 NAL 的起始码替换为 4 字节大端长度前缀，并
 /// **剥离参数集**（SPS=7 / PPS=8）。
 ///
@@ -108,24 +146,11 @@ pub(crate) fn parameter_sets<'a>(
 /// 返回 `None`（畸形拒绝）的情形：[`split_nals`] 拒绝的一切、单 NAL
 /// 载荷超过 4 字节前缀可表示的范围、剥离参数集后没有任何 NAL 剩余
 /// （「帧」只有参数集、没有 slice——解不出画面）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn to_avcc_without_parameter_sets(input: &[u8]) -> Option<Vec<u8>> {
     let nals = split_nals(input)?;
     let mut out = Vec::with_capacity(input.len());
-    let mut slice_count = 0usize;
-    for (nal_type, payload) in nals {
-        if nal_type == 7 || nal_type == 8 {
-            continue;
-        }
-        if payload.len() > u32::MAX as usize {
-            return None;
-        }
-        slice_count += 1;
-        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        out.extend_from_slice(payload);
-    }
-    if slice_count == 0 {
-        return None;
-    }
+    nals_to_avcc_into(&nals, &mut out)?;
     Some(out)
 }
 
@@ -397,6 +422,29 @@ mod tests {
         let good = annexb(&[nal(0x67, &[1]), nal(0x68, &[2]), nal(0x65, &[3; 8])]);
         assert!(split_nals(&good).is_some());
         assert!(to_avcc_without_parameter_sets(&good).is_some());
+    }
+
+    #[test]
+    fn nals_to_avcc_into_reuses_scratch_without_stale_bytes() {
+        let sps = nal(0x67, &[1, 2, 3]);
+        let pps = nal(0x68, &[4, 5]);
+        let idr = nal(0x65, &[9; 16]);
+        let p = nal(0x41, &[7; 5]);
+
+        let idr_stream = annexb(&[sps, pps, idr.clone()]);
+        let p_stream = annexb(std::slice::from_ref(&p));
+
+        let mut scratch = Vec::new();
+        let nals1 = split_nals(&idr_stream).unwrap();
+        assert!(nals_to_avcc_into(&nals1, &mut scratch).is_some());
+        assert_eq!(
+            scratch,
+            to_avcc_without_parameter_sets(&idr_stream).unwrap()
+        );
+
+        let nals2 = split_nals(&p_stream).unwrap();
+        assert!(nals_to_avcc_into(&nals2, &mut scratch).is_some());
+        assert_eq!(scratch, to_avcc_without_parameter_sets(&p_stream).unwrap());
     }
 
     // —— SPS 尺寸解析的测试用具：手工按位构造 SPS ——

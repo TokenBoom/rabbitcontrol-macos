@@ -31,7 +31,7 @@ pub struct Injector<P: EventPoster = CgPoster> {
 }
 
 impl Injector<CgPoster> {
-    /// 生产构造：辅助功能预检 → `CGEventSource`（HIDSystemState）→
+    /// 生产构造：辅助功能预检 → `CGEventSource`（Private 独立状态表）→
     /// 屏幕联合边界。
     ///
     /// 未授权时立即返回 [`InputError::NotTrusted`]，不会创建任何 CG 资源。
@@ -44,7 +44,7 @@ impl Injector<CgPoster> {
         Ok(Self { poster, screen })
     }
 
-    /// 生产构造（主显示器模式）：辅助功能预检 → `CGEventSource`（HIDSystemState）→
+    /// 生产构造（主显示器模式）：辅助功能预检 → `CGEventSource`（Private 独立状态表）→
     /// 主显示器边界（`CGDisplay::main().bounds()`）。
     ///
     /// 与 `rc-capture-macos` 默认采集主显示器（`display = 0`）严格对齐，多显示器下

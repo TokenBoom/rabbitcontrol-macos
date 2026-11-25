@@ -175,6 +175,8 @@ mod platform {
         /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：最近一次实际解码
         /// 调用的完成时刻。
         clock_us: u32,
+        /// 可复用的 AVCC 拼装暂存区：避免每帧重复分配 `Vec<u8>`。
+        avcc_scratch: Vec<u8>,
     }
 
     impl fmt::Debug for VtDecoder {
@@ -203,6 +205,7 @@ mod platform {
                 session_sps: None,
                 frame_id: 0,
                 clock_us: 0,
+                avcc_scratch: Vec::new(),
             })
         }
 
@@ -312,11 +315,13 @@ mod platform {
                 return Ok(DecodeOutput::NeedKeyframe);
             };
 
-            // 7) Annex-B → AVCC（剥离参数集，4 字节长度前缀）。「只有参数集
-            //    没有 slice」的畸形在这里兜住。
-            let avcc = crate::h264::to_avcc_without_parameter_sets(data).ok_or_else(|| {
-                Error::InvalidFrame("帧不含任何 slice NAL（无法解码出画面）".to_string())
-            })?;
+            // 7) Annex-B → AVCC（复用步骤 1 的切分结果与可复用暂存区，剥离参数集）。
+            //    「只有参数集没有 slice」的畸形在这里兜住。
+            if crate::h264::nals_to_avcc_into(&nals, &mut self.avcc_scratch).is_none() {
+                return Err(Error::InvalidFrame(
+                    "帧不含任何 slice NAL（无法解码出画面）".to_string(),
+                ));
+            }
 
             // 8) 提交 + 邮箱等待（D5）：帧号单调，墙钟预算 = 剩余注入预算。
             let frame_id = self.frame_id;
@@ -327,7 +332,7 @@ mod platform {
                 u64::from(deadline_ts.0.saturating_sub(self.clock_us)).max(1),
             );
             let started = Instant::now();
-            match session.decode_frame(&avcc, frame_id, wait) {
+            match session.decode_frame(&self.avcc_scratch, frame_id, wait) {
                 Ok(out) => {
                     let done_ts = self.advance_clock(started.elapsed());
                     if content_is_idr {

@@ -234,6 +234,18 @@ impl MetalRenderer {
     pub fn session_start(&self) -> Instant {
         self.session_start
     }
+
+    /// 注册真实 GPU 扫描上屏时间戳回调（仅 `bench-metrics`，生产构建屏蔽）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn set_present_timing_sink(&mut self, sink: Option<crate::ffi::PresentTimingSink>) {
+        self.gpu.set_present_timing_sink(sink);
+    }
+
+    /// 设置下一次 `present` 关联的帧 tag（仅 `bench-metrics`，供 `addPresentedHandler` 回传对账）。
+    #[cfg(feature = "bench-metrics")]
+    pub fn set_next_frame_tag(&self, tag: u64) {
+        self.gpu.set_next_frame_tag(tag);
+    }
 }
 
 impl Renderer for MetalRenderer {

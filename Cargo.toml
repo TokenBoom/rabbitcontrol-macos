@@ -21,24 +21,24 @@ rust-version = "1.75"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-diff = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-sched = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-fec = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-proto = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-trace = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-loopback = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-net = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-tools = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
-rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.7" }
+rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-diff = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-sched = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-fec = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-proto = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-trace = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-loopback = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-net = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-tools = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
 
 [profile.dev]
 opt-level = 0

@@ -65,6 +65,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLTexture",
     "MTLResource",
     "block2",
+    "objc2-core-foundation",
 ] }
 # CAMetalLayer（含 CAMetalDrawable 协议；displaySyncEnabled = false 等价 Present(0)）。
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
@@ -89,9 +90,19 @@ objc2-app-kit = { version = "0.3", default-features = false, optional = true, fe
     "NSScreen",
     # NSView::setLayer（挂 CAMetalLayer 到 contentView）需要。
     "objc2-quartz-core",
+    # NSApplicationActivationPolicy（bench_target 设为常规前台应用以接收全部鼠标事件）。
+    "NSRunningApplication",
+    # NSEvent::scrollingDeltaY / deltaY 需要 objc2-core-foundation。
+    "objc2-core-foundation",
+    # bench_target 鼠标本地事件监听（仅 window-bench）。
+    "NSEvent",
+    "block2",
 ] }
 
 [features]
+default = []
+# 编译期基准埋点开关：默认关闭，生产构建零额外代码与开销。
+bench-metrics = []
 # 真实窗口基准（完整 present 路径计时 + 60fps×60s soak）：非默认开启，
 # 因为它需要窗口服务器（GUI 会话）。运行方式见 tests/window_present.rs。
 window-bench = ["dep:objc2-app-kit"]
@@ -115,3 +126,9 @@ required-features = ["window-bench"]
 name = "curtain"
 harness = false
 required-features = ["window-bench"]
+
+# 光学视觉条码闭环基准探针（S1–S6 全自动测量源，仅 bench-metrics + window-bench）。
+[[test]]
+name = "bench_target"
+harness = false
+required-features = ["window-bench", "bench-metrics"]
