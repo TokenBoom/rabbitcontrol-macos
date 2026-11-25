@@ -28,6 +28,8 @@ pub enum BenchAction {
     Diff(BenchDiffArgs),
     /// 无高刷新率物理屏幕限制的高熵合成真机管线吞吐基准（4K@120 / 2K@240 / 1K@380）
     Synth(BenchSynthArgs),
+    /// 隔离编解码基准（直测生产 `rc-encode-vt` Sync/Pipelined 与 `rc-decode-vt` 解码性能）
+    Codec(BenchCodecArgs),
 }
 
 /// 传输路径模式。
@@ -72,6 +74,32 @@ pub struct BenchSynthArgs {
     pub duration: Duration,
 }
 
+/// `bench codec` 参数。
+#[derive(Args)]
+pub struct BenchCodecArgs {
+    /// 运行全矩阵（1080p60/120、1440p120、3440x1440@120、4K@120 × H.264 & HEVC）
+    #[arg(long)]
+    pub matrix: bool,
+    /// 单场景分辨率（非 --matrix 时生效），格式 WxH
+    #[arg(long, default_value = "1920x1080", value_parser = parse_resolution)]
+    pub resolution: Resolution,
+    /// 单场景目标帧率
+    #[arg(long, default_value_t = 120)]
+    pub fps: u32,
+    /// 单场景目标码率（bps），不传时自动按分辨率与帧率计算
+    #[arg(long)]
+    pub bitrate: Option<u32>,
+    /// 视频编解码器（默认 hevc）
+    #[arg(long, value_enum, default_value_t = SynthCodec::Hevc)]
+    pub codec: SynthCodec,
+    /// 每个场景编码/解码的帧数
+    #[arg(long, default_value_t = 150)]
+    pub frames: usize,
+    /// JSON 报告输出路径
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+}
+
 /// `bench run` 参数。
 #[derive(Args)]
 pub struct BenchRunArgs {
@@ -107,7 +135,33 @@ pub fn run(args: &BenchArgs) -> CliResult<ExitCode> {
         BenchAction::Run(run_args) => run_bench(run_args),
         BenchAction::Diff(diff_args) => run_diff(diff_args),
         BenchAction::Synth(synth_args) => run_synth(synth_args),
+        BenchAction::Codec(codec_args) => run_codec(codec_args),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_codec(args: &BenchCodecArgs) -> CliResult<ExitCode> {
+    use crate::bench::codec::{execute_codec_bench, CodecBenchCfg};
+    let codec = match args.codec {
+        SynthCodec::Hevc => rc_encode::Codec::Hevc,
+        SynthCodec::H264 => rc_encode::Codec::H264,
+    };
+    let cfg = CodecBenchCfg {
+        matrix: args.matrix,
+        resolution: args.resolution,
+        fps: args.fps.max(1),
+        bitrate_bps: args.bitrate,
+        codec,
+        frames: args.frames.max(20),
+        report_path: args.report.clone(),
+    };
+    execute_codec_bench(cfg)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_codec(_args: &BenchCodecArgs) -> CliResult<ExitCode> {
+    Err("rc-cli bench codec 仅支持在 macOS 上运行".to_string())
 }
 
 #[cfg(target_os = "macos")]

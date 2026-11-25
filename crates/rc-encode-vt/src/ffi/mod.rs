@@ -56,7 +56,7 @@ use objc2_core_media::{
 use objc2_core_video::CVPixelBufferCreate;
 use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetHeight,
-    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+    CVPixelBufferGetWidth,
 };
 
 use crate::annexb;
@@ -520,20 +520,31 @@ pub(crate) fn make_pixel_buffer(width: u32, height: u32) -> Result<TestPixelBuff
     }
 }
 
-/// `(width, height, pixel_format)`。句柄校验（尺寸核对、M9 防线）用。
-pub(crate) fn pixel_buffer_info(ptr: *mut c_void) -> (u32, u32, u32) {
+/// `(width, height)`。句柄校验（尺寸核对、M9 防线）用（省略无用的 pixel format 查询）。
+#[inline]
+pub(crate) fn pixel_buffer_dimensions(ptr: *mut c_void) -> (u32, u32) {
     // SAFETY: 调用方（lib.rs::encode）已校验句柄非空，且处在 FrameTexture
     // 的存活窗口内（下一次采集前有效），这里只做同步读取。
     let buffer = unsafe { &*(ptr as *const CVPixelBuffer) };
     (
         CVPixelBufferGetWidth(buffer) as u32,
         CVPixelBufferGetHeight(buffer) as u32,
-        CVPixelBufferGetPixelFormatType(buffer),
     )
 }
 
-/// 高帧率流水线编码最大在途帧数（60fps 以下兼容，120/240/380fps 充分利用双媒体引擎并行）。
-const MAX_PIPELINED_IN_FLIGHT: usize = 4;
+/// 按帧率计算异步流水线编码在途帧上限（与 `HostPipeline` 对齐）：
+/// - `<= 120fps`：严格 2 帧（铁律 1，避免 Pipe4 在 60/120fps 下延迟翻倍而无吞吐收益）；
+/// - `121..=240fps`：3 帧；
+/// - `> 240fps`：4 帧（240/380fps 高刷极限吞吐）。
+pub(crate) const fn pipelined_in_flight_limit(fps: u32) -> usize {
+    if fps > 240 {
+        4
+    } else if fps > 120 {
+        3
+    } else {
+        2
+    }
+}
 
 /// 异步流水线单帧提交元数据：保活 SCK `resource_guard` 直到回调输出提取/丢弃。
 struct InFlightMeta {
@@ -561,6 +572,8 @@ pub(crate) struct CompressionSession {
     /// +1 的会话引用（VTCompressionSessionCreate 返回）。Drop 前必须先
     /// Invalidate（Apple 文档要求），见 [`CompressionSession::drop`]。
     session: NonNull<c_void>,
+    /// 本会话允许的最大异步流水线在途帧数（按 fps 门控：2/3/4）。
+    max_in_flight: usize,
     /// 异步流水线在途元数据与 SCK 像素缓冲保活守卫（按提交顺序存放）。
     in_flight: VecDeque<InFlightMeta>,
     /// 单调非零提交 ID（通过 `source_frame_refcon` 区分同步/异步回调）。
@@ -568,6 +581,10 @@ pub(crate) struct CompressionSession {
     /// 回调邮箱。必须排在 session 之后：字段按声明逆序释放，Arc 在
     /// CFRelease(session) 之后才 drop。
     shared: Arc<Shared>,
+    /// 预构造并复用的 `ForceKeyFrame = true` 帧选项字典（消除每次 IDR 堆分配）。
+    force_keyframe_dict: CFRetained<CFDictionary>,
+    /// 缓存的 AVCC/HVCC 长度前缀字节数（默认 4，仅在 IDR 或回退路径刷新，P 帧免查格式描述）。
+    cached_length_size: usize,
     /// 会话内单调递增的帧号（PTS 来源，见 [`CompressionSession::next_pts`]）。
     frame_index: u64,
     /// PTS timescale = fps * 1000，帧间隔恰为 1/fps 秒。
@@ -639,13 +656,15 @@ impl CompressionSession {
     ///
     /// 任何红线属性设置失败都返回 Err（构造期暴露，而不是运行期花屏）。
     pub(crate) fn new(params: &SessionParams) -> Result<Self, String> {
+        let max_in_flight = pipelined_in_flight_limit(params.fps);
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState {
                 sync: CallbackState::Empty,
-                pipelined: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+                pipelined: VecDeque::with_capacity(max_in_flight),
             }),
             cond: Condvar::new(),
         });
+        let force_keyframe_dict = force_keyframe_dictionary().map_err(|e| e.to_string())?;
 
         let mut session_out: *mut c_void = std::ptr::null_mut();
         // 显式要求硬件编码器 + 按帧率门控低延迟码控（VTVideoEncoder.h / VTCompressionProperties.h：
@@ -694,9 +713,12 @@ impl CompressionSession {
         let timescale = (params.fps.saturating_mul(1000)).min(i32::MAX as u32) as i32;
         let mut s = CompressionSession {
             session,
-            in_flight: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+            max_in_flight,
+            in_flight: VecDeque::with_capacity(max_in_flight),
             next_submit_id: 1,
             shared,
+            force_keyframe_dict,
+            cached_length_size: 4,
             frame_index: 0,
             timescale,
             is_hevc,
@@ -875,16 +897,12 @@ impl CompressionSession {
             }
         }
 
-        // 按需构造 ForceKeyFrame 帧选项字典（一次性使用，不跨调用复用）。
-        let frame_props = if force_idr {
-            Some(force_keyframe_dictionary()?)
+        // 复用会话级 ForceKeyFrame 不可变帧选项字典（零每帧 CFDictionary 分配）。
+        let props_ptr = if force_idr {
+            &*self.force_keyframe_dict as *const CFDictionary as *const c_void
         } else {
-            None
+            std::ptr::null()
         };
-        let props_ptr = frame_props
-            .as_ref()
-            .map(|dict| &**dict as *const CFDictionary as *const c_void)
-            .unwrap_or_else(std::ptr::null);
 
         let pts = self.next_pts();
         let mut info_flags: u32 = 0;
@@ -975,21 +993,18 @@ impl CompressionSession {
         force_idr: bool,
         resource_guard: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Result<(), EncodeError> {
-        if self.in_flight.len() >= MAX_PIPELINED_IN_FLIGHT {
+        if self.in_flight.len() >= self.max_in_flight {
             return Err(EncodeError::Failed(format!(
-                "pipelined in_flight limit ({MAX_PIPELINED_IN_FLIGHT}) reached"
+                "pipelined in_flight limit ({}) reached",
+                self.max_in_flight
             )));
         }
         promote_thread_qos_once();
-        let frame_props = if force_idr {
-            Some(force_keyframe_dictionary()?)
+        let props_ptr = if force_idr {
+            &*self.force_keyframe_dict as *const CFDictionary as *const c_void
         } else {
-            None
+            std::ptr::null()
         };
-        let props_ptr = frame_props
-            .as_ref()
-            .map(|dict| &**dict as *const CFDictionary as *const c_void)
-            .unwrap_or_else(std::ptr::null);
 
         let submit_id = self.next_submit_id;
         self.next_submit_id = submit_id.wrapping_add(1);
@@ -1174,8 +1189,94 @@ impl CompressionSession {
             &self.extract_scratch[..len]
         };
 
-        // 仅读取 AVCC 长度前缀宽度（不分配/不拷贝 SPS/PPS，除非确认本帧为 IDR）。
-        let mut length_size = 4usize;
+        // 热路径：P 帧直接使用缓存的 `cached_length_size`（默认 4），完全跳过
+        // `sample.format_description()`（CFRetain/CFRelease）与参数集索引查询；
+        // 仅在 IDR 帧或结构预检未命中时才查询格式描述并刷新 `cached_length_size`。
+        let inspected_len_size = self.cached_length_size;
+        if let Some((keyframe, body_len)) =
+            annexb::inspect_avcc_for(self.is_hevc, raw_bytes, inspected_len_size)
+        {
+            if !keyframe {
+                let data =
+                    annexb::write_avcc_as_annexb(raw_bytes, inspected_len_size, &[], body_len);
+                return Ok(EncodedOutput {
+                    data,
+                    keyframe: false,
+                });
+            }
+            // IDR 帧：读取格式描述以提取 SPS/PPS/VPS，并确认 length_size。
+            // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
+            let desc_opt = unsafe { sample.format_description() };
+            let mut ps_slices: [&[u8]; 16] = [&[]; 16];
+            let mut ps_count = 0usize;
+            let mut actual_len_size = inspected_len_size;
+            if let Some(ref desc) = desc_opt {
+                let mut total = 0usize;
+                for index in 0..16usize {
+                    let mut ptr: *const u8 = std::ptr::null();
+                    let mut size = 0usize;
+                    let mut count_out = 0usize;
+                    let mut nal_header_len: c_int = 0;
+                    // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在整个循环与随后的
+                    // `write_avcc_as_annexb` 调用期间保持存活，参数集指针只读有效。
+                    let status = unsafe {
+                        if self.is_hevc {
+                            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                                desc,
+                                index,
+                                std::ptr::addr_of_mut!(ptr),
+                                std::ptr::addr_of_mut!(size),
+                                std::ptr::addr_of_mut!(count_out),
+                                std::ptr::addr_of_mut!(nal_header_len),
+                            )
+                        } else {
+                            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                                desc,
+                                index,
+                                std::ptr::addr_of_mut!(ptr),
+                                std::ptr::addr_of_mut!(size),
+                                std::ptr::addr_of_mut!(count_out),
+                                std::ptr::addr_of_mut!(nal_header_len),
+                            )
+                        }
+                    };
+                    if status != 0 {
+                        break;
+                    }
+                    if index == 0 {
+                        total = count_out;
+                        if nal_header_len > 0 {
+                            actual_len_size = nal_header_len as usize;
+                            self.cached_length_size = actual_len_size;
+                        }
+                    }
+                    if size > 0 {
+                        // SAFETY: `Get*ParameterSetAtIndex` 成功时 `[ptr, ptr+size)`
+                        // 指向 `desc` 内部只读内存，`desc` 存活至本函数末尾。
+                        ps_slices[ps_count] = unsafe { std::slice::from_raw_parts(ptr, size) };
+                        ps_count += 1;
+                    }
+                    if total != 0 && index + 1 >= total {
+                        break;
+                    }
+                }
+            }
+            if actual_len_size == inspected_len_size {
+                let data = annexb::write_avcc_as_annexb(
+                    raw_bytes,
+                    actual_len_size,
+                    &ps_slices[..ps_count],
+                    body_len,
+                );
+                return Ok(EncodedOutput {
+                    data,
+                    keyframe: true,
+                });
+            }
+        }
+
+        // 回退路径：若非 4 字节长度前缀或输入本身已是 Annex-B，查询格式描述后按实际宽度规整。
+        let mut length_size = self.cached_length_size;
         // SAFETY: format_description 对 +0 返回值做 retain，得到自有引用。
         let desc_opt = unsafe { sample.format_description() };
         if let Some(ref desc) = desc_opt {
@@ -1207,73 +1308,9 @@ impl CompressionSession {
             };
             if status == 0 && nal_header_len > 0 {
                 length_size = nal_header_len as usize;
+                self.cached_length_size = length_size;
             }
         }
-
-        if let Some((keyframe, body_len)) =
-            annexb::inspect_avcc_for(self.is_hevc, raw_bytes, length_size)
-        {
-            let mut ps_slices: [&[u8]; 16] = [&[]; 16];
-            let mut ps_count = 0usize;
-            if keyframe {
-                if let Some(ref desc) = desc_opt {
-                    let mut total = 0usize;
-                    for index in 0..16usize {
-                        let mut ptr: *const u8 = std::ptr::null();
-                        let mut size = 0usize;
-                        let mut count_out = 0usize;
-                        let mut nal_header_len: c_int = 0;
-                        // SAFETY: 全部出参指针指向本栈帧合法内存；`desc` 在整个循环与随后的
-                        // `write_avcc_as_annexb` 调用期间保持存活，参数集指针只读有效。
-                        let status = unsafe {
-                            if self.is_hevc {
-                                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                                    desc,
-                                    index,
-                                    std::ptr::addr_of_mut!(ptr),
-                                    std::ptr::addr_of_mut!(size),
-                                    std::ptr::addr_of_mut!(count_out),
-                                    std::ptr::addr_of_mut!(nal_header_len),
-                                )
-                            } else {
-                                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                                    desc,
-                                    index,
-                                    std::ptr::addr_of_mut!(ptr),
-                                    std::ptr::addr_of_mut!(size),
-                                    std::ptr::addr_of_mut!(count_out),
-                                    std::ptr::addr_of_mut!(nal_header_len),
-                                )
-                            }
-                        };
-                        if status != 0 {
-                            break;
-                        }
-                        if index == 0 {
-                            total = count_out;
-                        }
-                        if size > 0 {
-                            // SAFETY: `GetH264ParameterSetAtIndex` 成功时 `[ptr, ptr+size)`
-                            // 指向 `desc` 内部只读内存，`desc` 存活至本函数末尾。
-                            ps_slices[ps_count] = unsafe { std::slice::from_raw_parts(ptr, size) };
-                            ps_count += 1;
-                        }
-                        if total != 0 && index + 1 >= total {
-                            break;
-                        }
-                    }
-                }
-            }
-            let data = annexb::write_avcc_as_annexb(
-                raw_bytes,
-                length_size,
-                &ps_slices[..ps_count],
-                body_len,
-            );
-            return Ok(EncodedOutput { data, keyframe });
-        }
-
-        // 防御性回退：若输入本身已是 Annex-B 形态，走原有规整与参数集检测逻辑。
         let (data, _source) = annexb::normalize_to_annexb(raw_bytes, length_size)
             .ok_or_else(|| EncodeError::Failed("输出码流既非合法 AVCC 也非 Annex-B".to_string()))?;
         let keyframe = annexb::is_idr_for(self.is_hevc, &data);
@@ -1856,11 +1893,21 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_in_flight_limit_matches_fps_tiers() {
+        assert_eq!(pipelined_in_flight_limit(30), 2);
+        assert_eq!(pipelined_in_flight_limit(60), 2);
+        assert_eq!(pipelined_in_flight_limit(120), 2);
+        assert_eq!(pipelined_in_flight_limit(144), 3);
+        assert_eq!(pipelined_in_flight_limit(240), 3);
+        assert_eq!(pipelined_in_flight_limit(380), 4);
+    }
+
+    #[test]
     fn vt_output_callback_routes_sync_and_pipelined_separately() {
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState {
                 sync: CallbackState::Empty,
-                pipelined: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+                pipelined: VecDeque::with_capacity(4),
             }),
             cond: Condvar::new(),
         });
