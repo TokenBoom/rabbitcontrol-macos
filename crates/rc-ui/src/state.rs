@@ -1069,6 +1069,7 @@ impl AppState {
         let initial_server_cfg =
             server_config::load_from_path(&server_config::default_config_path());
         let initial_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+        rc_ui::proxy::set_global_proxy_config(initial_prefs.proxy.clone());
         Self::with_initial_configs_and_paths(
             initial_server_cfg,
             initial_prefs,
@@ -1226,6 +1227,7 @@ impl AppState {
         {
             let _io = self.prefs_io_lock.lock().unwrap_or_else(|e| e.into_inner());
             let loaded_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+            rc_ui::proxy::set_global_proxy_config(loaded_prefs.proxy.clone());
             let custom_pw = loaded_prefs.custom_host_password.clone();
             let allow_assist = loaded_prefs.allow_remote_assist;
             *self.prefs.lock().unwrap_or_else(|e| e.into_inner()) = loaded_prefs;

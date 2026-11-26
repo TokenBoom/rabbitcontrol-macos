@@ -270,6 +270,7 @@
       online: Boolean(raw && raw.online),
       inSession: Boolean(raw && (raw.inSession || raw.in_session)),
       isLocal: Boolean(raw && (raw.isLocal || raw.is_local)),
+      wolCapable: Boolean(raw && (raw.wolCapable || raw.wol_capable)),
       allowRemoteAssist: Boolean(raw && (raw.allowRemoteAssist || raw.allow_remote_assist)),
       allowRemoteControl: allowRemoteControl,
       lastSeenAt: String((raw && (raw.lastSeenAt || raw.last_seen_at)) || ""),
@@ -583,6 +584,84 @@
   var p1BannerDisconnect = $("#p1BannerDisconnect");
   var p1ActiveOverlay = $("#p1ActiveOverlay");
   var p1FocusSession = $("#p1FocusSession");
+  var p1WolBtn = $("#p1WolBtn");
+  var wolInflightIds = {};
+
+  function setWolButtonBusy(btn, busy) {
+    if (!btn) return;
+    btn.disabled = Boolean(busy);
+    var labelEl = btn.querySelector(".p1__wol-label");
+    if (labelEl) {
+      labelEl.textContent = busy ? "唤醒中…" : "远程开机";
+    } else {
+      btn.textContent = busy ? "唤醒中…" : "远程开机";
+    }
+  }
+
+  function syncWolButtonsState() {
+    if (p1WolBtn) {
+      var cur = findDevice(state.deviceId);
+      var curDid = cur && cur.deviceId ? String(cur.deviceId) : "";
+      setWolButtonBusy(p1WolBtn, Boolean(curDid && wolInflightIds[curDid]));
+    }
+    var liveP3Btns = document.querySelectorAll(".p3__wol-btn[data-wol-device-id]");
+    Array.prototype.forEach.call(liveP3Btns, function (btn) {
+      var btnDid = btn.getAttribute("data-wol-device-id") || "";
+      setWolButtonBusy(btn, Boolean(btnDid && wolInflightIds[btnDid]));
+    });
+  }
+
+  function triggerDeviceWol(device) {
+    if (!device || !device.deviceId) return;
+    var did = String(device.deviceId);
+    if (wolInflightIds[did]) return;
+    if (!IS_TAURI || typeof Bridge.requestDeviceWol !== "function") {
+      toast("浏览器预览模式，请在桌面端发送远程开机指令");
+      return;
+    }
+    wolInflightIds[did] = true;
+    syncWolButtonsState();
+    Bridge.requestDeviceWol(did)
+      .then(function (ack) {
+        if (ack && ack.ok) {
+          var method = String(ack.method || "").toLowerCase();
+          if (method === "already_online") {
+            toast("设备「" + device.name + "」当前已在线，无需唤醒");
+            refreshMyDevices();
+          } else if (method === "lan_peer") {
+            toast("已通过同局域网在线设备向「" + device.name + "」发送远程开机魔术包");
+          } else if (method === "server") {
+            toast("已通过服务器向「" + device.name + "」发送远程开机魔术包");
+          } else {
+            toast(
+              (ack.message && String(ack.message).trim()) ||
+                "已向「" + device.name + "」发送远程开机指令"
+            );
+          }
+          return;
+        }
+        var ackUiErr = ack && (ack.uiError || ack.ui_error);
+        if (window.RCErrorDisplay && ackUiErr) {
+          window.RCErrorDisplay.showToast(ackUiErr, { toastFn: toast });
+        } else {
+          var failMsg =
+            (ack && ack.message && String(ack.message).trim()) ||
+            "目标设备暂不支持或无法完成远程开机";
+          toast("远程开机失败：" + failMsg);
+        }
+      })
+      .catch(function (err) {
+        if (window.RCErrorDisplay && window.RCErrorDisplay.extractUiError(err)) {
+          window.RCErrorDisplay.showToast(err, { toastFn: toast });
+        } else {
+          toast("远程开机失败：" + String(err || "未知错误"));
+        }
+      })
+      .then(function () {
+        delete wolInflightIds[did];
+        syncWolButtonsState();
+      });
+  }
 
   function stripDeviceIdSep(val) {
     return String(val || "").replace(/[\s-]+/g, "");
@@ -802,8 +881,10 @@
       p1Watermark.textContent = "RabbitControl";
       p1Card.setAttribute("aria-label", "暂无选中设备");
       p1Card.classList.remove("is-controlling");
+      p1Card.classList.remove("is-wol-ready");
       if (p1SessionBanner) p1SessionBanner.hidden = true;
       if (p1ActiveOverlay) p1ActiveOverlay.hidden = true;
+      if (p1WolBtn) p1WolBtn.hidden = true;
       if (p1PreviewName) p1PreviewName.textContent = "暂无绑定设备";
       if (p1PreviewHint) p1PreviewHint.textContent = "请在「远程协助」输入设备码，或在其他设备登录同一账号";
       if (p1Wallpaper) {
@@ -857,13 +938,21 @@
 
     var hasSession = hasActiveSessionForDevice(device);
     var desktopControlled = isDesktopControlled(device);
+    var canWol = Boolean(
+      device.isMine && !device.isLocal && !device.online && device.wolCapable && !desktopControlled
+    );
     p1Card.classList.toggle("is-controlling", desktopControlled);
+    p1Card.classList.toggle("is-wol-ready", canWol);
     p1Card.setAttribute(
       "aria-label",
-      (desktopControlled ? "显示远控窗口：" : "进入桌面：") + device.name
+      (desktopControlled ? "显示远控窗口：" : canWol ? "远程开机：" : "进入桌面：") + device.name
     );
     if (p1SessionBanner) p1SessionBanner.hidden = !hasSession;
     if (p1ActiveOverlay) p1ActiveOverlay.hidden = !desktopControlled;
+    if (p1WolBtn) {
+      p1WolBtn.hidden = !canWol;
+      setWolButtonBusy(p1WolBtn, Boolean(wolInflightIds[String(device.deviceId || "")]));
+    }
     syncP1ToolPermissions();
   }
 
@@ -1007,6 +1096,19 @@
       p1FocusSession.addEventListener("click", function (e) {
         e.stopPropagation();
         focusSessionWindow();
+      });
+    }
+
+    if (p1WolBtn) {
+      p1WolBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var dev = findDevice(state.deviceId);
+        if (dev) triggerDeviceWol(dev);
+      });
+      p1WolBtn.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.stopPropagation();
+        }
       });
     }
 
@@ -1993,6 +2095,11 @@
         } else if (typeof ev.allowRemoteControl === "boolean") {
           d.allowRemoteControl = ev.allowRemoteControl;
         }
+        if (typeof ev.wol_capable === "boolean") {
+          d.wolCapable = ev.wol_capable;
+        } else if (typeof ev.wolCapable === "boolean") {
+          d.wolCapable = ev.wolCapable;
+        }
         d.name = d.alias.trim() || d.hostname.trim() || d.formattedId || did;
         notifyMainRemoteUpdateDeviceStatus(d);
         updatedDevice = d;
@@ -2029,6 +2136,43 @@
       }
     }
     paintSidebarRows();
+    if (state.route === "p3") renderP3();
+    if (state.route === "p1") {
+      renderP1();
+      renderTitlebar();
+    }
+  }
+
+  function applyDeviceWolChanged(ev) {
+    if (!ev || typeof ev !== "object") return;
+    var did = String(ev.device_id || ev.deviceId || "").replace(/\s+/g, "");
+    if (!did) return;
+    var changed = false;
+    var onlineChanged = false;
+    for (var i = 0; i < state.myDevices.length; i++) {
+      var d = state.myDevices[i];
+      if (d.id === did) {
+        if (typeof ev.wolCapable === "boolean" && d.wolCapable !== ev.wolCapable) {
+          d.wolCapable = ev.wolCapable;
+          changed = true;
+        } else if (typeof ev.wol_capable === "boolean" && d.wolCapable !== ev.wol_capable) {
+          d.wolCapable = ev.wol_capable;
+          changed = true;
+        }
+        if (typeof ev.online === "boolean" && d.online !== ev.online) {
+          d.online = ev.online;
+          if (!ev.online) d.inSession = false;
+          changed = true;
+          onlineChanged = true;
+        }
+        break;
+      }
+    }
+    if (!changed) return;
+    if (onlineChanged) {
+      sortMyDevices(state.myDevices);
+      paintSidebarRows();
+    }
     if (state.route === "p3") renderP3();
     if (state.route === "p1") {
       renderP1();
@@ -3203,6 +3347,18 @@
         actions.appendChild(updPill);
       }
       if (!device.isLocal) {
+        if (!device.online && device.wolCapable) {
+          var wolBtn = el("button", "rc-btn rc-btn--primary p3__action-pill p3__wol-btn", "远程开机");
+          wolBtn.type = "button";
+          wolBtn.setAttribute("data-wol-device-id", String(device.deviceId || ""));
+          wolBtn.title = "向该离线设备发送 Wake-on-LAN 远程开机指令";
+          setWolButtonBusy(wolBtn, Boolean(wolInflightIds[String(device.deviceId || "")]));
+          wolBtn.addEventListener("click", function (e) {
+            e.stopPropagation();
+            triggerDeviceWol(device);
+          });
+          actions.appendChild(wolBtn);
+        }
         var connectBtn = el("button", "rc-btn rc-btn--secondary p3__action-pill", "连接桌面");
         connectBtn.type = "button";
         connectBtn.disabled = !device.online || rcDisabled;
@@ -4192,6 +4348,9 @@
       }
       if (typeof Bridge.onDeviceStatusChanged === "function") {
         Bridge.onDeviceStatusChanged(applyDeviceStatusChanged);
+      }
+      if (typeof Bridge.onDeviceWolChanged === "function") {
+        Bridge.onDeviceWolChanged(applyDeviceWolChanged);
       }
       if (typeof Bridge.onAuthKicked === "function") {
         Bridge.onAuthKicked(function (payload) {

@@ -351,6 +351,15 @@
     saveUpnpEnabled: function (enabled) {
       return invoke("save_upnp_enabled", { enabled: Boolean(enabled) });
     },
+    getProxyPrefs: function () {
+      return invoke("get_proxy_prefs");
+    },
+    saveProxyPrefs: function (req) {
+      return invoke("save_proxy_prefs", { req: req || {} });
+    },
+    requestDeviceWol: function (targetDeviceId) {
+      return invoke("request_device_wol", { targetDeviceId: String(targetDeviceId || "") });
+    },
     triggerReconnectNow: function () {
       return invoke("trigger_reconnect_now");
     },
@@ -550,6 +559,13 @@
     },
     onDeviceStatusChanged: function (cb) {
       return listen("device://status-changed", function (ev) {
+        if (typeof cb === "function") {
+          cb(ev && ev.payload !== undefined ? ev.payload : ev);
+        }
+      });
+    },
+    onDeviceWolChanged: function (cb) {
+      return listen("device://wol-changed", function (ev) {
         if (typeof cb === "function") {
           cb(ev && ev.payload !== undefined ? ev.payload : ev);
         }

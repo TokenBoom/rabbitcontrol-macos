@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use rc_client_core::platform::{
     ClientPlatformHooks, DisplayModeSessionGuard, HardwareRendererOutput, PlatformDisplayInfo,
     PlatformDisplayMode, PreallocatedRenderSurface,
 };
+use rc_client_core::proxy::{ProxyConfig, ProxyMode, ProxyProtocol};
 use rc_decode::Decoder;
 use rc_encode::{BitstreamFormat, Codec, Encoder};
 use rc_input::InputInjector;
@@ -567,6 +569,281 @@ impl ClientPlatformHooks for MacosClientPlatformHooks {
             Err("Metal renderer is only supported on macOS".to_string())
         }
     }
+
+    fn resolve_system_proxy(&self) -> Option<ProxyConfig> {
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("/usr/sbin/scutil")
+                .arg("--proxy")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            parse_scutil_proxy_output(&stdout)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn primary_mac_address(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let default_if = std::process::Command::new("/sbin/route")
+                .args(["-n", "get", "default"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| parse_default_route_interface(&String::from_utf8_lossy(&o.stdout)));
+
+            if let Some(ref iface) = default_if {
+                if let Ok(out) = std::process::Command::new("/sbin/ifconfig")
+                    .arg(iface)
+                    .output()
+                {
+                    if out.status.success() {
+                        if let Some(mac) = parse_ifconfig_mac(&String::from_utf8_lossy(&out.stdout))
+                        {
+                            return Some(mac);
+                        }
+                    }
+                }
+            }
+
+            let all_out = std::process::Command::new("/sbin/ifconfig")
+                .arg("-a")
+                .output()
+                .ok()?;
+            if !all_out.status.success() {
+                return None;
+            }
+            parse_ifconfig_all_primary_mac(
+                &String::from_utf8_lossy(&all_out.stdout),
+                default_if.as_deref(),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+}
+
+/// 解析 macOS `scutil --proxy` 标准输出中的系统代理设置。
+///
+/// 仅提取顶层字典中已启用的代理项，按 `SOCKS5` → `HTTPS (HTTP CONNECT)` → `HTTP` 优先级返回首个
+/// 经 [`ProxyConfig::validate`] 校验合法的代理端点；未启用或解析失败时返回 `None`，交由核心层环境变量兜底。
+pub fn parse_scutil_proxy_output(output: &str) -> Option<ProxyConfig> {
+    let mut top_level: HashMap<&str, &str> = HashMap::new();
+    let mut brace_depth: usize = 0;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "}" {
+            brace_depth = brace_depth.saturating_sub(1);
+            continue;
+        }
+        if line.ends_with('{') {
+            brace_depth = brace_depth.saturating_add(1);
+            continue;
+        }
+        if brace_depth == 1 {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                let val = v.trim();
+                if !key.is_empty() {
+                    top_level.insert(key, val);
+                }
+            }
+        }
+    }
+
+    let candidates: [(&str, &str, &str, ProxyProtocol); 3] = [
+        (
+            "SOCKSEnable",
+            "SOCKSProxy",
+            "SOCKSPort",
+            ProxyProtocol::Socks5,
+        ),
+        (
+            "HTTPSEnable",
+            "HTTPSProxy",
+            "HTTPSPort",
+            ProxyProtocol::Http,
+        ),
+        ("HTTPEnable", "HTTPProxy", "HTTPPort", ProxyProtocol::Http),
+    ];
+
+    for (enable_key, host_key, port_key, protocol) in candidates {
+        let enabled = top_level
+            .get(enable_key)
+            .is_some_and(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"));
+        if !enabled {
+            continue;
+        }
+        let Some(raw_host) = top_level.get(host_key).map(|v| v.trim()) else {
+            continue;
+        };
+        let Some(raw_port) = top_level.get(port_key).map(|v| v.trim()) else {
+            continue;
+        };
+        let Ok(port) = raw_port.parse::<u16>() else {
+            continue;
+        };
+        if raw_host.is_empty() || port == 0 {
+            continue;
+        }
+        let cfg = ProxyConfig {
+            mode: ProxyMode::Manual,
+            protocol: Some(protocol),
+            host: raw_host.to_string(),
+            port,
+            username: None,
+            password: None,
+        };
+        if cfg.validate().is_ok() {
+            return Some(cfg);
+        }
+    }
+
+    None
+}
+
+/// 校验 macOS 网络接口名是否安全（防命令行标志注入与非法字符）。
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// 解析 macOS `route -n get default` 输出中的默认路由网络接口名（如 `"en0"`）。
+pub fn parse_default_route_interface(output: &str) -> Option<String> {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("interface:") {
+            let iface = rest.trim();
+            if is_valid_interface_name(iface) {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 解析单个接口 `ifconfig <iface>` 输出中的合法单播 MAC 地址并经核心层归一化为小写 `aa:bb:cc:dd:ee:ff`。
+pub fn parse_ifconfig_mac(output: &str) -> Option<String> {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        if key == "ether" || key == "lladdr" {
+            if let Some(raw_mac) = parts.next() {
+                if let Some(norm) = rc_client_core::wol::normalize_mac_addr(raw_mac) {
+                    return Some(norm);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析物理以太网/Wi-Fi 接口名 `en<N>` 的数字序号，用于回退选择主网卡。
+fn parse_en_interface_index(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("en")?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u32>().ok()
+}
+
+/// 从 `ifconfig -a` 全量输出中提取主网卡合法单播 MAC 地址：
+/// 1. 优先采用 `preferred_if`（默认路由接口，如 `en0`）上的合法单播 MAC；
+/// 2. 若默认路由为无以太网 MAC 的隧道接口（如 VPN `utun*`），回退至 `status: active` 的最小序号 `en<N>`；
+/// 3. 仍无匹配时回退至任意带合法单播 MAC 的最小序号 `en<N>`（排除 `lo*`/`awdl*`/`llw*`/`utun*` 等虚拟接口）。
+pub fn parse_ifconfig_all_primary_mac(output: &str, preferred_if: Option<&str>) -> Option<String> {
+    struct IfaceEntry {
+        name: String,
+        mac: String,
+        active: bool,
+    }
+
+    let mut entries: Vec<IfaceEntry> = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_mac: Option<String> = None;
+    let mut cur_active = false;
+
+    let flush = |entries: &mut Vec<IfaceEntry>,
+                 name: &mut Option<String>,
+                 mac: &mut Option<String>,
+                 active: &mut bool| {
+        if let (Some(n), Some(m)) = (name.take(), mac.take()) {
+            entries.push(IfaceEntry {
+                name: n,
+                mac: m,
+                active: *active,
+            });
+        } else {
+            *name = None;
+            *mac = None;
+        }
+        *active = false;
+    };
+
+    for raw_line in output.lines() {
+        let is_header = !raw_line.starts_with(char::is_whitespace) && raw_line.contains(':');
+        if is_header {
+            flush(&mut entries, &mut cur_name, &mut cur_mac, &mut cur_active);
+            if let Some((ifname, _)) = raw_line.split_once(':') {
+                let trimmed = ifname.trim();
+                if is_valid_interface_name(trimmed) {
+                    cur_name = Some(trimmed.to_string());
+                }
+            }
+            continue;
+        }
+        if cur_name.is_none() {
+            continue;
+        }
+        let trimmed = raw_line.trim();
+        if cur_mac.is_none() {
+            if let Some(mac) = parse_ifconfig_mac(trimmed) {
+                cur_mac = Some(mac);
+            }
+        }
+        if let Some(status_val) = trimmed.strip_prefix("status:") {
+            if status_val.trim().eq_ignore_ascii_case("active") {
+                cur_active = true;
+            }
+        }
+    }
+    flush(&mut entries, &mut cur_name, &mut cur_mac, &mut cur_active);
+
+    if let Some(pref) = preferred_if {
+        if let Some(hit) = entries.iter().find(|e| e.name == pref) {
+            return Some(hit.mac.clone());
+        }
+    }
+
+    let mut en_candidates: Vec<(u32, bool, &str)> = entries
+        .iter()
+        .filter_map(|e| {
+            let idx = parse_en_interface_index(&e.name)?;
+            Some((idx, e.active, e.mac.as_str()))
+        })
+        .collect();
+    en_candidates.sort_by_key(|&(idx, active, _)| (!active, idx));
+    en_candidates.first().map(|&(_, _, mac)| mac.to_string())
 }
 
 /// 幂等注册全部 macOS 硬件提供者与原生钩子（应在主程序/Agent/CLI 入口最早阶段调用）。
@@ -704,5 +981,167 @@ mod tests {
             "当前仍走 NV12/420v 零拷贝主路径，不得虚报 true_rgb_capture = true"
         );
         assert_eq!(cap.formats, vec!["qoi".to_string()]);
+    }
+
+    #[test]
+    fn parse_scutil_proxy_output_handles_socks_http_https_and_disabled() {
+        let empty = r#"<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.local
+    1 : 169.254/16
+  }
+  FTPPassive : 1
+}"#;
+        assert_eq!(parse_scutil_proxy_output(empty), None);
+
+        // SOCKS5 与 HTTP 同时开启时优先 SOCKS5。
+        let both = r#"<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.local
+  }
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  SOCKSEnable : 1
+  SOCKSPort : 7891
+  SOCKSProxy : 127.0.0.1
+}"#;
+        assert_eq!(
+            parse_scutil_proxy_output(both),
+            Some(ProxyConfig {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Socks5),
+                host: "127.0.0.1".to_string(),
+                port: 7891,
+                username: None,
+                password: None,
+            })
+        );
+
+        // SOCKSEnable = 0 时应忽略 SOCKS 并回退至启用的 HTTPS / HTTP 代理。
+        let https_only = r#"<dictionary> {
+  SOCKSEnable : 0
+  SOCKSPort : 1080
+  SOCKSProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 8443
+  HTTPSProxy : proxy.corp.internal
+}"#;
+        assert_eq!(
+            parse_scutil_proxy_output(https_only),
+            Some(ProxyConfig {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Http),
+                host: "proxy.corp.internal".to_string(),
+                port: 8443,
+                username: None,
+                password: None,
+            })
+        );
+
+        // IPv6 代理主机与非法端口 0 跳过逻辑。
+        let ipv6_fallback = r#"<dictionary> {
+  SOCKSEnable : 1
+  SOCKSPort : 0
+  SOCKSProxy : 127.0.0.1
+  HTTPEnable : 1
+  HTTPPort : 8080
+  HTTPProxy : ::1
+}"#;
+        assert_eq!(
+            parse_scutil_proxy_output(ipv6_fallback),
+            Some(ProxyConfig {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Http),
+                host: "::1".to_string(),
+                port: 8080,
+                username: None,
+                password: None,
+            })
+        );
+
+        // 非法主机名（含空白或斜杠）应拒绝并返回 None。
+        let invalid_host = r#"<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 8080
+  HTTPProxy : http://bad/path
+}"#;
+        assert_eq!(parse_scutil_proxy_output(invalid_host), None);
+
+        // 值内含未配对花括号（如 PAC URL 或 ExceptionsList 条目）不应破坏顶层块深度解析。
+        let unpaired_brace_val = r#"<dictionary> {
+  ExceptionsList : <array> {
+    0 : foo{bar
+  }
+  ProxyAutoConfigURLString : http://pac.local/{unclosed
+  HTTPEnable : 1
+  HTTPPort : 8888
+  HTTPProxy : 10.0.0.2
+}"#;
+        assert_eq!(
+            parse_scutil_proxy_output(unpaired_brace_val),
+            Some(ProxyConfig {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Http),
+                host: "10.0.0.2".to_string(),
+                port: 8888,
+                username: None,
+                password: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_default_route_and_ifconfig_mac_normalizes_and_validates() {
+        let route_out = r#"   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.50.254
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>"#;
+        assert_eq!(
+            parse_default_route_interface(route_out).as_deref(),
+            Some("en0")
+        );
+        assert_eq!(parse_default_route_interface("interface: -rf\n"), None);
+        assert_eq!(parse_default_route_interface("no route"), None);
+
+        let ifcfg_en0 = r#"en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether AA:BB:CC:DD:EE:FF
+	inet 192.168.50.23 netmask 0xffffff00 broadcast 192.168.50.255
+	status: active"#;
+        assert_eq!(
+            parse_ifconfig_mac(ifcfg_en0).as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+
+        // 多播 / 全零 / 全 F 广播 MAC 必须拒绝。
+        assert_eq!(parse_ifconfig_mac("\tether 01:00:5e:00:00:01\n"), None);
+        assert_eq!(parse_ifconfig_mac("\tether ff:ff:ff:ff:ff:ff\n"), None);
+        assert_eq!(parse_ifconfig_mac("\tether 00:00:00:00:00:00\n"), None);
+
+        // 默认路由走 VPN utun3（无 ether）时，应回退至 status: active 的 en* 网卡。
+        let ifcfg_all = r#"lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 02:11:22:33:44:55
+	status: inactive
+en1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 02:AA:BB:CC:DD:EE
+	status: active
+utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff
+awdl0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 02:99:99:99:99:99
+	status: active"#;
+        assert_eq!(
+            parse_ifconfig_all_primary_mac(ifcfg_all, Some("utun3")).as_deref(),
+            Some("02:aa:bb:cc:dd:ee")
+        );
+        // 默认路由指向 en0 时优先返回 en0。
+        assert_eq!(
+            parse_ifconfig_all_primary_mac(ifcfg_all, Some("en0")).as_deref(),
+            Some("02:11:22:33:44:55")
+        );
     }
 }

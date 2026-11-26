@@ -227,6 +227,28 @@ body[data-page="settings"] {
   width: 248px;
 }
 
+.rc-proxy-manual[hidden] {
+  display: none;
+}
+
+.rc-proxy-manual .rc-setting-row {
+  border-top: 1px solid var(--divider);
+}
+
+.rc-proxy-addr-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rc-input--proxy-host {
+  width: 176px;
+}
+
+.rc-input--cred {
+  width: 128px;
+}
+
 .rc-port-pair {
   display: inline-flex;
   align-items: center;

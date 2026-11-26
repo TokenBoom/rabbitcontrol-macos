@@ -17,6 +17,6 @@ pub mod updater_macos;
 
 pub use rc_client_core::{
     app_prefs, auth_client, cert_manager, config_paths, display_ctrl, host_bridge, hud,
-    input_bridge, lan_discovery, model, p2p, platform, relay_transport, server_config,
-    session_bridge, signal_client, ui_error, updater, upnp,
+    input_bridge, lan_discovery, model, p2p, platform, proxy, relay_transport, server_config,
+    session_bridge, signal_client, ui_error, updater, upnp, wol,
 };

@@ -38,7 +38,10 @@ use rc_ui::service_ipc::{
 };
 #[cfg(target_os = "macos")]
 use rc_ui::service_manager;
-use rc_ui::signal_client::{DeviceStatusEvent, SignalClientHandle, SignalClientOptions};
+use rc_ui::signal_client::{
+    DeviceStatusEvent, DeviceWolCapabilityEvent, SignalClientHandle, SignalClientOptions,
+};
+use rc_ui::ui_error::{self, codes, ErrorPlatform};
 
 const MAX_PENDING_DEVICE_EVENTS: usize = 64;
 const DEFAULT_REQUEST_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -237,11 +240,21 @@ struct ReloadedContext {
     server_cfg: ServerConfig,
     prefs: AppPrefs,
     auth: Option<Arc<AuthSessionManager>>,
+    local_wol_mac: Option<String>,
+}
+
+fn probe_local_wol_mac_if_enabled(allow_wol: bool) -> Option<String> {
+    if allow_wol {
+        rc_ui::platform::primary_mac_address()
+    } else {
+        None
+    }
 }
 
 fn load_reloaded_context() -> ReloadedContext {
     let server_cfg = server_config::load_from_path(&server_config::default_config_path());
     let prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+    let local_wol_mac = probe_local_wol_mac_if_enabled(prefs.allow_wol);
     let certs_dir = cert_manager::default_certs_dir();
     let auth = CertManager::load_or_init(certs_dir).ok().map(|cert_mgr| {
         let mgr = Arc::new(AuthSessionManager::new(
@@ -256,6 +269,7 @@ fn load_reloaded_context() -> ReloadedContext {
         server_cfg,
         prefs,
         auth,
+        local_wol_mac,
     }
 }
 
@@ -363,6 +377,7 @@ struct AgentInner {
     host: Option<HostHandle>,
     allow_owner_control: bool,
     pending_device_events: VecDeque<DeviceStatusEvent>,
+    pending_device_wol_events: VecDeque<DeviceWolCapabilityEvent>,
     password: String,
     custom_password: bool,
     listen_addr: Option<String>,
@@ -381,6 +396,7 @@ impl AgentInner {
     fn new(session_type: ServiceSessionType, ipc_secret: String) -> Result<Self, String> {
         let cfg = server_config::load_from_path(&server_config::default_config_path());
         let prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+        rc_ui::proxy::set_global_proxy_config(prefs.proxy.clone());
         let certs_dir = cert_manager::default_certs_dir();
         let cert_mgr = Arc::new(CertManager::load_or_init(certs_dir)?);
         let auth = Arc::new(AuthSessionManager::new(
@@ -406,6 +422,7 @@ impl AgentInner {
             host: None,
             allow_owner_control: true,
             pending_device_events: VecDeque::new(),
+            pending_device_wol_events: VecDeque::new(),
             password,
             custom_password,
             listen_addr: None,
@@ -453,6 +470,20 @@ impl AgentInner {
     fn sync_signal_allow_assist(&self) {
         if let Some(ref sig) = self.signal {
             let _ = sig.set_allow_remote_assist(self.signal_allow_remote_assist());
+        }
+    }
+
+    fn sync_signal_wol(&self, local_mac: Option<String>) {
+        if let Some(ref sig) = self.signal {
+            if self.prefs.allow_wol {
+                if let Some(mac) = local_mac {
+                    let _ = sig.set_mac_addr(Some(mac));
+                }
+                let _ = sig.set_wol_enabled(true);
+            } else {
+                let _ = sig.set_mac_addr(None);
+                let _ = sig.set_wol_enabled(false);
+            }
         }
     }
 
@@ -541,7 +572,7 @@ impl AgentInner {
     }
 
     #[must_use]
-    fn start_signal(&mut self) -> Option<Arc<SignalClientHandle>> {
+    fn start_signal(&mut self, local_mac: Option<String>) -> Option<Arc<SignalClientHandle>> {
         let old = self.signal.take();
         if let Some(ref o) = old {
             o.request_stop();
@@ -582,6 +613,15 @@ impl AgentInner {
             options,
             |_| {},
         );
+        if self.prefs.allow_wol {
+            if let Some(mac) = local_mac {
+                let _ = handle.set_mac_addr(Some(mac));
+            }
+            let _ = handle.set_wol_enabled(true);
+        } else {
+            let _ = handle.set_mac_addr(None);
+            let _ = handle.set_wol_enabled(false);
+        }
         let snap = handle.status();
         self.signal_online = snap.state == ServerConnectionState::Connected;
         if let Some(did) = snap.device_id {
@@ -724,8 +764,11 @@ impl AgentInner {
     #[must_use]
     fn apply_reloaded_context(&mut self, ctx: ReloadedContext) -> RetiredHandles {
         let prev_sig_key = self.signal_identity_key();
+        let prev_proxy = self.prefs.proxy.clone();
+        let prev_allow_wol = self.prefs.allow_wol;
         self.server_cfg = ctx.server_cfg;
         self.prefs = ctx.prefs;
+        rc_ui::proxy::set_global_proxy_config(self.prefs.proxy.clone());
         if let Some(auth) = ctx.auth {
             self.replace_auth(auth);
         } else {
@@ -775,11 +818,17 @@ impl AgentInner {
             &next_sig_key,
             signal_state,
         ) {
-            self.start_signal()
+            self.start_signal(ctx.local_wol_mac)
         } else {
             self.sync_signal_allow_assist();
+            if prev_allow_wol != self.prefs.allow_wol {
+                self.sync_signal_wol(ctx.local_wol_mac);
+            }
             if let Some(ref sig) = self.signal {
                 sig.set_upnp_enabled(self.prefs.upnp_enabled);
+                if prev_proxy != self.prefs.proxy {
+                    sig.trigger_reconnect("proxy_config_changed");
+                }
             }
             None
         };
@@ -788,8 +837,15 @@ impl AgentInner {
     }
 
     #[must_use]
-    fn reload_prefs(&mut self) -> Option<HostHandle> {
-        self.prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+    fn reload_prefs(
+        &mut self,
+        next_prefs: AppPrefs,
+        local_wol_mac: Option<String>,
+    ) -> Option<HostHandle> {
+        let prev_proxy = self.prefs.proxy.clone();
+        let prev_allow_wol = self.prefs.allow_wol;
+        self.prefs = next_prefs;
+        rc_ui::proxy::set_global_proxy_config(self.prefs.proxy.clone());
         let (pw, custom) = resolve_host_password_mode(
             self.session_type,
             self.prefs.custom_host_password.clone(),
@@ -800,8 +856,14 @@ impl AgentInner {
         self.custom_password = custom;
         let retired = self.ensure_host_state();
         self.sync_signal_allow_assist();
+        if prev_allow_wol != self.prefs.allow_wol {
+            self.sync_signal_wol(local_wol_mac);
+        }
         if let Some(ref sig) = self.signal {
             sig.set_upnp_enabled(self.prefs.upnp_enabled);
+            if prev_proxy != self.prefs.proxy {
+                sig.trigger_reconnect("proxy_config_changed");
+            }
         }
         if let Some(ref running_host) = self.host {
             let pw_opt = if self.password.is_empty() {
@@ -880,6 +942,13 @@ impl AgentInner {
         self.pending_device_events.push_back(ev);
     }
 
+    fn enqueue_device_wol_event(&mut self, ev: DeviceWolCapabilityEvent) {
+        if self.pending_device_wol_events.len() >= MAX_PENDING_DEVICE_EVENTS {
+            self.pending_device_wol_events.pop_front();
+        }
+        self.pending_device_wol_events.push_back(ev);
+    }
+
     fn pump_events(&mut self) -> (bool, RetiredHandles) {
         let mut changed = false;
         let mut retired_host = None;
@@ -930,6 +999,13 @@ impl AgentInner {
                 self.enqueue_device_status_event(dev_ev);
             }
 
+            while let Some(wol_ev) = sig.try_recv_device_wol_status() {
+                if revoked_reason.is_some() {
+                    break;
+                }
+                self.enqueue_device_wol_event(wol_ev);
+            }
+
             let reject_mtls = if revoked_reason.is_some() || self.host.is_none() {
                 self.build_mtls_bundle()
                     .map(|b| b.to_relay_mtls_config(None))
@@ -974,6 +1050,7 @@ impl AgentInner {
             self.device_id = None;
             self.allow_owner_control = true;
             self.pending_device_events.clear();
+            self.pending_device_wol_events.clear();
             self.listen_addr = None;
             self.display_addr = None;
             self.backend.clear();
@@ -1003,6 +1080,7 @@ impl AgentInner {
                     self.server_cfg =
                         server_config::load_from_path(&server_config::default_config_path());
                     self.prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+                    rc_ui::proxy::set_global_proxy_config(self.prefs.proxy.clone());
                     auth.update_server_config(self.server_cfg.clone());
                     auth.apply_external_session(sess);
                     let (pw, custom) = resolve_host_password_mode(
@@ -1020,9 +1098,21 @@ impl AgentInner {
                         }
                         let retired_all = RetiredHandles {
                             host: self.ensure_host_state(),
-                            signal: self.start_signal(),
+                            signal: self.start_signal(None),
                             lan: None,
                         };
+                        if self.prefs.allow_wol {
+                            if let Some(sig) = self.signal.clone() {
+                                let _ = std::thread::Builder::new()
+                                    .name("rc-agent-wol-mac".to_string())
+                                    .spawn(move || {
+                                        if let Some(mac) = rc_ui::platform::primary_mac_address() {
+                                            let _ = sig.set_mac_addr(Some(mac));
+                                        }
+                                        let _ = sig.set_wol_enabled(true);
+                                    });
+                            }
+                        }
                         self.sync_lan_advertising();
                         return (true, retired_all);
                     }
@@ -1301,8 +1391,9 @@ fn main() {
     if inner.is_authenticated() {
         inner.start_lan();
     }
+    let initial_wol_mac = probe_local_wol_mac_if_enabled(inner.prefs.allow_wol);
     let _ = inner.ensure_host_state();
-    let _ = inner.start_signal();
+    let _ = inner.start_signal(initial_wol_mac);
 
     let initial_tray = inner.status_bar_display();
     let agent = Arc::new(Mutex::new(inner));
@@ -1410,9 +1501,12 @@ fn main() {
                 ServiceResponse::Ok
             }
             ServiceRequest::ReloadPrefs => {
+                // 在获取 agent_ipc 锁前读取磁盘偏好并按需探测本机 MAC，严禁持锁派生外部子进程。
+                let next_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+                let local_wol_mac = probe_local_wol_mac_if_enabled(next_prefs.allow_wol);
                 let (retired_host, tray) = {
                     let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
-                    let retired = guard.reload_prefs();
+                    let retired = guard.reload_prefs(next_prefs, local_wol_mac);
                     (retired, guard.status_bar_display())
                 };
                 if let Some(mut h) = retired_host {
@@ -1451,6 +1545,53 @@ fn main() {
                 let events: Vec<DeviceStatusEvent> =
                     guard.pending_device_events.drain(..).collect();
                 ServiceResponse::DeviceStatusEvents(events)
+            }
+            ServiceRequest::DrainDeviceWolEvents => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                let events: Vec<DeviceWolCapabilityEvent> =
+                    guard.pending_device_wol_events.drain(..).collect();
+                ServiceResponse::DeviceWolEvents { events }
+            }
+            ServiceRequest::GetWolCapableSnapshot => {
+                let guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                let devices = guard
+                    .signal
+                    .as_ref()
+                    .map(|s| s.device_wol_capable_snapshot())
+                    .unwrap_or_default();
+                ServiceResponse::WolCapableSnapshot { devices }
+            }
+            ServiceRequest::RequestWol {
+                target_device_id,
+                timeout_ms,
+            } => {
+                let sig_opt = {
+                    let guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.signal.as_ref().cloned()
+                };
+                let Some(sig) = sig_opt else {
+                    return ServiceResponse::WolError(Box::new(ui_error::resolve_ui_error(
+                        codes::NETWORK_UNREACHABLE,
+                        ErrorPlatform::Macos,
+                        &[],
+                        None,
+                        Some("请先在「设置 → 网络」配置并连接服务器".to_string()),
+                    )));
+                };
+                if sig.status().state != ServerConnectionState::Connected {
+                    return ServiceResponse::WolError(Box::new(ui_error::resolve_ui_error(
+                        codes::NETWORK_UNREACHABLE,
+                        ErrorPlatform::Macos,
+                        &[],
+                        None,
+                        Some("信令服务器尚未连接，暂无法发送远程开机指令".to_string()),
+                    )));
+                }
+                let timeout = resolve_request_connect_timeout(timeout_ms);
+                match sig.request_wol(&target_device_id, timeout) {
+                    Ok(ack) => ServiceResponse::WolAck(Box::new(ack)),
+                    Err(ui_err) => ServiceResponse::WolError(Box::new(ui_err)),
+                }
             }
             ServiceRequest::RequestConnect {
                 target_id,

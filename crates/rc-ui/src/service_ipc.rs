@@ -4,6 +4,7 @@
 //! 并附带由后台服务生成的 256-bit 随机十六进制共享密钥（`run/ipc.secret`）做常量时间校验，
 //! 防止同机低权限进程冒充控制指令。非 Unix 平台提供零开销编译占位桩。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::host_bridge::HostApprovalPrompt;
 use crate::permissions::PermissionSnapshot;
 use crate::server_config::ServerStatusSnapshot;
-use crate::signal_client::{ConnectGrant, DeviceStatusEvent};
+use crate::signal_client::{
+    ConnectGrant, DeviceStatusEvent, DeviceWolCapabilityEvent, WolAckResult,
+};
+use crate::ui_error::UiError;
 
 /// 单条 IPC 请求/响应最大行字节数（256 KiB，防止异常写入耗尽内存）。
 pub const MAX_IPC_LINE_BYTES: usize = 256 * 1024;
@@ -149,6 +153,17 @@ pub enum ServiceRequest {
     },
     /// 请求后台立刻重新检查系统权限快照。
     TriggerPermissionCheck,
+    /// 通过后台信令长连接发起 Wake-on-LAN 远程开机请求。
+    RequestWol {
+        /// 目标 9 位设备码。
+        target_device_id: String,
+        /// 超时毫秒数。
+        timeout_ms: u64,
+    },
+    /// 查询后台信令连接缓存的同账号设备 `wol_capable` 状态映射。
+    GetWolCapableSnapshot,
+    /// 排空后台信令连接收到的设备 Wake-on-LAN 能力增量事件批次。
+    DrainDeviceWolEvents,
 }
 
 /// 后台服务返回的 IPC 响应消息。
@@ -182,6 +197,20 @@ pub enum ServiceResponse {
     ServerStatus(Box<ServerStatusSnapshot>),
     /// 后台信令连接收到的设备状态变更事件批次。
     DeviceStatusEvents(Vec<DeviceStatusEvent>),
+    /// 后台信令连接收到的设备 Wake-on-LAN 能力增量事件批次。
+    DeviceWolEvents {
+        /// 增量事件列表。
+        events: Vec<DeviceWolCapabilityEvent>,
+    },
+    /// 后台信令缓存的同账号设备 `wol_capable` 映射快照。
+    WolCapableSnapshot {
+        /// `device_id -> wol_capable` 映射表。
+        devices: HashMap<String, bool>,
+    },
+    /// 服务端返回的 Wake-on-LAN 远程开机结果。
+    WolAck(Box<WolAckResult>),
+    /// 远程开机请求失败的结构化错误。
+    WolError(Box<UiError>),
     /// 最新有效的认证登录会话快照（由 `rc-daemon` 单点刷新返回）。
     AuthSession(Box<crate::auth_client::StoredAuthSession>),
     /// Refresh Token 已被吊销或需重新登录。
@@ -1124,5 +1153,57 @@ mod tests {
         let decoded: AgentSnapshot =
             serde_json::from_str(&encoded).expect("deserialize AgentSnapshot with upnp");
         assert_eq!(decoded.upnp_status, base.upnp_status);
+    }
+
+    #[test]
+    fn wol_service_ipc_messages_roundtrip() {
+        let req = ServiceRequest::RequestWol {
+            target_device_id: "604928235".to_string(),
+            timeout_ms: 8_000,
+        };
+        let dec_req: ServiceRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(dec_req, req);
+
+        let ack = ServiceResponse::WolAck(Box::new(WolAckResult {
+            target_device_id: "604928235".to_string(),
+            ok: true,
+            method: "lan_peer".to_string(),
+            code: None,
+            message: "dispatched".to_string(),
+            ui_error: None,
+        }));
+        let dec_ack: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&ack).unwrap()).unwrap();
+        assert_eq!(dec_ack, ack);
+
+        let wol_err = ServiceResponse::WolError(Box::new(crate::ui_error::resolve_ui_error(
+            crate::ui_error::codes::WOL_DISABLED,
+            crate::ui_error::ErrorPlatform::Macos,
+            &[],
+            None,
+            Some("target wol disabled".to_string()),
+        )));
+        let dec_wol_err: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&wol_err).unwrap()).unwrap();
+        assert_eq!(dec_wol_err, wol_err);
+
+        let mut map = HashMap::new();
+        map.insert("604928235".to_string(), true);
+        let snap = ServiceResponse::WolCapableSnapshot { devices: map };
+        let dec_snap: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(dec_snap, snap);
+
+        let events = ServiceResponse::DeviceWolEvents {
+            events: vec![DeviceWolCapabilityEvent {
+                device_id: "604928235".to_string(),
+                online: false,
+                wol_capable: true,
+            }],
+        };
+        let dec_events: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
+        assert_eq!(dec_events, events);
     }
 }

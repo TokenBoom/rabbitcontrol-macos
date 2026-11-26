@@ -586,7 +586,28 @@ body {
 }
 
 .p1__card.is-controlling .p1__watermark,
-.p1__card.is-controlling .p1__enter {
+.p1__card.is-controlling .p1__enter,
+.p1__card.is-controlling .p1__wol-btn {
+  display: none;
+}
+
+.p1__card.is-wol-ready .p1__enter {
+  display: none;
+}
+
+.p1__wol-btn {
+  position: relative;
+  z-index: 2;
+  margin-top: 20px;
+  gap: 7px;
+  height: 38px;
+  padding: 0 22px;
+  border-radius: var(--r-pill);
+  font-size: var(--size-title);
+  font-weight: var(--font-weight-medium);
+}
+
+.p1__wol-btn[hidden] {
   display: none;
 }
 

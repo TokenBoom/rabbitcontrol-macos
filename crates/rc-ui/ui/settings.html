@@ -91,6 +91,19 @@
               </span>
             </div>
           </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-allow-wol">允许通过远程开机启动</div>
+              <div class="rc-setting-row__desc">开启后上报主网卡 MAC 地址，支持同账号其他设备向本机发送 Wake-on-LAN 远程唤醒指令（需系统与局域网支持网络唤醒）。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-allow-wol" aria-labelledby="row-allow-wol" />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
         </section>
 
         <!-- G1.5 系统级后台被控服务（macOS LoginWindow/Aqua）与整体退出 -->
@@ -306,6 +319,90 @@
           </div>
         </section>
 
+        <!-- G1.6 网络代理设置（Issue #5） -->
+        <section class="rc-group" aria-label="代理设置" id="group-proxy">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-proxy-mode">代理设置</div>
+              <div class="rc-setting-row__desc">配置信令、认证、中继与更新请求的出站网络代理（保存后立即生效并自动重连信令）。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <span class="rc-select">
+                <select id="opt-proxy-mode" aria-labelledby="row-proxy-mode">
+                  <option value="none" selected>不使用代理</option>
+                  <option value="system">系统代理</option>
+                  <option value="manual">手动设置</option>
+                </select>
+                <svg class="rc-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </span>
+            </div>
+          </div>
+
+          <div class="rc-proxy-manual" id="proxy-manual-fields" hidden>
+            <div class="rc-setting-row">
+              <div class="rc-setting-row__main">
+                <div class="rc-setting-row__title" id="row-proxy-protocol">代理协议</div>
+                <div class="rc-setting-row__desc">支持 SOCKS5 与 HTTP CONNECT 代理隧道。</div>
+              </div>
+              <div class="rc-setting-row__control">
+                <span class="rc-select">
+                  <select id="opt-proxy-protocol" aria-labelledby="row-proxy-protocol">
+                    <option value="socks5" selected>SOCKS5</option>
+                    <option value="http">HTTP</option>
+                  </select>
+                  <svg class="rc-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                </span>
+              </div>
+            </div>
+
+            <div class="rc-setting-row">
+              <div class="rc-setting-row__main">
+                <div class="rc-setting-row__title" id="row-proxy-endpoint">代理地址与端口</div>
+                <div class="rc-setting-row__desc">填写代理服务器主机名或 IP 以及端口（1–65535）。</div>
+              </div>
+              <div class="rc-setting-row__control">
+                <div class="rc-proxy-addr-pair" aria-labelledby="row-proxy-endpoint">
+                  <input type="text" class="rc-input rc-input--proxy-host" id="opt-proxy-host"
+                         aria-label="代理地址" placeholder="127.0.0.1 或 proxy.corp"
+                         autocomplete="off" spellcheck="false" />
+                  <span class="rc-port-sep" aria-hidden="true">:</span>
+                  <input type="text" inputmode="numeric" pattern="[0-9]*"
+                         class="rc-input rc-input--port" id="opt-proxy-port"
+                         aria-label="代理端口" placeholder="1080"
+                         autocomplete="off" spellcheck="false" />
+                </div>
+              </div>
+            </div>
+
+            <div class="rc-setting-row">
+              <div class="rc-setting-row__main">
+                <div class="rc-setting-row__title" id="row-proxy-auth">认证凭据（可选）</div>
+                <div class="rc-setting-row__desc">若代理无需认证可留空；已保存的密码仅用于出站鉴权，不会明文回显。</div>
+              </div>
+              <div class="rc-setting-row__control">
+                <div class="rc-proxy-addr-pair" aria-labelledby="row-proxy-auth">
+                  <input type="text" class="rc-input rc-input--cred" id="opt-proxy-username"
+                         aria-label="代理用户名" placeholder="用户名（可选）"
+                         autocomplete="off" spellcheck="false" />
+                  <input type="password" class="rc-input rc-input--cred" id="opt-proxy-password"
+                         aria-label="代理密码" placeholder="密码（可选）"
+                         autocomplete="new-password" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__desc" id="proxy-status-detail">当前不使用代理（直连模式）。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-proxy-clear-password" hidden>清除已存密码</button>
+              <button type="button" class="rc-btn rc-btn--primary" id="btn-proxy-save">保存代理</button>
+            </div>
+          </div>
+        </section>
+
         <!-- G2 自动更新镜像加速 -->
         <section class="rc-group" aria-label="自动更新下载镜像">
           <div class="rc-setting-row">
@@ -463,8 +560,9 @@
         document.getElementById(id).addEventListener("change", save);
       });
 
-      /* ── 常规：关闭窗口行为与文件传输存储路径（Tauri 持久化 prefs.json）+ 系统后台服务托管 ── */
+      /* ── 常规：关闭窗口行为、远程开机与文件传输存储路径（Tauri 持久化 prefs.json）+ 系统后台服务托管 ── */
       var optCloseWindow = document.getElementById("opt-close-window");
+      var optAllowWol = document.getElementById("opt-allow-wol");
       var optDownloadPath = document.getElementById("opt-download-path");
       var btnChangeDownloadPath = document.getElementById("btn-change-download-path");
       var btnOpenDownloadPath = document.getElementById("btn-open-download-path");
@@ -522,10 +620,34 @@
             if (gp && typeof gp.fileTransferDir === "string") {
               applyDownloadPathText(gp.fileTransferDir);
             }
+            if (gp && optAllowWol && typeof gp.allowWol === "boolean") {
+              optAllowWol.checked = gp.allowWol;
+            }
           })
           .catch(function () {
             applyDownloadPathText("读取失败");
           });
+        if (optAllowWol) {
+          optAllowWol.addEventListener("change", function () {
+            if (typeof Bridge.saveGeneralPrefs !== "function") return;
+            var desired = Boolean(optAllowWol.checked);
+            optAllowWol.disabled = true;
+            Bridge.saveGeneralPrefs({ allowWol: desired })
+              .then(function (saved) {
+                if (saved && typeof saved.allowWol === "boolean") {
+                  optAllowWol.checked = saved.allowWol;
+                }
+                toast(desired ? "已开启允许通过远程开机启动" : "已关闭远程开机启动");
+              })
+              .catch(function (err) {
+                optAllowWol.checked = !desired;
+                toast("保存远程开机设置失败：" + String(err));
+              })
+              .then(function () {
+                optAllowWol.disabled = false;
+              });
+          });
+        }
         if (optCloseWindow) {
           optCloseWindow.addEventListener("change", function () {
             if (serviceProxyLocked) {
@@ -1316,6 +1438,226 @@
             });
         });
         refreshUpnpStatus();
+      }
+
+      /* ── 网络代理设置（Issue #5）───────────────────────────────── */
+      var PROXY_STORE_KEY = "rc.settings.proxy.v1";
+      var optProxyMode = document.getElementById("opt-proxy-mode");
+      var proxyManualFields = document.getElementById("proxy-manual-fields");
+      var optProxyProtocol = document.getElementById("opt-proxy-protocol");
+      var optProxyHost = document.getElementById("opt-proxy-host");
+      var optProxyPort = document.getElementById("opt-proxy-port");
+      var optProxyUsername = document.getElementById("opt-proxy-username");
+      var optProxyPassword = document.getElementById("opt-proxy-password");
+      var proxyStatusDetail = document.getElementById("proxy-status-detail");
+      var btnProxyClearPassword = document.getElementById("btn-proxy-clear-password");
+      var btnProxySave = document.getElementById("btn-proxy-save");
+      var proxyHasSavedPassword = false;
+      var proxyClearPasswordPending = false;
+      var proxyBusy = false;
+
+      function syncProxyModeUi() {
+        if (!optProxyMode) return;
+        var mode = optProxyMode.value || "none";
+        if (proxyManualFields) {
+          proxyManualFields.hidden = mode !== "manual";
+        }
+        if (btnProxyClearPassword) {
+          btnProxyClearPassword.hidden = !(mode === "manual" && proxyHasSavedPassword && !proxyClearPasswordPending);
+        }
+      }
+
+      function syncProxyPasswordPlaceholder() {
+        if (!optProxyPassword) return;
+        if (proxyHasSavedPassword && !proxyClearPasswordPending) {
+          optProxyPassword.placeholder = "已保存密码（留空不变）";
+        } else {
+          optProxyPassword.placeholder = "密码（可选）";
+        }
+      }
+
+      function setProxyStatusMessage(text, isError) {
+        if (!proxyStatusDetail) return;
+        proxyStatusDetail.classList.remove("rc-setting-row__detail--error", "rc-setting-row__detail--ok");
+        if (isError) {
+          proxyStatusDetail.classList.add("rc-setting-row__detail--error");
+        }
+        proxyStatusDetail.textContent = text;
+      }
+
+      function formatProxySummary(view) {
+        if (!view || view.mode === "none") {
+          return "当前不使用代理（直连模式）。";
+        }
+        if (view.mode === "system") {
+          return "当前跟随 macOS 系统代理设置（无系统代理时自动回退环境变量）。";
+        }
+        var proto = String(view.protocol || "socks5").toUpperCase();
+        var endpoint = view.host && view.port ? proto + " · " + view.host + ":" + view.port : proto;
+        return "当前使用手动代理：" + endpoint + (view.hasPassword ? "（已保存密码）" : "");
+      }
+
+      function applyProxyView(view) {
+        if (!view || !optProxyMode) return;
+        var mode = view.mode === "system" || view.mode === "manual" ? view.mode : "none";
+        optProxyMode.value = mode;
+        if (optProxyProtocol) {
+          optProxyProtocol.value = view.protocol === "http" ? "http" : "socks5";
+        }
+        if (optProxyHost) {
+          optProxyHost.value = typeof view.host === "string" ? view.host : "";
+        }
+        if (optProxyPort) {
+          optProxyPort.value = view.port && Number(view.port) > 0 ? String(view.port) : "";
+        }
+        if (optProxyUsername) {
+          optProxyUsername.value = typeof view.username === "string" ? view.username : "";
+        }
+        if (optProxyPassword) {
+          optProxyPassword.value = "";
+        }
+        proxyHasSavedPassword = Boolean(view.hasPassword);
+        proxyClearPasswordPending = false;
+        syncProxyPasswordPlaceholder();
+        syncProxyModeUi();
+        setProxyStatusMessage(formatProxySummary(view), false);
+      }
+
+      function setProxyBusy(busy) {
+        proxyBusy = Boolean(busy);
+        if (btnProxySave) btnProxySave.disabled = proxyBusy;
+        if (btnProxyClearPassword) btnProxyClearPassword.disabled = proxyBusy;
+      }
+
+      if (optProxyMode) {
+        optProxyMode.addEventListener("change", function () {
+          syncProxyModeUi();
+        });
+      }
+
+      if (btnProxyClearPassword) {
+        btnProxyClearPassword.addEventListener("click", function () {
+          proxyClearPasswordPending = true;
+          if (optProxyPassword) optProxyPassword.value = "";
+          syncProxyPasswordPlaceholder();
+          syncProxyModeUi();
+          toast("将在保存代理设置后清除已存密码");
+        });
+      }
+
+      if (optProxyPassword) {
+        optProxyPassword.addEventListener("input", function () {
+          if (optProxyPassword.value.length > 0) {
+            proxyClearPasswordPending = false;
+            syncProxyModeUi();
+          }
+        });
+      }
+
+      if (IS_TAURI && typeof Bridge.getProxyPrefs === "function") {
+        Bridge.getProxyPrefs()
+          .then(applyProxyView)
+          .catch(function () {
+            applyProxyView({ mode: "none", protocol: "socks5", host: "", port: 0, username: null, hasPassword: false });
+          });
+      } else {
+        var savedPreviewProxy = null;
+        try {
+          savedPreviewProxy = JSON.parse(window.localStorage.getItem(PROXY_STORE_KEY) || "null");
+        } catch (err) {
+          savedPreviewProxy = null;
+        }
+        applyProxyView(savedPreviewProxy || { mode: "none", protocol: "socks5", host: "", port: 0, username: null, hasPassword: false });
+      }
+
+      if (btnProxySave) {
+        btnProxySave.addEventListener("click", function () {
+          if (proxyBusy || !optProxyMode) return;
+          var mode = optProxyMode.value || "none";
+          var protocol = optProxyProtocol ? (optProxyProtocol.value === "http" ? "http" : "socks5") : "socks5";
+          var host = optProxyHost ? optProxyHost.value.trim() : "";
+          var rawPort = optProxyPort ? optProxyPort.value.trim() : "";
+          var port = 0;
+          if (mode === "manual") {
+            if (!host) {
+              toast("请填写代理服务器地址");
+              if (optProxyHost) optProxyHost.focus();
+              return;
+            }
+            if (!/^\d+$/.test(rawPort)) {
+              toast("代理端口需为 1–65535 之间的整数");
+              if (optProxyPort) optProxyPort.focus();
+              return;
+            }
+            port = Number(rawPort);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+              toast("代理端口需为 1–65535 之间的整数");
+              if (optProxyPort) optProxyPort.focus();
+              return;
+            }
+          } else if (rawPort && /^\d+$/.test(rawPort)) {
+            var parsedPort = Number(rawPort);
+            if (Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+              port = parsedPort;
+            }
+          }
+          var username = optProxyUsername ? optProxyUsername.value : "";
+          var password = optProxyPassword ? optProxyPassword.value : "";
+          var payload = {
+            mode: mode,
+            protocol: protocol,
+            host: host,
+            port: port,
+            username: username ? username : null,
+            password: password ? password : null,
+            clearPassword: Boolean(proxyClearPasswordPending)
+          };
+
+          if (!IS_TAURI || typeof Bridge.saveProxyPrefs !== "function") {
+            var previewView = {
+              mode: mode,
+              protocol: protocol,
+              host: host,
+              port: port,
+              username: username ? username : null,
+              hasPassword: Boolean(password || (proxyHasSavedPassword && !proxyClearPasswordPending))
+            };
+            try {
+              window.localStorage.setItem(PROXY_STORE_KEY, JSON.stringify(previewView));
+            } catch (err) { /* ignore */ }
+            applyProxyView(previewView);
+            toast("已保存代理设置（浏览器预览模式）");
+            return;
+          }
+
+          setProxyBusy(true);
+          Bridge.saveProxyPrefs(payload)
+            .then(function (view) {
+              applyProxyView(view);
+              toast("已保存代理设置并应用");
+            })
+            .catch(function (err) {
+              var msg = window.RCErrorDisplay
+                ? window.RCErrorDisplay.formatSummary(err, String(err))
+                : String(err);
+              setProxyStatusMessage("保存代理失败：" + msg, true);
+              toast("保存代理失败：" + msg);
+            })
+            .then(function () {
+              setProxyBusy(false);
+            });
+        });
+
+        [optProxyHost, optProxyPort, optProxyUsername, optProxyPassword].forEach(function (inp) {
+          if (!inp) return;
+          inp.addEventListener("keydown", function (e) {
+            if (e.isComposing || e.keyCode === 229) return;
+            if (e.key === "Enter") {
+              e.preventDefault();
+              btnProxySave.click();
+            }
+          });
+        });
       }
 
       /* ── 自动更新镜像加速前缀配置 ───────────────────────────── */

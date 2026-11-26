@@ -8,6 +8,8 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -32,13 +34,14 @@ use rc_ui::lan_discovery::{self, LanPeer};
 use rc_ui::metal_attach::{self, Frame, StatusBarAction, StatusBarDisplay};
 use rc_ui::model::{self, ConnectTarget};
 use rc_ui::permissions::{self, PermissionSnapshot};
+use rc_ui::proxy::{self, ProxyConfig, ProxyMode, ProxyProtocol};
 use rc_ui::server_config::{self, ServerConfig, ServerConnectionState, ServerStatusSnapshot};
 use rc_ui::service_ipc::{IpcClient, ServiceRequest, ServiceResponse};
 use rc_ui::service_manager::{self, ServiceStatusReport};
 use rc_ui::session_bridge::{
     SessionCommand, SessionHandle, SessionUpdate, ToolClientHandle, UiSessionConfig,
 };
-use rc_ui::signal_client::{self, SignalClientHandle, SignalClientOptions};
+use rc_ui::signal_client::{self, SignalClientHandle, SignalClientOptions, WolAckResult};
 use rc_ui::ui_error::{self, codes, ErrorPlatform, IntoUiError, UiError};
 use rc_ui::upnp::UpnpStatus;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -2486,19 +2489,17 @@ pub(crate) fn call_agent_ipc(
 
 fn send_background_services_reload_ipc(auth_changed: bool) {
     let secret_path = config_paths::ipc_secret_path();
-    if auth_changed {
-        let _ = IpcClient::call(
-            &config_paths::daemon_socket_path(),
-            &secret_path,
-            ServiceRequest::RefreshAuthAndCerts,
-            Duration::from_secs(2),
-        );
-    }
     let req = if auth_changed {
         ServiceRequest::RefreshAuthAndCerts
     } else {
         ServiceRequest::ReloadPrefs
     };
+    let _ = IpcClient::call(
+        &config_paths::daemon_socket_path(),
+        &secret_path,
+        req.clone(),
+        Duration::from_secs(2),
+    );
     let _ = IpcClient::call(
         &config_paths::agent_socket_path(),
         &secret_path,
@@ -3289,10 +3290,32 @@ fn stop_signal_client_for_logout(state: &AppState) -> ServerStatusSnapshot {
     snap
 }
 
+/// 将本机 Wake-on-LAN 隐私开关与主网卡 MAC 同步至活跃信令句柄：
+/// - `allow_wol == true`：上报已探测到的合法单播 MAC 并开启 `wol_enabled`；
+/// - `allow_wol == false`：显式清空缓存 MAC（`set_mac_addr(None)`）并关闭 `wol_enabled`，避免后续心跳携带 MAC。
+fn apply_wol_state_to_signal(sig: &SignalClientHandle, allow_wol: bool, local_mac: Option<String>) {
+    if allow_wol {
+        if let Some(mac) = local_mac {
+            let _ = sig.set_mac_addr(Some(mac));
+        }
+        let _ = sig.set_wol_enabled(true);
+    } else {
+        let _ = sig.set_mac_addr(None);
+        let _ = sig.set_wol_enabled(false);
+    }
+}
+
 /// 根据当前 `state.server.config` 启动或停用信令服务器长连接客户端，并返回最新状态快照。
 pub(crate) fn start_signal_client_if_enabled(state: &AppState) -> ServerStatusSnapshot {
     let lan_addrs = collect_local_lan_addrs(state);
     let authenticated = state.gate_state() == AppGateState::Authenticated;
+    let allow_wol = sync_prefs_from_disk_if_proxy(state).allow_wol;
+    // 严格遵守隐私承诺：仅当用户开启 allow_wol 时才在锁外探测主网卡 MAC。
+    let local_mac = if authenticated && !state.is_service_proxy() && allow_wol {
+        rc_ui::platform::primary_mac_address()
+    } else {
+        None
+    };
     let options = build_signal_client_options(state);
     let (old, snap) = {
         let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
@@ -3311,6 +3334,7 @@ pub(crate) fn start_signal_client_if_enabled(state: &AppState) -> ServerStatusSn
                 options,
                 |_| {},
             ));
+            apply_wol_state_to_signal(&handle, allow_wol, local_mac);
             let snap = handle.status();
             rt.signal_client = Some(handle);
             snap
@@ -3727,6 +3751,12 @@ fn save_terminal_prefs_to_path(
     Ok(next)
 }
 
+/// 脱敏面向前端返回的 `AppPrefs` 副本，确保代理密码绝不经通用偏好 IPC 泄露至渲染层。
+fn sanitize_app_prefs_for_ui(mut prefs: AppPrefs) -> AppPrefs {
+    prefs.proxy.password = None;
+    prefs
+}
+
 /// IPC 命令：读取持久化应用偏好（异步在工作线程执行，避免文件锁与磁盘读阻塞主线程）。
 #[tauri::command]
 pub async fn get_app_prefs(app: AppHandle) -> Result<AppPrefs, String> {
@@ -3734,7 +3764,7 @@ pub async fn get_app_prefs(app: AppHandle) -> Result<AppPrefs, String> {
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
-        sync_prefs_from_disk_if_proxy(&state)
+        sanitize_app_prefs_for_ui(sync_prefs_from_disk_if_proxy(&state))
     })
     .await
     .map_err(|e| format!("读取应用偏好任务异常：{e}"))
@@ -3753,6 +3783,7 @@ pub async fn save_stream_prefs(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         save_stream_prefs_to_path(&state, patch, &app_prefs::default_prefs_path())
+            .map(sanitize_app_prefs_for_ui)
     })
     .await
     .map_err(|e| format!("保存偏好设置任务异常：{e}"))?
@@ -3931,6 +3962,8 @@ pub struct MyDeviceEntry {
     pub in_session: bool,
     /// 是否当前本机。
     pub is_local: bool,
+    /// 是否具备 Wake-on-LAN 远程开机能力（目标已开启且已上报合法单播 MAC）。
+    pub wol_capable: bool,
     /// 绑定时间（RFC3339）。
     pub bound_at: Option<String>,
     /// 最近活跃时间（RFC3339）。
@@ -4024,7 +4057,35 @@ fn format_auth_error(err: AuthClientError) -> String {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn map_my_device_entry(info: MyDeviceInfo, local_device_id: Option<&str>) -> MyDeviceEntry {
+    let wol_capable = info.wol_capable;
+    map_my_device_entry_with_wol(info, local_device_id, wol_capable)
+}
+
+/// 解析设备最终的 `wolCapable` 状态：
+/// 1. 优先采用信令连接实时缓存的 `device_wol_capable_snapshot`（最新变更）；
+/// 2. 未命中信令缓存时回退至 REST `/api/v1/me/devices` 返回的 `info.wol_capable`（确保已离线设备首次启动即可展示远程开机）；
+/// 3. 本机设备无信令缓存时额外兼容本机实时 `local_wol_fallback`。
+fn resolve_device_wol_capable(
+    info: &MyDeviceInfo,
+    is_local: bool,
+    wol_map: &HashMap<String, bool>,
+    local_wol_fallback: bool,
+) -> bool {
+    let norm_id = normalize_device_id_for_match(&info.device_id);
+    wol_map.get(&norm_id).copied().unwrap_or(if is_local {
+        info.wol_capable || local_wol_fallback
+    } else {
+        info.wol_capable
+    })
+}
+
+fn map_my_device_entry_with_wol(
+    info: MyDeviceInfo,
+    local_device_id: Option<&str>,
+    wol_capable: bool,
+) -> MyDeviceEntry {
     let formatted_id = if info.formatted_id.trim().is_empty() {
         server_config::format_device_id(&info.device_id)
     } else {
@@ -4055,8 +4116,29 @@ fn map_my_device_entry(info: MyDeviceInfo, local_device_id: Option<&str>) -> MyD
         online: info.online,
         in_session: info.in_session,
         is_local,
+        wol_capable,
         bound_at: info.bound_at,
         last_seen_at: info.last_seen_at,
+    }
+}
+
+fn query_wol_capable_snapshot(state: &AppState) -> HashMap<String, bool> {
+    if state.is_service_proxy() {
+        match call_agent_ipc(
+            ServiceRequest::GetWolCapableSnapshot,
+            Duration::from_millis(400),
+        ) {
+            Ok(ServiceResponse::WolCapableSnapshot { devices }) => devices,
+            _ => HashMap::new(),
+        }
+    } else {
+        let client = {
+            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+            rt.signal_client.as_ref().cloned()
+        };
+        client
+            .map(|c| c.device_wol_capable_snapshot())
+            .unwrap_or_default()
     }
 }
 
@@ -4880,9 +4962,20 @@ pub async fn list_my_devices(app: AppHandle) -> Result<Vec<MyDeviceEntry>, Strin
         let list = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.list_my_devices(token)
         })?;
+        let wol_map = query_wol_capable_snapshot(&state);
+        let local_wol_fallback = sync_prefs_from_disk_if_proxy(&state).allow_wol
+            && rc_ui::platform::primary_mac_address().is_some();
         let mut entries: Vec<MyDeviceEntry> = list
             .into_iter()
-            .map(|d| map_my_device_entry(d, local_did.as_deref()))
+            .map(|d| {
+                let norm_id = normalize_device_id_for_match(&d.device_id);
+                let is_local = local_did
+                    .as_deref()
+                    .is_some_and(|local| normalize_device_id_for_match(local) == norm_id);
+                let wol_capable =
+                    resolve_device_wol_capable(&d, is_local, &wol_map, local_wol_fallback);
+                map_my_device_entry_with_wol(d, local_did.as_deref(), wol_capable)
+            })
             .collect();
         sort_my_device_entries(&mut entries);
         Ok(entries)
@@ -4907,7 +5000,21 @@ pub async fn rename_my_device(
         let updated = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.rename_device(token, &device_id, &alias)
         })?;
-        Ok(map_my_device_entry(updated, local_did.as_deref()))
+        let wol_map = query_wol_capable_snapshot(&state);
+        let norm_id = normalize_device_id_for_match(&updated.device_id);
+        let is_local = local_did
+            .as_deref()
+            .is_some_and(|local| normalize_device_id_for_match(local) == norm_id);
+        let local_wol_fallback = is_local
+            && sync_prefs_from_disk_if_proxy(&state).allow_wol
+            && rc_ui::platform::primary_mac_address().is_some();
+        let wol_capable =
+            resolve_device_wol_capable(&updated, is_local, &wol_map, local_wol_fallback);
+        Ok(map_my_device_entry_with_wol(
+            updated,
+            local_did.as_deref(),
+            wol_capable,
+        ))
     })
     .await
     .map_err(|e| format!("修改设备备注任务异常：{e}"))?
@@ -5672,6 +5779,7 @@ pub async fn terminal_set_font_prefs(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         save_terminal_prefs_to_path(&state, patch, &app_prefs::default_prefs_path())
+            .map(sanitize_app_prefs_for_ui)
     })
     .await
     .map_err(|e| format!("保存终端字体偏好任务异常：{e}"))?
@@ -5876,7 +5984,7 @@ pub fn portmap_delete(id: u64, state: State<'_, AppState>) -> Result<(), String>
 // 常规偏好、系统级后台服务托管与菜单栏整体退出 IPC 命令
 // ─────────────────────────────────────────────────────────────────
 
-/// 常规窗口行为与文件存储路径偏好快照（IPC `camelCase`）。
+/// 常规窗口行为、文件存储路径与远程开机偏好快照（IPC `camelCase`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneralPrefsSnapshot {
@@ -5886,6 +5994,8 @@ pub struct GeneralPrefsSnapshot {
     pub file_transfer_dir: String,
     /// 当前文件传输存储路径是否为平台默认目录。
     pub file_transfer_dir_is_default: bool,
+    /// 是否允许通过 Wake-on-LAN 远程开机启动本机。
+    pub allow_wol: bool,
 }
 
 /// 常规偏好增量更新补丁（IPC `camelCase`）。
@@ -5896,6 +6006,8 @@ pub struct GeneralPrefsPatch {
     pub close_to_tray: Option<bool>,
     /// W2 文件传输存储目录（`Some("")` 表示恢复默认目录）。
     pub file_transfer_dir: Option<String>,
+    /// 是否允许通过 Wake-on-LAN 远程开机启动本机。
+    pub allow_wol: Option<bool>,
 }
 
 fn general_prefs_snapshot_from_prefs(prefs: &AppPrefs) -> GeneralPrefsSnapshot {
@@ -5906,6 +6018,7 @@ fn general_prefs_snapshot_from_prefs(prefs: &AppPrefs) -> GeneralPrefsSnapshot {
             .to_string_lossy()
             .into_owned(),
         file_transfer_dir_is_default: prefs.is_default_file_transfer_dir(),
+        allow_wol: prefs.allow_wol,
     }
 }
 
@@ -6039,6 +6152,9 @@ fn save_general_prefs_to_path(
     if let Some(close_to_tray) = patch.close_to_tray {
         next.close_to_tray = close_to_tray;
     }
+    if let Some(allow_wol) = patch.allow_wol {
+        next.allow_wol = allow_wol;
+    }
 
     let mut updated_transfer_dir: Option<PathBuf> = None;
     if let Some(raw_dir) = patch.file_transfer_dir {
@@ -6055,6 +6171,23 @@ fn save_general_prefs_to_path(
         let host = state.host.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = host.handle.as_ref() {
             handle.set_file_transfer_dir(Some(resolved));
+        }
+    }
+
+    if let Some(allow_wol) = patch.allow_wol {
+        if !state.is_service_proxy() {
+            let client = {
+                let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+                rt.signal_client.as_ref().cloned()
+            };
+            if let Some(sig) = client {
+                let local_mac = if allow_wol {
+                    rc_ui::platform::primary_mac_address()
+                } else {
+                    None
+                };
+                apply_wol_state_to_signal(&sig, allow_wol, local_mac);
+            }
         }
     }
 
@@ -7209,6 +7342,274 @@ pub async fn save_upnp_enabled(enabled: bool, app: AppHandle) -> Result<UpnpStat
     .map_err(|e| format!("保存 UPnP 设置任务异常：{e}"))?
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 出站网络代理（Issue #5）与 Wake-on-LAN 远程开机（Issue #7）IPC 命令
+// ─────────────────────────────────────────────────────────────────
+
+/// 面向前端渲染层的脱敏网络代理配置视图（绝不回传代理密码明文）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPrefsView {
+    /// 代理模式（`"none"` / `"system"` / `"manual"`）。
+    pub mode: ProxyMode,
+    /// 手动代理协议（`"socks5"` / `"http"`）。
+    pub protocol: Option<ProxyProtocol>,
+    /// 代理服务器主机名或 IP。
+    pub host: String,
+    /// 代理服务器端口。
+    pub port: u16,
+    /// 可选代理认证用户名。
+    pub username: Option<String>,
+    /// 是否已在本地保存了代理认证密码（用于 UI 展示脱敏占位，绝不回传明文）。
+    pub has_password: bool,
+}
+
+/// 保存出站网络代理配置请求（自定义 `Debug` 对密码字段脱敏，防日志泄露）。
+#[derive(Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SaveProxyPrefsRequest {
+    /// 代理模式（`"none"` / `"system"` / `"manual"`）。
+    pub mode: ProxyMode,
+    /// 手动代理协议（`"socks5"` / `"http"`）。
+    pub protocol: Option<ProxyProtocol>,
+    /// 代理服务器主机名或 IP。
+    pub host: String,
+    /// 代理服务器端口。
+    pub port: u16,
+    /// 可选代理认证用户名。
+    pub username: Option<String>,
+    /// 可选新代理认证密码（留空且 `clear_password == false` 时保留已保存密码）。
+    pub password: Option<String>,
+    /// 为 `true` 时显式清空已保存密码。
+    pub clear_password: bool,
+}
+
+impl fmt::Debug for SaveProxyPrefsRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = self.password.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SaveProxyPrefsRequest")
+            .field("mode", &self.mode)
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &redacted)
+            .field("clear_password", &self.clear_password)
+            .finish()
+    }
+}
+
+fn proxy_prefs_view_from_config(cfg: &ProxyConfig) -> ProxyPrefsView {
+    ProxyPrefsView {
+        mode: cfg.mode,
+        protocol: cfg.protocol,
+        host: cfg.host.clone(),
+        port: cfg.port,
+        username: cfg.username.clone(),
+        has_password: cfg.password.as_deref().is_some_and(|p| !p.is_empty()),
+    }
+}
+
+fn save_proxy_prefs_to_path(
+    state: &AppState,
+    req: SaveProxyPrefsRequest,
+    prefs_path: &Path,
+) -> Result<(ProxyPrefsView, ProxyConfig, bool), UiCommandError> {
+    let _io = state
+        .prefs_io_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _file_lock = config_paths::acquire_file_lock(prefs_path, Duration::from_secs(3));
+
+    let mut next = {
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(prefs_path);
+        }
+        prefs.clone()
+    };
+
+    let prev_proxy = next.proxy.clone();
+    let username = req.username.filter(|u| !u.is_empty());
+    let password = if req.clear_password {
+        None
+    } else if let Some(pw) = req.password.filter(|p| !p.is_empty()) {
+        Some(pw)
+    } else if username.is_none() && prev_proxy.username.is_some() {
+        // 用户清空了先前保存的用户名且未提供新密码时，一并清空遗留密码避免孤立凭据。
+        None
+    } else {
+        prev_proxy.password.clone()
+    };
+
+    let candidate = ProxyConfig {
+        mode: req.mode,
+        protocol: req.protocol,
+        host: req.host.trim().to_string(),
+        port: req.port,
+        username,
+        password,
+    };
+
+    if let Err(err) = candidate.validate() {
+        return Err(UiCommandError::from_ui_error(
+            err.to_ui_error(ErrorPlatform::Macos),
+        ));
+    }
+
+    let changed = prev_proxy != candidate;
+    next.proxy = candidate.clone();
+
+    app_prefs::save_to_path(prefs_path, &next).map_err(|e| {
+        UiCommandError::from_ui_error_with_message(
+            e.clone(),
+            ui_error::resolve_ui_error(
+                codes::VALIDATION_INVALID_CONFIG,
+                ErrorPlatform::Macos,
+                &[],
+                None,
+                Some(e),
+            ),
+        )
+    })?;
+    *state.prefs.lock().unwrap_or_else(|e| e.into_inner()) = next;
+
+    Ok((proxy_prefs_view_from_config(&candidate), candidate, changed))
+}
+
+/// IPC 命令：读取当前出站网络代理配置（脱敏视图，不返回明文密码）。
+#[tauri::command]
+pub fn get_proxy_prefs(state: State<'_, AppState>) -> ProxyPrefsView {
+    let prefs = sync_prefs_from_disk_if_proxy(&state);
+    proxy_prefs_view_from_config(&prefs.proxy)
+}
+
+/// IPC 命令：校验并保存出站网络代理配置，立即更新全局代理并在变更时触发信令重连及后台服务重载。
+#[tauri::command]
+pub async fn save_proxy_prefs(
+    req: SaveProxyPrefsRequest,
+    app: AppHandle,
+) -> Result<ProxyPrefsView, UiCommandError> {
+    app.state::<AppState>()
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
+    let app_bg = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app_bg.state::<AppState>();
+        let (view, active_cfg, changed) =
+            save_proxy_prefs_to_path(&st, req, &app_prefs::default_prefs_path())?;
+        proxy::set_global_proxy_config(active_cfg);
+        if changed {
+            if st.is_service_proxy() {
+                notify_background_services_reload_sync(&st, false);
+            } else {
+                let client = {
+                    let rt = st.server.lock().unwrap_or_else(|e| e.into_inner());
+                    rt.signal_client.as_ref().cloned()
+                };
+                if let Some(sig) = client {
+                    sig.trigger_reconnect("proxy_config_changed");
+                }
+            }
+        }
+        Ok(view)
+    })
+    .await
+    .map_err(|e| {
+        UiCommandError::from_ui_error(ui_error::resolve_ui_error(
+            codes::COMMON_UNKNOWN,
+            ErrorPlatform::Macos,
+            &[],
+            None,
+            Some(format!("保存网络代理设置任务异常：{e}")),
+        ))
+    })?
+}
+
+/// 发起 Wake-on-LAN 远程开机请求的纯状态执行实现（兼容独立模式与系统服务代理模式）。
+fn request_device_wol_inner(
+    state: &AppState,
+    target_device_id: &str,
+) -> Result<WolAckResult, UiCommandError> {
+    state
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
+    state
+        .require_authenticated()
+        .map_err(UiCommandError::from_auth_gate_error)?;
+
+    let norm_id = server_config::parse_device_id_input(target_device_id).ok_or_else(|| {
+        UiCommandError::from_validation_error("目标设备码格式无效，请输入 9 位数字设备码")
+    })?;
+
+    if state.is_service_proxy() {
+        match call_agent_ipc(
+            ServiceRequest::RequestWol {
+                target_device_id: norm_id,
+                timeout_ms: 8_000,
+            },
+            Duration::from_secs(10),
+        ) {
+            Ok(ServiceResponse::WolAck(ack)) => Ok(*ack),
+            Ok(ServiceResponse::WolError(ui_err)) => Err(UiCommandError::from_ui_error(*ui_err)),
+            Ok(ServiceResponse::Error { message }) => {
+                let ui_err = ui_error::classify_signal_error(&message, ErrorPlatform::Macos);
+                Err(UiCommandError::from_ui_error_with_message(message, ui_err))
+            }
+            Ok(other) => Err(UiCommandError::from_ui_error(ui_error::resolve_ui_error(
+                codes::COMMON_UNKNOWN,
+                ErrorPlatform::Macos,
+                &[],
+                None,
+                Some(format!("后台服务返回了意外的远程开机响应：{other:?}")),
+            ))),
+            Err(err) => {
+                let ui_err = ui_error::classify_signal_error(&err, ErrorPlatform::Macos);
+                Err(UiCommandError::from_ui_error_with_message(err, ui_err))
+            }
+        }
+    } else {
+        let client = {
+            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+            rt.signal_client.as_ref().cloned()
+        };
+        let Some(sig) = client else {
+            return Err(UiCommandError::from_ui_error(ui_error::resolve_ui_error(
+                codes::NETWORK_UNREACHABLE,
+                ErrorPlatform::Macos,
+                &[],
+                None,
+                Some("请先在「设置 → 网络」配置并连接服务器".to_string()),
+            )));
+        };
+        sig.request_wol(&norm_id, Duration::from_secs(8))
+            .map_err(UiCommandError::from_ui_error)
+    }
+}
+
+/// IPC 命令：向同账号离线设备发起 Wake-on-LAN 远程开机请求。
+#[tauri::command]
+pub async fn request_device_wol(
+    target_device_id: String,
+    app: AppHandle,
+) -> Result<WolAckResult, UiCommandError> {
+    let app_bg = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app_bg.state::<AppState>();
+        request_device_wol_inner(&st, &target_device_id)
+    })
+    .await
+    .map_err(|e| {
+        UiCommandError::from_ui_error(ui_error::resolve_ui_error(
+            codes::COMMON_UNKNOWN,
+            ErrorPlatform::Macos,
+            &[],
+            None,
+            Some(format!("发送远程开机请求任务异常：{e}")),
+        ))
+    })?
+}
+
 /// 判断当前是否仍有 S1 远控窗口或任一 W2/W3/W4 工具窗口打开。
 pub(crate) fn has_any_session_or_tool_window(app: &AppHandle) -> bool {
     app.get_webview_window("session").is_some()
@@ -8273,7 +8674,7 @@ pub fn set_session_peripherals(
         }
     }
 
-    Ok(next_prefs)
+    Ok(sanitize_app_prefs_for_ui(next_prefs))
 }
 
 /// IPC 命令：请求被控端刷新全部可用物理与虚拟显示器列表。
@@ -9244,6 +9645,7 @@ mod tests {
                 disabled: false,
                 online: true,
                 in_session: false,
+                wol_capable: false,
                 bound_at: None,
                 last_seen_at: None,
             },
@@ -9282,6 +9684,7 @@ mod tests {
                 disabled: false,
                 online: true,
                 in_session: false,
+                wol_capable: false,
                 bound_at: None,
                 last_seen_at: None,
             },
@@ -9333,6 +9736,7 @@ mod tests {
                 disabled: false,
                 online: true,
                 in_session: false,
+                wol_capable: false,
                 bound_at: None,
                 last_seen_at: None,
             },
@@ -9353,6 +9757,7 @@ mod tests {
                 disabled: false,
                 online: true,
                 in_session: false,
+                wol_capable: false,
                 bound_at: None,
                 last_seen_at: None,
             },
@@ -9454,6 +9859,7 @@ mod tests {
             online,
             in_session: false,
             is_local,
+            wol_capable: false,
             bound_at: None,
             last_seen_at: None,
         };
@@ -9787,16 +10193,19 @@ mod tests {
             GeneralPrefsPatch {
                 close_to_tray: Some(false),
                 file_transfer_dir: Some(format!("{}/", custom_dir.display())),
+                allow_wol: Some(true),
             },
             &prefs_path,
         )
         .expect("saving writable custom dir should succeed");
         assert!(!saved.close_to_tray);
+        assert!(saved.allow_wol);
         assert!(!saved.file_transfer_dir_is_default);
         assert_eq!(saved.file_transfer_dir, custom_dir.to_string_lossy());
         let on_disk = app_prefs::load_from_path(&prefs_path);
         assert_eq!(on_disk.resolved_file_transfer_dir(), custom_dir);
         assert!(!on_disk.close_to_tray);
+        assert!(on_disk.allow_wol);
 
         // 2) Missing custom directory is rejected without modifying prefs.json or state.prefs.
         let err_missing = save_general_prefs_to_path(
@@ -9804,6 +10213,7 @@ mod tests {
             GeneralPrefsPatch {
                 close_to_tray: Some(true),
                 file_transfer_dir: Some(missing_dir.to_string_lossy().into_owned()),
+                allow_wol: Some(false),
             },
             &prefs_path,
         )
@@ -9817,6 +10227,7 @@ mod tests {
             custom_dir
         );
         assert!(!app_prefs::load_from_path(&prefs_path).close_to_tray);
+        assert!(app_prefs::load_from_path(&prefs_path).allow_wol);
 
         // 3) Regular file path is rejected without modifying prefs.json.
         let err_file = save_general_prefs_to_path(
@@ -9824,6 +10235,7 @@ mod tests {
             GeneralPrefsPatch {
                 close_to_tray: None,
                 file_transfer_dir: Some(regular_file.to_string_lossy().into_owned()),
+                allow_wol: None,
             },
             &prefs_path,
         )
@@ -9837,17 +10249,20 @@ mod tests {
             custom_dir
         );
 
-        // 4) Empty string resets back to default directory.
+        // 4) Empty string resets back to default directory and allow_wol can be toggled off.
         let reset = save_general_prefs_to_path(
             &state,
             GeneralPrefsPatch {
                 close_to_tray: None,
                 file_transfer_dir: Some(String::new()),
+                allow_wol: Some(false),
             },
             &prefs_path,
         )
         .expect("resetting file_transfer_dir to default should succeed");
         assert!(reset.file_transfer_dir_is_default);
+        assert!(!reset.allow_wol);
+        assert!(!app_prefs::load_from_path(&prefs_path).allow_wol);
         assert_eq!(
             reset.file_transfer_dir,
             app_prefs::default_file_transfer_dir().to_string_lossy()
@@ -10420,5 +10835,170 @@ mod tests {
 
         let file_generic = UiCommandError::from_file_tool_error_with_policy("磁盘空间不足", true);
         assert_eq!(file_generic.ui_error.code, codes::TOOL_FILE_TRANSFER_FAILED);
+    }
+
+    #[test]
+    fn proxy_prefs_roundtrip_validation_and_password_redaction() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-proxy-prefs-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let prefs_path = base.join("prefs.json");
+        let state = AppState::new_for_test();
+
+        let secret_pw = "SuperSecretProxyPass!987";
+        let req_manual = SaveProxyPrefsRequest {
+            mode: ProxyMode::Manual,
+            protocol: Some(ProxyProtocol::Socks5),
+            host: "  proxy.corp.local  ".to_string(),
+            port: 1080,
+            username: Some("alice".to_string()),
+            password: Some(secret_pw.to_string()),
+            clear_password: false,
+        };
+        let dbg_req = format!("{req_manual:?}");
+        assert!(
+            !dbg_req.contains(secret_pw) && dbg_req.contains("<redacted>"),
+            "SaveProxyPrefsRequest Debug must redact password: {dbg_req}"
+        );
+
+        let (view, cfg, changed) =
+            save_proxy_prefs_to_path(&state, req_manual, &prefs_path).expect("save manual proxy");
+        assert!(changed);
+        assert_eq!(view.mode, ProxyMode::Manual);
+        assert_eq!(view.protocol, Some(ProxyProtocol::Socks5));
+        assert_eq!(view.host, "proxy.corp.local");
+        assert_eq!(view.port, 1080);
+        assert_eq!(view.username.as_deref(), Some("alice"));
+        assert!(view.has_password);
+        assert_eq!(cfg.password.as_deref(), Some(secret_pw));
+
+        // 响应序列化与 sanitize_app_prefs_for_ui 绝不泄露密码明文。
+        let view_json = serde_json::to_string(&view).expect("serialize ProxyPrefsView");
+        assert!(!view_json.contains(secret_pw));
+        assert!(view_json.contains("\"hasPassword\":true"));
+
+        let sanitized_prefs = sanitize_app_prefs_for_ui(state.prefs.lock().unwrap().clone());
+        assert_eq!(sanitized_prefs.proxy.password, None);
+        let prefs_json = serde_json::to_string(&sanitized_prefs).expect("serialize sanitized");
+        assert!(!prefs_json.contains(secret_pw));
+
+        // 再次保存端口变更且密码留空时，应保留已保存密码。
+        let (view2, cfg2, changed2) = save_proxy_prefs_to_path(
+            &state,
+            SaveProxyPrefsRequest {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Socks5),
+                host: "proxy.corp.local".to_string(),
+                port: 1081,
+                username: Some("alice".to_string()),
+                password: None,
+                clear_password: false,
+            },
+            &prefs_path,
+        )
+        .expect("update port preserving password");
+        assert!(changed2);
+        assert!(view2.has_password);
+        assert_eq!(cfg2.password.as_deref(), Some(secret_pw));
+
+        // 显式 clear_password 清空密码。
+        let (view3, cfg3, changed3) = save_proxy_prefs_to_path(
+            &state,
+            SaveProxyPrefsRequest {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Http),
+                host: "proxy.corp.local".to_string(),
+                port: 8080,
+                username: Some("alice".to_string()),
+                password: None,
+                clear_password: true,
+            },
+            &prefs_path,
+        )
+        .expect("clear proxy password");
+        assert!(changed3);
+        assert!(!view3.has_password);
+        assert_eq!(cfg3.password, None);
+
+        // 非法配置（端口 0）必须被拒绝且不破坏已有持久化配置。
+        let err = save_proxy_prefs_to_path(
+            &state,
+            SaveProxyPrefsRequest {
+                mode: ProxyMode::Manual,
+                protocol: Some(ProxyProtocol::Http),
+                host: "proxy.corp.local".to_string(),
+                port: 0,
+                username: None,
+                password: Some("ShouldNotLeakInError!".to_string()),
+                clear_password: false,
+            },
+            &prefs_path,
+        )
+        .unwrap_err();
+        assert_eq!(err.ui_error.code, codes::PROXY_CONFIG_CONFLICT);
+        assert!(!err.message.contains("ShouldNotLeakInError!"));
+        assert_eq!(app_prefs::load_from_path(&prefs_path).proxy.port, 8080);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn wol_entry_mapping_and_request_device_wol_validation() {
+        // 1) REST /api/v1/me/devices 返回 wol_capable=true 时，即使信令快照缓存为空也必须透传 wolCapable=true。
+        let rest_offline: MyDeviceInfo = serde_json::from_str(
+            r#"{
+                "device_id": "604928235",
+                "formatted_id": "604 928 235",
+                "hostname": "studio-mac",
+                "os": "macos",
+                "app_version": "0.1.12",
+                "arch": "arm64",
+                "alias": "工作室 Mac",
+                "allow_remote_assist": false,
+                "allow_remote_control": true,
+                "disabled": false,
+                "online": false,
+                "in_session": false,
+                "wol_capable": true
+            }"#,
+        )
+        .expect("deserialize REST MyDeviceInfo with wol_capable=true");
+        assert!(rest_offline.wol_capable);
+
+        let empty_signal_cache: HashMap<String, bool> = HashMap::new();
+        assert!(
+            resolve_device_wol_capable(&rest_offline, false, &empty_signal_cache, false),
+            "无信令缓存时必须回退 REST wol_capable=true"
+        );
+        let entry_from_rest = map_my_device_entry(rest_offline.clone(), Some("111222333"));
+        assert!(entry_from_rest.wol_capable);
+        let json = serde_json::to_value(&entry_from_rest).expect("serialize MyDeviceEntry");
+        assert_eq!(json["wolCapable"], serde_json::Value::Bool(true));
+
+        // 2) 信令实时缓存更新（例如目标关闭 WoL）优先覆盖旧 REST 值。
+        let mut live_signal_cache: HashMap<String, bool> = HashMap::new();
+        live_signal_cache.insert("604928235".to_string(), false);
+        assert!(
+            !resolve_device_wol_capable(&rest_offline, false, &live_signal_cache, false),
+            "信令实时快照应优先覆盖 REST 旧值"
+        );
+
+        // 3) 未登录态调用 request_device_wol_inner 应返回结构化认证门禁错误。
+        let state = AppState::new_for_test();
+        let err_unauth = request_device_wol_inner(&state, "604928235").unwrap_err();
+        assert!(
+            matches!(
+                err_unauth.ui_error.code.as_str(),
+                codes::AUTH_UNAUTHORIZED | codes::VALIDATION_INVALID_CONFIG
+            ),
+            "unexpected code: {}",
+            err_unauth.ui_error.code
+        );
     }
 }

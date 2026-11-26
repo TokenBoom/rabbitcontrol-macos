@@ -208,6 +208,15 @@ fn sync_proxy_state_and_emit(
             let _ = app.emit("device://status-changed", &dev_ev);
         }
     }
+
+    if let Ok(ServiceResponse::DeviceWolEvents { events }) = commands::call_agent_ipc(
+        ServiceRequest::DrainDeviceWolEvents,
+        Duration::from_millis(350),
+    ) {
+        for wol_ev in events {
+            let _ = app.emit("device://wol-changed", &wol_ev);
+        }
+    }
 }
 
 /// 查询当前进程已注册平台是否具备 AV1 硬件解码能力（M3/M4 为 `true`，M1/M2 为 `false`）。
@@ -874,6 +883,19 @@ fn start_background_poller(app: AppHandle) {
                         let _ = app.emit("device://status-changed", &dev_ev);
                     }
 
+                    while let Some(wol_ev) = client.try_recv_device_wol_status() {
+                        let is_current = {
+                            let rt = st.server.lock().unwrap_or_else(|e| e.into_inner());
+                            rt.signal_client
+                                .as_ref()
+                                .is_some_and(|cur| Arc::ptr_eq(cur, &client))
+                        };
+                        if !is_current {
+                            break;
+                        }
+                        let _ = app.emit("device://wol-changed", &wol_ev);
+                    }
+
                     while let Some(raw_reason) = client.try_recv_kicked_reason() {
                         let Some(zh_reason) =
                             rc_ui::signal_client::classify_auth_revocation_kick(&raw_reason)
@@ -1533,6 +1555,9 @@ fn main() {
             commands::set_session_mtls_mode,
             commands::get_upnp_status,
             commands::save_upnp_enabled,
+            commands::get_proxy_prefs,
+            commands::save_proxy_prefs,
+            commands::request_device_wol,
             commands::trigger_reconnect_now,
             commands::session_command,
             commands::session_snapshot,

@@ -522,6 +522,69 @@ pub fn parse_single_sha256_sidecar(text: &str) -> Option<String> {
     None
 }
 
+/// 将字符串安全转义为 curl `--config` 双引号值（转义 `\` 与 `"`，并剔除控制字符防注入）。
+fn escape_curl_config_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control() || ch == '\0' {
+            continue;
+        }
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 将字符串中可能意外回显的代理密码替换为 `"<redacted>"`，防止凭据进入日志或前端提示。
+fn redact_proxy_secret(text: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(s) if !s.is_empty() => text.replace(s, "<redacted>"),
+        _ => text.to_string(),
+    }
+}
+
+/// 构造经 `stdin`（`--config -`）传给 `/usr/bin/curl` 的代理配置指令，确保凭据绝不出现在进程命令行或日志中。
+///
+/// - 有生效代理时输出 `proxy = "..."`（SOCKS5 使用 `socks5h://` 保持远端 DNS 解析）及可选 `proxy-user = "..."`；
+/// - 若代理用户名包含冒号 `:`（与 curl `proxy-user` 分隔符冲突），fail-closed 返回错误且绝不回显凭据；
+/// - 无代理或命中 Bypass 时输出 `noproxy = "*"`，避免 curl 意外继承宿主终端残留的环境变量代理。
+pub fn build_curl_proxy_config(
+    proxy: Option<&rc_client_core::proxy::ResolvedProxy>,
+) -> Result<String, String> {
+    let Some(p) = proxy else {
+        return Ok("noproxy = \"*\"\n".to_string());
+    };
+    let scheme = match p.protocol {
+        rc_client_core::proxy::ProxyProtocol::Socks5 => "socks5h",
+        rc_client_core::proxy::ProxyProtocol::Http => "http",
+    };
+    let authority = if p.host.contains(':') && !p.host.starts_with('[') {
+        format!("[{}]:{}", p.host, p.port)
+    } else {
+        format!("{}:{}", p.host, p.port)
+    };
+    let proxy_url = format!("{scheme}://{authority}");
+    let mut cfg = format!("proxy = \"{}\"\n", escape_curl_config_value(&proxy_url));
+    if p.username.is_some() || p.password.is_some() {
+        let user = p.username.as_deref().unwrap_or("");
+        if user.contains(':') {
+            return Err(
+                "更新器暂不支持包含冒号 ':' 的代理用户名，请修改代理凭据后重试".to_string(),
+            );
+        }
+        let pass = p.password.as_deref().unwrap_or("");
+        let cred = format!("{user}:{pass}");
+        cfg.push_str(&format!(
+            "proxy-user = \"{}\"\n",
+            escape_curl_config_value(&cred)
+        ));
+    }
+    Ok(cfg)
+}
+
 /// 通过 `/usr/bin/curl` 流式限额拉取受限体积的 HTTPS 文本响应（禁用 `.curlrc` 与 glob 展开，超出 `max_bytes` 立即终止防 OOM）。
 fn curl_get_text(
     url: &str,
@@ -530,9 +593,15 @@ fn curl_get_text(
     max_bytes: usize,
 ) -> Result<String, String> {
     validate_update_https_url(url)?;
+    let resolved_proxy = crate::updater::resolve_updater_proxy(url)
+        .map_err(|e| format!("更新请求代理配置无效: {e}"))?;
+    let curl_proxy_cfg = build_curl_proxy_config(resolved_proxy.as_ref())?;
+
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
         "-q",
+        "--config",
+        "-",
         "--globoff",
         "--proto",
         "=https",
@@ -559,13 +628,21 @@ fn curl_get_text(
     }
     cmd.arg("--")
         .arg(url)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("调用 curl 请求更新信息失败: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(curl_proxy_cfg.as_bytes()) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("向 curl 写入代理配置失败: {e}"));
+        }
+    }
 
     let mut stdout_buf = Vec::new();
     let mut exceeded = false;
@@ -599,11 +676,14 @@ fn curl_get_text(
         return Err("更新元数据响应体积超限".to_string());
     }
     if !status.success() {
-        let stderr = stderr_buf.trim();
-        return Err(if stderr.is_empty() {
+        let stderr_redacted = redact_proxy_secret(
+            stderr_buf.trim(),
+            resolved_proxy.as_ref().and_then(|p| p.password.as_deref()),
+        );
+        return Err(if stderr_redacted.is_empty() {
             format!("请求更新服务器失败（退出码 {:?}）", status.code())
         } else {
-            format!("请求更新服务器失败: {stderr}")
+            format!("请求更新服务器失败: {stderr_redacted}")
         });
     }
     String::from_utf8(stdout_buf).map_err(|e| format!("更新元数据不是合法 UTF-8: {e}"))
@@ -762,9 +842,15 @@ pub fn download_update_package(
     }
     let _hdr_guard = CleanupFile(header_path.clone());
 
+    let resolved_proxy = crate::updater::resolve_updater_proxy(url)
+        .map_err(|e| format!("更新下载代理配置无效: {e}"))?;
+    let curl_proxy_cfg = build_curl_proxy_config(resolved_proxy.as_ref())?;
+
     let mut child = Command::new("/usr/bin/curl")
         .args([
             "-q",
+            "--config",
+            "-",
             "--globoff",
             "--proto",
             "=https",
@@ -792,11 +878,20 @@ pub fn download_update_package(
         .arg(dest_path)
         .arg("--")
         .arg(url)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("启动 curl 下载更新包失败: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(curl_proxy_cfg.as_bytes()) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(dest_path);
+            return Err(format!("向 curl 写入下载代理配置失败: {e}"));
+        }
+    }
 
     let mut total_bytes = 0u64;
     let mut last_reported = 0u64;
@@ -837,7 +932,10 @@ pub fn download_update_package(
                         let _ = stderr.take(16 * 1024).read_to_string(&mut err_buf);
                     }
                     let _ = fs::remove_file(dest_path);
-                    let detail = err_buf.trim();
+                    let detail = redact_proxy_secret(
+                        err_buf.trim(),
+                        resolved_proxy.as_ref().and_then(|p| p.password.as_deref()),
+                    );
                     return Err(if detail.is_empty() {
                         format!("下载更新包失败（退出码 {:?}）", status.code())
                     } else {
@@ -1686,5 +1784,49 @@ mod tests {
         assert!(verify_regular_file_sha256(&link, &good_sha, MAX_UPDATE_PACKAGE_BYTES).is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_curl_proxy_config_formats_noproxy_socks5h_http_and_escapes_credentials() {
+        use rc_client_core::proxy::{ProxyProtocol, ResolvedProxy};
+
+        assert_eq!(build_curl_proxy_config(None).unwrap(), "noproxy = \"*\"\n");
+
+        let socks = ResolvedProxy {
+            protocol: ProxyProtocol::Socks5,
+            host: "proxy.corp.local".to_string(),
+            port: 1080,
+            username: Some("alice".to_string()),
+            password: Some("p\"a\\ss".to_string()),
+        };
+        let cfg = build_curl_proxy_config(Some(&socks)).unwrap();
+        assert_eq!(
+            cfg,
+            "proxy = \"socks5h://proxy.corp.local:1080\"\nproxy-user = \"alice:p\\\"a\\\\ss\"\n"
+        );
+
+        let ipv6_http = ResolvedProxy {
+            protocol: ProxyProtocol::Http,
+            host: "::1".to_string(),
+            port: 8080,
+            username: None,
+            password: None,
+        };
+        assert_eq!(
+            build_curl_proxy_config(Some(&ipv6_http)).unwrap(),
+            "proxy = \"http://[::1]:8080\"\n"
+        );
+
+        // SOCKS5 用户名含冒号与 curl proxy-user 分隔符冲突时必须 fail-closed 且不泄露密码。
+        let colon_user = ResolvedProxy {
+            protocol: ProxyProtocol::Socks5,
+            host: "proxy.corp.local".to_string(),
+            port: 1080,
+            username: Some("corp:alice".to_string()),
+            password: Some("TopSecret999".to_string()),
+        };
+        let err = build_curl_proxy_config(Some(&colon_user)).unwrap_err();
+        assert!(!err.contains("TopSecret999"));
+        assert!(!err.contains("corp:alice"));
     }
 }

@@ -15,10 +15,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rc_ui::app_prefs;
 use rc_ui::auth_client::{AuthClientError, AuthMaintainerHandle, AuthSessionManager};
 use rc_ui::cert_manager::CertManager;
 use rc_ui::config_paths;
 use rc_ui::metal_attach;
+use rc_ui::proxy;
 use rc_ui::server_config;
 use rc_ui::service_ipc::{
     current_exe_sha256, read_or_create_ipc_secret, IpcClient, IpcServer, ServiceRequest,
@@ -180,9 +182,14 @@ impl DaemonRuntime {
 }
 
 fn main() {
+    rc_platform_macos::register_all();
+
     if !ensure_boot_state_and_should_run() {
         return;
     }
+
+    let initial_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+    proxy::set_global_proxy_config(initial_prefs.proxy);
 
     let binary_sha256 = current_exe_sha256();
     let secret_path = config_paths::ipc_secret_path();
@@ -233,12 +240,19 @@ fn main() {
                 binary_sha256: binary_sha_ipc.clone(),
             },
             ServiceRequest::RefreshAuthAndCerts => {
+                let latest_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+                proxy::set_global_proxy_config(latest_prefs.proxy);
                 let _sync = rt_ipc
                     .auth_sync_lock
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let _ = rt_ipc.reload_auth_from_disk(true);
                 rt_ipc.restart_maintainer();
+                ServiceResponse::Ok
+            }
+            ServiceRequest::ReloadPrefs => {
+                let latest_prefs = app_prefs::load_from_path(&app_prefs::default_prefs_path());
+                proxy::set_global_proxy_config(latest_prefs.proxy);
                 ServiceResponse::Ok
             }
             ServiceRequest::EnsureAccessToken { failed_token } => {
