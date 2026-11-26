@@ -456,16 +456,20 @@ struct DecodeBenchOut {
 
 fn decoder_max_resolution_for(codec: Codec) -> Resolution {
     match codec {
-        Codec::Hevc => Resolution::new(8192, 4320),
-        _ => Resolution::new(4096, 4096),
+        Codec::Hevc | Codec::Av1 => Resolution::new(8192, 4320),
+        Codec::H264 => Resolution::new(4096, 4096),
     }
 }
 
 fn bench_decode_vt(codec: Codec, frames: &[EncodedFrame]) -> Result<DecodeBenchOut, String> {
+    let bitstream_format = match codec {
+        Codec::H264 | Codec::Hevc => rc_encode::BitstreamFormat::AnnexB,
+        Codec::Av1 => rc_encode::BitstreamFormat::Obu,
+    };
     let mut dec = VtDecoder::new(VtDecoderConfig {
         codec,
+        bitstream_format,
         max_resolution: decoder_max_resolution_for(codec),
-        ..VtDecoderConfig::default()
     })
     .map_err(|e| format!("VtDecoder::new 失败: {e}"))?;
 

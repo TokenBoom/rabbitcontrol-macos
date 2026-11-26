@@ -17,9 +17,11 @@ use rc_client_core::platform::{
     PlatformDisplayMode, PreallocatedRenderSurface,
 };
 use rc_decode::Decoder;
-use rc_encode::Encoder;
+use rc_encode::{BitstreamFormat, Codec, Encoder};
 use rc_input::InputInjector;
-use rc_pipeline::{PipelineConfig, PlatformMediaProvider};
+use rc_pipeline::{
+    ChromaSubsampling, CodecCapability, LatencyTier, PipelineConfig, PlatformMediaProvider,
+};
 use rc_render::Renderer;
 use rc_types::{Resolution, Result};
 
@@ -70,8 +72,16 @@ impl PlatformMediaProvider for MacosMediaProvider {
     fn create_encoder(&self, cfg: &PipelineConfig) -> Result<(Box<dyn Encoder>, &'static str)> {
         #[cfg(target_os = "macos")]
         {
-            let enc = rc_encode_vt::VtEncoder::new(rc_pipeline::default_encoder_config(cfg))?;
-            Ok((Box::new(enc), "videotoolbox"))
+            match cfg.codec {
+                Codec::H264 | Codec::Hevc => {
+                    let enc =
+                        rc_encode_vt::VtEncoder::new(rc_pipeline::default_encoder_config(cfg))?;
+                    Ok((Box::new(enc), "videotoolbox"))
+                }
+                Codec::Av1 => Err(rc_types::Error::InvalidConfig(
+                    "macOS VideoToolbox 不支持 AV1 硬件编码（仅支持 H.264 与 HEVC/H.265）".into(),
+                )),
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -85,13 +95,25 @@ impl PlatformMediaProvider for MacosMediaProvider {
     fn create_decoder(&self, cfg: &PipelineConfig) -> Result<(Box<dyn Decoder>, &'static str)> {
         #[cfg(target_os = "macos")]
         {
+            let (bitstream_format, min_max_res) = match cfg.codec {
+                Codec::H264 => (BitstreamFormat::AnnexB, Resolution::new(4096, 4096)),
+                Codec::Hevc => (BitstreamFormat::AnnexB, Resolution::new(5120, 4096)),
+                Codec::Av1 => {
+                    if !rc_decode_vt::supports_hardware_av1_decode() {
+                        return Err(rc_types::Error::Decoder(
+                            "macOS VideoToolbox 当前设备不支持 AV1 硬件解码".into(),
+                        ));
+                    }
+                    (BitstreamFormat::Obu, Resolution::new(5120, 4096))
+                }
+            };
             let dec = rc_decode_vt::new_decoder(rc_decode_vt::VtDecoderConfig {
                 codec: cfg.codec,
+                bitstream_format,
                 max_resolution: Resolution::new(
-                    cfg.resolution.width.max(4096),
-                    cfg.resolution.height.max(4096),
+                    cfg.resolution.width.max(min_max_res.width),
+                    cfg.resolution.height.max(min_max_res.height),
                 ),
-                ..rc_decode_vt::VtDecoderConfig::default()
             })?;
             Ok((Box::new(dec), "videotoolbox"))
         }
@@ -106,6 +128,83 @@ impl PlatformMediaProvider for MacosMediaProvider {
 
     fn supports_hevc(&self) -> bool {
         cfg!(target_os = "macos")
+    }
+
+    fn encode_capabilities(&self) -> Vec<CodecCapability> {
+        #[cfg(target_os = "macos")]
+        {
+            // Apple VideoToolbox 仅支持 HEVC 与 H.264 硬件编码，绝不虚报 AV1 硬编。
+            vec![
+                CodecCapability {
+                    codec: Codec::Hevc,
+                    hardware: true,
+                    max_width: 5120,
+                    max_height: 2880,
+                    max_pixel_rate: 600_000_000,
+                    screen_content_tools: false,
+                    chroma: ChromaSubsampling::Yuv420,
+                    latency_tier: LatencyTier::UltraLow,
+                },
+                CodecCapability {
+                    codec: Codec::H264,
+                    hardware: true,
+                    max_width: 4096,
+                    max_height: 2304,
+                    max_pixel_rate: 280_000_000,
+                    screen_content_tools: false,
+                    chroma: ChromaSubsampling::Yuv420,
+                    latency_tier: LatencyTier::UltraLow,
+                },
+            ]
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+
+    fn decode_capabilities(&self) -> Vec<CodecCapability> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut caps = Vec::with_capacity(3);
+            if rc_decode_vt::supports_hardware_av1_decode() {
+                caps.push(CodecCapability {
+                    codec: Codec::Av1,
+                    hardware: true,
+                    max_width: 5120,
+                    max_height: 2880,
+                    max_pixel_rate: 500_000_000,
+                    screen_content_tools: true,
+                    chroma: ChromaSubsampling::Yuv420,
+                    latency_tier: LatencyTier::Low,
+                });
+            }
+            caps.push(CodecCapability {
+                codec: Codec::Hevc,
+                hardware: true,
+                max_width: 5120,
+                max_height: 2880,
+                max_pixel_rate: 600_000_000,
+                screen_content_tools: false,
+                chroma: ChromaSubsampling::Yuv420,
+                latency_tier: LatencyTier::UltraLow,
+            });
+            caps.push(CodecCapability {
+                codec: Codec::H264,
+                hardware: true,
+                max_width: 4096,
+                max_height: 2304,
+                max_pixel_rate: 280_000_000,
+                screen_content_tools: false,
+                chroma: ChromaSubsampling::Yuv420,
+                latency_tier: LatencyTier::UltraLow,
+            });
+            caps
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
     }
 
     fn create_renderer(&self, cfg: &PipelineConfig) -> Result<(Box<dyn Renderer>, &'static str)> {
@@ -463,4 +562,119 @@ pub fn register_all() {
     let _ = rc_audio_macos::register();
     let _ = rc_clipboard_macos::register();
     let _ = rc_client_core::platform::register_platform_hooks(Arc::new(MacosClientPlatformHooks));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asymmetric_capabilities_match_platform_hardware_support() {
+        let provider = MacosMediaProvider;
+        let enc_caps = provider.encode_capabilities();
+        let dec_caps = provider.decode_capabilities();
+
+        // 任何平台均绝不虚报 AV1 硬件编码能力。
+        assert!(
+            !enc_caps.iter().any(|c| c.codec == Codec::Av1),
+            "macOS encode_capabilities 不得包含 AV1，实际 {enc_caps:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let enc_hevc = enc_caps
+                .iter()
+                .find(|c| c.codec == Codec::Hevc)
+                .expect("macOS 编码能力必须包含 HEVC");
+            assert!(enc_hevc.hardware);
+            assert_eq!(enc_hevc.max_pixel_rate, 600_000_000);
+            assert_eq!(enc_hevc.max_width, 5120);
+            assert_eq!(enc_hevc.max_height, 2880);
+
+            let enc_h264 = enc_caps
+                .iter()
+                .find(|c| c.codec == Codec::H264)
+                .expect("macOS 编码能力必须包含 H.264");
+            assert!(enc_h264.hardware);
+            assert_eq!(enc_h264.max_pixel_rate, 280_000_000);
+
+            assert!(
+                dec_caps
+                    .iter()
+                    .any(|c| c.codec == Codec::Hevc && c.hardware),
+                "macOS 解码能力必须包含 HEVC 硬解"
+            );
+            assert!(
+                dec_caps
+                    .iter()
+                    .any(|c| c.codec == Codec::H264 && c.hardware),
+                "macOS 解码能力必须包含 H.264 硬解"
+            );
+
+            let hw_av1 = rc_decode_vt::supports_hardware_av1_decode();
+            let dec_av1 = dec_caps.iter().find(|c| c.codec == Codec::Av1);
+            if hw_av1 {
+                let cap = dec_av1.expect("本机支持 AV1 硬解时 decode_capabilities 必须上报 AV1");
+                assert!(cap.hardware);
+                assert!(cap.screen_content_tools);
+                assert_eq!(cap.max_pixel_rate, 500_000_000);
+            } else {
+                assert!(
+                    dec_av1.is_none(),
+                    "本机不支持 AV1 硬解（如 M1/M2）时不得虚报 AV1 解码能力"
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(enc_caps.is_empty());
+            assert!(dec_caps.is_empty());
+        }
+    }
+
+    #[test]
+    fn encoder_rejects_av1_and_decoder_follows_hardware_av1_probe() {
+        let provider = MacosMediaProvider;
+
+        let enc_av1 = provider.create_encoder(&PipelineConfig {
+            codec: Codec::Av1,
+            ..PipelineConfig::default()
+        });
+        assert!(
+            matches!(enc_av1, Err(rc_types::Error::InvalidConfig(_))),
+            "create_encoder(Av1) 必须明确返回 InvalidConfig 错误"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let h264_dec = provider.create_decoder(&PipelineConfig {
+                codec: Codec::H264,
+                ..PipelineConfig::default()
+            });
+            assert!(h264_dec.is_ok());
+
+            let hevc_dec = provider.create_decoder(&PipelineConfig {
+                codec: Codec::Hevc,
+                ..PipelineConfig::default()
+            });
+            assert!(hevc_dec.is_ok());
+
+            let av1_dec = provider.create_decoder(&PipelineConfig {
+                codec: Codec::Av1,
+                ..PipelineConfig::default()
+            });
+            if rc_decode_vt::supports_hardware_av1_decode() {
+                assert!(
+                    matches!(av1_dec, Ok((_, "videotoolbox"))),
+                    "支持 AV1 硬解的设备应成功创建 VideoToolbox AV1 解码器"
+                );
+            } else {
+                assert!(
+                    matches!(av1_dec, Err(rc_types::Error::Decoder(_))),
+                    "不支持 AV1 硬解的设备应返回 Error::Decoder 供上游熔断降级"
+                );
+            }
+        }
+    }
 }

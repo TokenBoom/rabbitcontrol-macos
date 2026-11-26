@@ -8696,6 +8696,15 @@ mod tests {
                 codec: rc_ui::display_ctrl::StreamCodec::H264
             }
         );
+
+        let j: SessionCommandArg =
+            serde_json::from_str(r#"{"type":"set_codec","codec":"av1"}"#).unwrap();
+        assert_eq!(
+            j.0,
+            SessionCommand::SetCodec {
+                codec: rc_ui::display_ctrl::StreamCodec::Av1
+            }
+        );
     }
 
     #[test]

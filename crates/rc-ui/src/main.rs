@@ -210,6 +210,38 @@ fn sync_proxy_state_and_emit(
     }
 }
 
+/// 查询当前进程已注册平台是否具备 AV1 硬件解码能力（M3/M4 为 `true`，M1/M2 为 `false`）。
+fn local_client_supports_hardware_av1_decode() -> bool {
+    rc_pipeline::platform_decode_capabilities()
+        .iter()
+        .any(|c| c.codec == rc_encode::Codec::Av1 && c.hardware)
+}
+
+/// 将 `SessionUpdate` 序列化为发往前端 `"session://update"` 的 JSON 载荷。
+///
+/// 对 `SessionUpdate::DisplayConfig` 在上游未显式携带 `client_supports_av1` 时注入本机硬件 AV1
+/// 解码能力（不覆盖上游未来新增的同名字段），确保 M1/M2 与 M3/M4 严格按本机硬解能力 fail-closed 门控 AV1 菜单项。
+fn serialize_session_update_for_ui(
+    upd: &SessionUpdate,
+    client_supports_av1: bool,
+) -> Option<serde_json::Value> {
+    let mut val = serde_json::to_value(upd).ok()?;
+    if matches!(upd, SessionUpdate::DisplayConfig { .. }) {
+        inject_client_supports_av1_if_missing(&mut val, client_supports_av1);
+    }
+    Some(val)
+}
+
+fn inject_client_supports_av1_if_missing(val: &mut serde_json::Value, client_supports_av1: bool) {
+    if let Some(data) = val
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        data.entry("client_supports_av1".to_string())
+            .or_insert(serde_json::Value::Bool(client_supports_av1));
+    }
+}
+
 /// 启动后台状态轮询线程：
 /// 1) 排空 `SessionHandle` 更新队列 → 缓存快照（M8）→ emit `"session://update"`，
 ///    并协调主线程上的 `CAMetalLayer` 挂载 / 摘除；
@@ -598,8 +630,15 @@ fn start_background_poller(app: AppHandle) {
                         emit_active_state,
                     );
                     if should_emit {
+                        let client_supports_av1 = local_client_supports_hardware_av1_decode();
                         for upd in updates {
-                            let _ = app.emit("session://update", &upd);
+                            if let Some(payload) =
+                                serialize_session_update_for_ui(&upd, client_supports_av1)
+                            {
+                                let _ = app.emit("session://update", &payload);
+                            } else {
+                                let _ = app.emit("session://update", &upd);
+                            }
                         }
                         for ev in file_events {
                             let _ = app.emit("file://event", &ev);
@@ -1098,6 +1137,9 @@ fn main() {
     {
         return;
     }
+
+    // 平台提供者注册完成后非阻塞预热本机硬件编解码能力缓存（绝不阻塞启动或首帧建连热路径）。
+    let _ = rc_client_core::codec_selector::trigger_default_hardware_caps_probe();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1623,4 +1665,52 @@ fn main() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_session_update_injects_client_supports_av1_on_display_config_without_overwriting()
+    {
+        let upd = SessionUpdate::DisplayConfig {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            native_width: 1920,
+            native_height: 1080,
+            max_fps: 120,
+            presets: Vec::new(),
+            codec: Some("hevc".to_string()),
+            supported_codecs: vec!["av1".to_string(), "hevc".to_string(), "h264".to_string()],
+            client_supports_hevc: true,
+            advisory: rc_ui::display_ctrl::HighRefreshAdvisory::default(),
+        };
+
+        let val_false = serialize_session_update_for_ui(&upd, false).expect("应成功序列化");
+        assert_eq!(val_false["kind"], "display_config");
+        assert_eq!(val_false["data"]["codec"], "hevc");
+        assert_eq!(val_false["data"]["client_supports_hevc"], true);
+        assert_eq!(val_false["data"]["client_supports_av1"], false);
+
+        let val_true = serialize_session_update_for_ui(&upd, true).expect("应成功序列化");
+        assert_eq!(val_true["data"]["client_supports_av1"], true);
+
+        // 若上游未来已显式提供 `client_supports_av1`，不得覆盖原值。
+        let mut upstream = serde_json::json!({
+            "kind": "display_config",
+            "data": {
+                "codec": "hevc",
+                "client_supports_av1": false
+            }
+        });
+        inject_client_supports_av1_if_missing(&mut upstream, true);
+        assert_eq!(upstream["data"]["client_supports_av1"], false);
+
+        // 非 DisplayConfig 更新不注入该字段。
+        let media = SessionUpdate::MediaState { paused: true };
+        let media_val = serialize_session_update_for_ui(&media, true).expect("应成功序列化");
+        assert!(media_val["data"].get("client_supports_av1").is_none());
+    }
 }

@@ -695,11 +695,12 @@ impl CompressionSession {
         // SAFETY: 出参 session_out 合法；encoder_spec 指向栈上存活的
         // CFDictionary（Create 同步读取）；其余可空参数传 null = 系统默认；
         // refcon 指向 shared 的稳定堆分配。
-        let is_hevc = params.codec == rc_encode::Codec::Hevc;
-        let codec_type = if is_hevc {
-            K_CM_VIDEO_CODEC_TYPE_HEVC
-        } else {
-            K_CM_VIDEO_CODEC_TYPE_H264
+        let (is_hevc, codec_type) = match params.codec {
+            rc_encode::Codec::Hevc => (true, K_CM_VIDEO_CODEC_TYPE_HEVC),
+            rc_encode::Codec::H264 => (false, K_CM_VIDEO_CODEC_TYPE_H264),
+            rc_encode::Codec::Av1 => {
+                return Err("VideoToolbox 不支持 AV1 硬件编码".to_string());
+            }
         };
         // SAFETY: `encoder_spec` 指向本栈上存活的 CFDictionary，`shared` 堆地址由 Arc 保活，
         // `session_out` 为本栈帧合法出参。
@@ -1624,7 +1625,13 @@ pub(crate) fn decode_verify_annexb_for(
     expected_height: u32,
     wait: Duration,
 ) -> Result<(), String> {
-    let is_hevc = codec == rc_encode::Codec::Hevc;
+    let is_hevc = match codec {
+        rc_encode::Codec::Hevc => true,
+        rc_encode::Codec::H264 => false,
+        rc_encode::Codec::Av1 => {
+            return Err("E6 Annex-B 解码自检仅适用于 H.264 / HEVC，不支持 AV1".to_string());
+        }
+    };
     // 1. 提取参数集，建格式描述。
     let parameter_sets: Vec<&[u8]> = annexb::nal_payloads_for(is_hevc, data)
         .into_iter()

@@ -85,27 +85,57 @@ fn probe_backends() -> ProbeReport {
             }),
         };
 
-        let cfg = rc_pipeline::PipelineConfig {
+        let h264_cfg = rc_pipeline::PipelineConfig {
+            codec: rc_encode::Codec::H264,
             prefer_hardware: true,
             ..rc_pipeline::PipelineConfig::default()
         };
-        let vt_encoder_ok = matches!(
-            rc_pipeline::select_encoder_labeled(&cfg),
+        let hevc_cfg = rc_pipeline::PipelineConfig {
+            codec: rc_encode::Codec::Hevc,
+            prefer_hardware: true,
+            ..rc_pipeline::PipelineConfig::default()
+        };
+        let av1_cfg = rc_pipeline::PipelineConfig {
+            codec: rc_encode::Codec::Av1,
+            prefer_hardware: true,
+            ..rc_pipeline::PipelineConfig::default()
+        };
+        let vt_h264_encoder_ok = matches!(
+            rc_pipeline::select_encoder_labeled(&h264_cfg),
             Ok((_, "videotoolbox"))
         );
-        let vt_decoder_ok = matches!(
-            rc_pipeline::select_decoder_labeled(&cfg),
+        let vt_hevc_encoder_ok = matches!(
+            rc_pipeline::select_encoder_labeled(&hevc_cfg),
+            Ok((_, "videotoolbox"))
+        );
+        let vt_h264_decoder_ok = matches!(
+            rc_pipeline::select_hardware_decoder_labeled(&h264_cfg),
+            Ok((_, "videotoolbox"))
+        );
+        let vt_hevc_decoder_ok = matches!(
+            rc_pipeline::select_hardware_decoder_labeled(&hevc_cfg),
+            Ok((_, "videotoolbox"))
+        );
+        let vt_av1_decoder_ok = matches!(
+            rc_pipeline::select_hardware_decoder_labeled(&av1_cfg),
             Ok((_, "videotoolbox"))
         );
 
         ProbeReport {
             capture,
+            // Apple VideoToolbox 仅提供 H.264 与 HEVC 硬件编码，绝不虚报 AV1 硬编。
             encoders: vec![
                 CodecProbe {
                     codec: "h264".to_string(),
                     hardware: true,
                     backend: "videotoolbox".to_string(),
-                    available: vt_encoder_ok,
+                    available: vt_h264_encoder_ok,
+                },
+                CodecProbe {
+                    codec: "hevc".to_string(),
+                    hardware: true,
+                    backend: "videotoolbox".to_string(),
+                    available: vt_hevc_encoder_ok,
                 },
                 fake_codec(),
             ],
@@ -114,7 +144,19 @@ fn probe_backends() -> ProbeReport {
                     codec: "h264".to_string(),
                     hardware: true,
                     backend: "videotoolbox".to_string(),
-                    available: vt_decoder_ok,
+                    available: vt_h264_decoder_ok,
+                },
+                CodecProbe {
+                    codec: "hevc".to_string(),
+                    hardware: true,
+                    backend: "videotoolbox".to_string(),
+                    available: vt_hevc_decoder_ok,
+                },
+                CodecProbe {
+                    codec: "av1".to_string(),
+                    hardware: true,
+                    backend: "videotoolbox".to_string(),
+                    available: vt_av1_decoder_ok,
                 },
                 fake_codec(),
             ],

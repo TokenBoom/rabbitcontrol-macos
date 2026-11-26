@@ -155,6 +155,7 @@
     var screenMoreResListEl = document.getElementById('screen-more-res-list');
     var qualityEl = document.getElementById('quality-menu');
     var qualityItem = document.getElementById('menu-quality');
+    var codecAv1Btn = document.getElementById('opt-codec-av1');
     var codecHevcBtn = document.getElementById('opt-codec-hevc');
     var codecH264Btn = document.getElementById('opt-codec-h264');
     var qualityAdvisoryHintEl = document.getElementById('quality-advisory-hint');
@@ -641,6 +642,7 @@
     var SVG_NS = 'http://www.w3.org/2000/svg';
     var HIGH_REFRESH_FPS_THRESHOLD = 90;
     var HEVC_HIGH_REFRESH_MAX_PIXEL_RATE = 600000000;
+    var AV1_HIGH_REFRESH_MAX_PIXEL_RATE = 500000000;
     var H264_HIGH_REFRESH_MAX_PIXEL_RATE = 280000000;
     var DEFAULT_MOCK_PRESETS = [
       { width: 3024, height: 1964, label: '3024 × 1964', is_native: false, is_hidpi: false },
@@ -661,6 +663,7 @@
       codec: IS_TAURI ? '' : 'hevc',
       supportedCodecs: IS_TAURI ? [] : ['hevc', 'h264'],
       clientSupportsHevc: !IS_TAURI,
+      clientSupportsAv1: !IS_TAURI,
       advisory: null,
       hasServerPresets: false,
       presets: DEFAULT_MOCK_PRESETS.slice()
@@ -671,8 +674,24 @@
     function normalizeCodec(raw) {
       if (typeof raw !== 'string') return '';
       var s = raw.trim().toLowerCase();
+      if (s === 'av1') return 'av1';
       if (s === 'hevc' || s === 'h265') return 'hevc';
       if (s === 'h264' || s === 'avc') return 'h264';
+      return '';
+    }
+
+    function formatCodecLabel(codec) {
+      var c = normalizeCodec(codec);
+      if (c === 'av1') return 'AV1';
+      if (c === 'hevc') return 'HEVC (H.265)';
+      return 'H.264';
+    }
+
+    function formatCodecHudTag(codec) {
+      var c = normalizeCodec(codec);
+      if (c === 'av1') return 'AV1';
+      if (c === 'hevc') return 'HEVC';
+      if (c === 'h264') return 'H.264';
       return '';
     }
 
@@ -694,10 +713,25 @@
       return hostSupportsHevc() && Boolean(streamState.clientSupportsHevc);
     }
 
+    function hostSupportsAv1() {
+      if (normalizeCodec(streamState.codec) === 'av1') return true;
+      return (
+        Array.isArray(streamState.supportedCodecs) &&
+        streamState.supportedCodecs.some(function (c) {
+          return normalizeCodec(c) === 'av1';
+        })
+      );
+    }
+
+    function canUseAv1() {
+      return hostSupportsAv1() && Boolean(streamState.clientSupportsAv1);
+    }
+
     function codecMaxPixelRate(codec) {
-      return normalizeCodec(codec) === 'hevc'
-        ? HEVC_HIGH_REFRESH_MAX_PIXEL_RATE
-        : H264_HIGH_REFRESH_MAX_PIXEL_RATE;
+      var c = normalizeCodec(codec);
+      if (c === 'hevc') return HEVC_HIGH_REFRESH_MAX_PIXEL_RATE;
+      if (c === 'av1') return AV1_HIGH_REFRESH_MAX_PIXEL_RATE;
+      return H264_HIGH_REFRESH_MAX_PIXEL_RATE;
     }
 
     function isWithinHighRefreshSweetSpot(w, h, fps, codec) {
@@ -773,6 +807,19 @@
           recommended_height: recHevc ? recHevc.height : null
         };
       }
+      if (c === 'av1') {
+        if (rate <= AV1_HIGH_REFRESH_MAX_PIXEL_RATE) {
+          return { level: 'optimal', reason: 'optimal', can_enable_hevc: false };
+        }
+        var recAv1 = selectRecommendedPreset(presets, fn, 'av1');
+        return {
+          level: 'above_sweet_spot',
+          reason: 'hevc_over_budget',
+          can_enable_hevc: false,
+          recommended_width: recAv1 ? recAv1.width : null,
+          recommended_height: recAv1 ? recAv1.height : null
+        };
+      }
       if (rate <= H264_HIGH_REFRESH_MAX_PIXEL_RATE) {
         return { level: 'optimal', reason: 'optimal', can_enable_hevc: false };
       }
@@ -828,14 +875,26 @@
     function formatHudResolution(resText) {
       var clean = String(resText || '').trim();
       if (!clean) return '';
-      var c = normalizeCodec(streamState.codec);
-      if (!c) return clean;
-      var tag = c === 'hevc' ? 'HEVC' : 'H.264';
+      var tag = formatCodecHudTag(streamState.codec);
+      if (!tag) return clean;
       return clean + ' · ' + tag;
     }
 
     function syncCodecMenuUi() {
       var cur = effectiveCodec();
+      var av1Visible = cur === 'av1' || hostSupportsAv1();
+      var av1Allowed = cur === 'av1' || canUseAv1();
+      if (codecAv1Btn) {
+        var isAv1 = cur === 'av1';
+        codecAv1Btn.hidden = !av1Visible;
+        codecAv1Btn.setAttribute('aria-checked', isAv1 ? 'true' : 'false');
+        codecAv1Btn.setAttribute('aria-disabled', av1Allowed ? 'false' : 'true');
+        codecAv1Btn.title = av1Allowed
+          ? 'AV1 硬件编解码：高压缩率与屏幕内容锐化，适合办公与弱网/中继'
+          : '当前主机或本机解码端不支持 AV1 硬件编解码';
+        var av1c = codecAv1Btn.querySelector('.sn-check');
+        if (av1c) av1c.hidden = !isAv1;
+      }
       var hevcAllowed = !IS_TAURI || !hasDisplayConfig || canUseHevc();
       if (codecHevcBtn) {
         var isHevc = cur === 'hevc';
@@ -848,7 +907,7 @@
         if (hc) hc.hidden = !isHevc;
       }
       if (codecH264Btn) {
-        var isH264 = cur !== 'hevc';
+        var isH264 = cur === 'h264';
         codecH264Btn.setAttribute('aria-checked', isH264 ? 'true' : 'false');
         var ac = codecH264Btn.querySelector('.sn-check');
         if (ac) ac.hidden = !isH264;
@@ -3222,6 +3281,8 @@
           if (opt.getAttribute('aria-disabled') === 'true') {
             if (group === 'codec' && val === 'hevc') {
               toast('当前主机或本机解码端暂不支持 HEVC 硬件编解码');
+            } else if (group === 'codec' && val === 'av1') {
+              toast('当前主机或本机解码端暂不支持 AV1 硬件编解码');
             }
             return;
           }
@@ -3274,7 +3335,7 @@
               streamState.fps,
               targetCodec
             );
-            var codecLabel = targetCodec === 'hevc' ? 'HEVC (H.265)' : 'H.264';
+            var codecLabel = formatCodecLabel(targetCodec);
             if (targetCodec === 'h264' && advAfterCodec.level !== 'optimal') {
               toast(
                 advAfterCodec.can_enable_hevc
@@ -3862,6 +3923,7 @@
         streamState.codec = '';
         streamState.supportedCodecs = [];
         streamState.clientSupportsHevc = false;
+        streamState.clientSupportsAv1 = false;
         streamState.advisory = null;
         streamState.hasServerPresets = false;
         streamState.presets = DEFAULT_MOCK_PRESETS.slice();
@@ -4167,6 +4229,8 @@
           if (typeof data.client_supports_hevc === 'boolean') {
             streamState.clientSupportsHevc = data.client_supports_hevc;
           }
+          streamState.clientSupportsAv1 =
+            typeof data.client_supports_av1 === 'boolean' ? data.client_supports_av1 : false;
           if (data.advisory && typeof data.advisory === 'object') {
             streamState.advisory = data.advisory;
           }
@@ -4194,11 +4258,7 @@
             var authoritativeCodec = cfgCodec || 'h264';
             pendingUserCodecTarget = null;
             if (authoritativeCodec !== wantedCodec) {
-              toast(
-                '被控端保持 ' +
-                  (authoritativeCodec === 'hevc' ? 'HEVC (H.265)' : 'H.264') +
-                  ' 编码'
-              );
+              toast('被控端保持 ' + formatCodecLabel(authoritativeCodec) + ' 编码');
             }
           }
           if (pendingUserResTarget && hasValidCfgDims) {

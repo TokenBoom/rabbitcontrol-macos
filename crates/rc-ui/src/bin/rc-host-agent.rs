@@ -1277,6 +1277,9 @@ fn main() {
         return;
     }
 
+    // 平台提供者注册完成后非阻塞预热本机硬件编解码能力缓存（绝不阻塞 Agent 启动或建连热路径）。
+    let _ = rc_client_core::codec_selector::trigger_default_hardware_caps_probe();
+
     let binary_sha256 = current_exe_sha256();
     let session_type = detect_session_type();
     let secret_path = config_paths::ipc_secret_path();

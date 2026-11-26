@@ -70,21 +70,28 @@ fn caps_for(cfg: &EncoderConfig) -> EncoderCaps {
     let profiles: &'static [u8] = match cfg.codec {
         rc_encode::Codec::Hevc => &[1],   // HEVC Main
         rc_encode::Codec::H264 => &[100], // H.264 High Profile (CABAC + 8x8 DCT)
-        _ => &[],
+        rc_encode::Codec::Av1 => &[],
     };
     let max_resolution = match cfg.codec {
         // Apple Silicon HEVC 硬件编码支持 5K (5120x2880) / 8K；H.264 硬件编码上限为 4096x4096。
         rc_encode::Codec::Hevc => Resolution::new(8192, 4320),
-        _ => Resolution::new(4096, 4096),
+        rc_encode::Codec::H264 => Resolution::new(4096, 4096),
+        // Apple VideoToolbox 无 AV1 硬件编码器，绝不虚报硬件能力或分辨率上限。
+        rc_encode::Codec::Av1 => Resolution::new(0, 0),
+    };
+    let hardware = matches!(cfg.codec, rc_encode::Codec::H264 | rc_encode::Codec::Hevc);
+    let bitstream_format = match cfg.codec {
+        // ffi 侧重排为 Annex-B（见模块文档「输出格式」）。
+        rc_encode::Codec::H264 | rc_encode::Codec::Hevc => BitstreamFormat::AnnexB,
+        rc_encode::Codec::Av1 => BitstreamFormat::Obu,
     };
     EncoderCaps {
         codec: cfg.codec,
         // 会话创建时显式要求硬件编码器（RequireHardwareAccelerated = true，
         // 见 ffi 模块），无硬件可用会在构造期失败而非静默落回软编。
-        hardware: true,
+        hardware,
         max_resolution,
-        // ffi 侧重排为 Annex-B（见模块文档「输出格式」）。
-        bitstream_format: BitstreamFormat::AnnexB,
+        bitstream_format,
         profiles,
     }
 }
@@ -192,8 +199,10 @@ impl ContentAdaptiveRateController {
         let (per_pixel_num, per_pixel_den, min_bps, max_bps) = match self.codec {
             // HEVC 同画质效率更高：1080p ≈ 1.35 Mbps，2560×1662 ≈ 2.5 Mbps（在 <5% 脏区上等效 >50 Mbps 密度）
             rc_encode::Codec::Hevc => (65u64, 100u64, 800_000u64, 2_500_000u64),
+            // AV1 压缩效率更高（防御性详尽分支；VideoToolbox 实际不支持 AV1 硬件编码）
+            rc_encode::Codec::Av1 => (55u64, 100u64, 650_000u64, 2_200_000u64),
             // H.264 High Profile 文本锐利底线：1080p ≈ 2.0 Mbps，2560×1662 ≈ 3.8 Mbps
-            _ => (100u64, 100u64, 1_200_000u64, 3_800_000u64),
+            rc_encode::Codec::H264 => (100u64, 100u64, 1_200_000u64, 3_800_000u64),
         };
         let scaled = self
             .frame_pixels
@@ -364,7 +373,9 @@ fn speed_over_quality_for(cfg: &EncoderConfig) -> bool {
                 Preset::Fastest | Preset::Fast | Preset::Balanced
             )
         }
-        _ => matches!(cfg.preset, Preset::Fastest | Preset::Fast),
+        rc_encode::Codec::Hevc | rc_encode::Codec::Av1 => {
+            matches!(cfg.preset, Preset::Fastest | Preset::Fast)
+        }
     }
 }
 
@@ -471,7 +482,16 @@ impl VtEncoder {
             .session
             .encode(buffer.as_opaque_ptr(), true, Duration::from_millis(500))
             .map_err(|e| Error::Encoder(format!("E6 启动自检（编码一帧假数据）失败: {e}")))?;
-        let is_hevc = self.cfg.codec == rc_encode::Codec::Hevc;
+        let is_hevc = match self.cfg.codec {
+            rc_encode::Codec::Hevc => true,
+            rc_encode::Codec::H264 => false,
+            rc_encode::Codec::Av1 => {
+                return Err(Error::InvalidConfig(
+                    "rc-encode-vt 不支持 AV1 硬件编码（Apple VideoToolbox 仅支持 H.264 与 HEVC/H.265）"
+                        .to_string(),
+                ));
+            }
+        };
         if !output.keyframe
             || !annexb::has_parameter_sets_for(is_hevc, &output.data)
             || annexb::nal_unit_types_for(is_hevc, &output.data).is_empty()
@@ -499,11 +519,14 @@ impl VtEncoder {
 #[cfg(target_os = "macos")]
 fn validate_supported(cfg: &EncoderConfig) -> Result<()> {
     cfg.validate()?;
-    if !matches!(cfg.codec, rc_encode::Codec::H264 | rc_encode::Codec::Hevc) {
-        return Err(Error::InvalidConfig(format!(
-            "rc-encode-vt 支持 H.264 与 HEVC（H.265），配置的是 {}",
-            cfg.codec.as_str()
-        )));
+    match cfg.codec {
+        rc_encode::Codec::H264 | rc_encode::Codec::Hevc => {}
+        rc_encode::Codec::Av1 => {
+            return Err(Error::InvalidConfig(format!(
+                "rc-encode-vt 不支持 AV1 硬件编码（Apple VideoToolbox 仅支持 H.264 与 HEVC/H.265，配置的是 {}）",
+                cfg.codec.as_str()
+            )));
+        }
     }
     if !cfg.resolution.is_even() {
         return Err(Error::InvalidConfig(format!(
@@ -818,6 +841,20 @@ mod tests {
             "caps 声明什么，解码端就按什么解析——输出侧重排后必须声明 Annex-B"
         );
         assert_eq!(caps.profiles, &[100], "profile idc 100 = High Profile");
+    }
+
+    /// AV1 非本后端硬件编码能力：绝不虚报 hardware=true 或 Annex-B，且分辨率上限为 0×0。
+    #[test]
+    fn caps_for_av1_does_not_claim_hardware_support() {
+        let caps = caps_for(&EncoderConfig {
+            codec: Codec::Av1,
+            ..EncoderConfig::default()
+        });
+        assert_eq!(caps.codec, Codec::Av1);
+        assert!(!caps.hardware, "VideoToolbox 不得虚报 AV1 硬件编码");
+        assert_eq!(caps.bitstream_format, BitstreamFormat::Obu);
+        assert_eq!(caps.max_resolution, Resolution::new(0, 0));
+        assert!(caps.profiles.is_empty());
     }
 
     #[test]
