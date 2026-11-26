@@ -3452,7 +3452,7 @@ dependencies = [
 
 [[package]]
 name = "rc-audio-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "block2",
  "dispatch2",
@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "rc-capture-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "block2",
  "core-graphics 0.24.0",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "rc-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3556,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "rc-clipboard-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "core-foundation",
  "rc-capture",
@@ -3613,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "rc-encode-vt"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "objc2-core-foundation",
  "objc2-core-media",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "rc-host-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "rc-input-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "rc-platform-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "objc2-core-foundation",
  "objc2-core-video",
@@ -3756,7 +3756,7 @@ dependencies = [
 
 [[package]]
 name = "rc-render-macos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "block2",
  "objc2",
@@ -3829,7 +3829,7 @@ dependencies = [
 
 [[package]]
 name = "rc-ui"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "base64 0.22.1",
  "objc2",
