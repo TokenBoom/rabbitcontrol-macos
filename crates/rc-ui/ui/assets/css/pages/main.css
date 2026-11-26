@@ -1295,6 +1295,14 @@ body.is-tauri .p2__body.is-disabled .p2__verify-col {
   outline-offset: -1px;
 }
 
+.p3__row--rc-disabled {
+  cursor: default;
+}
+
+.p3__rc-off-pill {
+  flex: none;
+}
+
 .p3__icon {
   display: inline-flex;
   align-items: center;

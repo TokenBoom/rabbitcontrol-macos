@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +37,15 @@ use rc_ui::service_ipc::{
 };
 #[cfg(target_os = "macos")]
 use rc_ui::service_manager;
-use rc_ui::signal_client::{SignalClientHandle, SignalClientOptions};
+use rc_ui::signal_client::{DeviceStatusEvent, SignalClientHandle, SignalClientOptions};
+
+const MAX_PENDING_DEVICE_EVENTS: usize = 64;
+
+fn normalize_device_id_digits(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect()
+}
 
 fn current_os_boot_id() -> Option<String> {
     #[cfg(target_os = "macos")]
@@ -341,6 +350,8 @@ struct AgentInner {
     signal: Option<Arc<SignalClientHandle>>,
     lan: Option<LanDiscoveryHandle>,
     host: Option<HostHandle>,
+    allow_owner_control: bool,
+    pending_device_events: VecDeque<DeviceStatusEvent>,
     password: String,
     custom_password: bool,
     listen_addr: Option<String>,
@@ -382,6 +393,8 @@ impl AgentInner {
             signal: None,
             lan: None,
             host: None,
+            allow_owner_control: true,
+            pending_device_events: VecDeque::new(),
             password,
             custom_password,
             listen_addr: None,
@@ -543,6 +556,7 @@ impl AgentInner {
             token_refresher: Some(token_refresher),
             device_pubkey: Some(self.current_auth().cert_manager().device_pubkey_hex()),
             allow_remote_assist: self.signal_allow_remote_assist(),
+            allow_remote_control: Some(self.allow_owner_control),
             dynamic_lan_discovery: true,
         };
         let mut lan_addrs = Vec::new();
@@ -617,6 +631,7 @@ impl AgentInner {
                     let _ = host.respond_approval(prompt.generation, false);
                 }
             }
+            host.set_allow_owner_control(self.allow_owner_control);
             host.set_allow_remote_assist(allow_remote_assist);
             host.set_owner_verifier(owner_verifier);
             host.set_mtls_config(mtls_bundle, accept_mtls_lan);
@@ -643,6 +658,7 @@ impl AgentInner {
                 && !self.custom_password,
             clipboard_enabled: self.session_type != ServiceSessionType::LoginWindow,
             audio_enabled: self.session_type != ServiceSessionType::LoginWindow,
+            allow_owner_control: self.allow_owner_control,
             allow_remote_assist,
             owner_verifier,
             mtls_config: mtls_bundle,
@@ -817,6 +833,30 @@ impl AgentInner {
         }
     }
 
+    fn apply_device_status_event(&mut self, ev: &DeviceStatusEvent) -> bool {
+        let Some(ref local_did) = self.device_id else {
+            return false;
+        };
+        let norm_local = normalize_device_id_digits(local_did);
+        let norm_ev = normalize_device_id_digits(&ev.device_id);
+        if norm_local.is_empty() || norm_local != norm_ev {
+            return false;
+        }
+        let changed = self.allow_owner_control != ev.allow_remote_control;
+        self.allow_owner_control = ev.allow_remote_control;
+        if let Some(ref host) = self.host {
+            host.set_allow_owner_control(ev.allow_remote_control);
+        }
+        changed
+    }
+
+    fn enqueue_device_status_event(&mut self, ev: DeviceStatusEvent) {
+        if self.pending_device_events.len() >= MAX_PENDING_DEVICE_EVENTS {
+            self.pending_device_events.pop_front();
+        }
+        self.pending_device_events.push_back(ev);
+    }
+
     fn pump_events(&mut self) -> (bool, RetiredHandles) {
         let mut changed = false;
         let mut retired_host = None;
@@ -855,6 +895,16 @@ impl AgentInner {
                         self.sync_signal_allow_assist();
                     }
                 }
+            }
+
+            while let Some(dev_ev) = sig.try_recv_device_status() {
+                if revoked_reason.is_some() {
+                    break;
+                }
+                if self.apply_device_status_event(&dev_ev) {
+                    changed = true;
+                }
+                self.enqueue_device_status_event(dev_ev);
             }
 
             let reject_mtls = if revoked_reason.is_some() || self.host.is_none() {
@@ -899,6 +949,8 @@ impl AgentInner {
             let retired_all = self.take_all_handles();
             self.signal_online = false;
             self.device_id = None;
+            self.allow_owner_control = true;
+            self.pending_device_events.clear();
             self.listen_addr = None;
             self.display_addr = None;
             self.backend.clear();
@@ -1339,6 +1391,12 @@ fn main() {
                 };
                 ServiceResponse::ServerStatus(Box::new(snap))
             }
+            ServiceRequest::DrainDeviceStatusEvents => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                let events: Vec<DeviceStatusEvent> =
+                    guard.pending_device_events.drain(..).collect();
+                ServiceResponse::DeviceStatusEvents(events)
+            }
             ServiceRequest::RequestConnect {
                 target_id,
                 timeout_ms,
@@ -1543,5 +1601,12 @@ mod tests {
             &next,
             Some(ServerConnectionState::Connected)
         ));
+    }
+
+    #[test]
+    fn normalize_device_id_digits_strips_spaces_and_hyphens() {
+        assert_eq!(normalize_device_id_digits("604 928 235"), "604928235");
+        assert_eq!(normalize_device_id_digits("604-928-235"), "604928235");
+        assert_eq!(normalize_device_id_digits("604928235"), "604928235");
     }
 }

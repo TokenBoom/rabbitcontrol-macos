@@ -563,6 +563,8 @@ impl HostStatusSnapshot {
 pub struct HostRuntime {
     /// 当前活动被控端服务句柄（未启用时为 `None`）。
     pub handle: Option<HostHandle>,
+    /// 是否允许本机被远程控制（含同账号本人自控总门控，默认 `true`，随自身 `DeviceStatusChanged` 热同步）。
+    pub allow_owner_control: bool,
     /// 是否允许非同账号他人的远程协助（为 `false` 时，即使仅本人自控监听运行，UI「允许远程协助」仍显示关闭）。
     pub allow_remote_assist: bool,
     /// 实际绑定的监听地址。
@@ -586,6 +588,7 @@ impl HostRuntime {
     pub fn new() -> Self {
         Self {
             handle: None,
+            allow_owner_control: true,
             allow_remote_assist: false,
             listen_addr: None,
             display_addr: None,

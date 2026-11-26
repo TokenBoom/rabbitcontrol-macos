@@ -198,6 +198,15 @@ fn sync_proxy_state_and_emit(
             *prev_server = Some(raw);
         }
     }
+
+    if let Ok(ServiceResponse::DeviceStatusEvents(events)) = commands::call_agent_ipc(
+        ServiceRequest::DrainDeviceStatusEvents,
+        Duration::from_millis(350),
+    ) {
+        for dev_ev in events {
+            let _ = app.emit("device://status-changed", &dev_ev);
+        }
+    }
 }
 
 /// 启动后台状态轮询线程：
@@ -716,6 +725,7 @@ fn start_background_poller(app: AppHandle) {
                         if !is_current {
                             break;
                         }
+                        commands::apply_local_device_status_policy(&st, &dev_ev);
                         let _ = app.emit("device://status-changed", &dev_ev);
                     }
 

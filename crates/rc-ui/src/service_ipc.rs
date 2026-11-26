@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::host_bridge::HostApprovalPrompt;
 use crate::permissions::PermissionSnapshot;
 use crate::server_config::ServerStatusSnapshot;
-use crate::signal_client::ConnectGrant;
+use crate::signal_client::{ConnectGrant, DeviceStatusEvent};
 
 /// 单条 IPC 请求/响应最大行字节数（256 KiB，防止异常写入耗尽内存）。
 pub const MAX_IPC_LINE_BYTES: usize = 256 * 1024;
@@ -114,6 +114,8 @@ pub enum ServiceRequest {
     },
     /// 查询后台信令服务实时状态快照。
     GetServerStatus,
+    /// 排空后台信令连接收到的设备状态变更事件队列（供代理模式 GUI 实时刷新侧栏与 P3）。
+    DrainDeviceStatusEvents,
     /// 执行「整体退出」：写 `manual-stop` 标记并优雅关闭 agent 与 daemon。
     QuitAll,
     /// 检测到磁盘二进制已更新时请求平滑重启：不写 `manual-stop` 优雅退出，由 `launchd` 拉起新版。
@@ -160,6 +162,8 @@ pub enum ServiceResponse {
     ConnectGrant(Box<ConnectGrant>),
     /// 后台信令服务器状态快照。
     ServerStatus(Box<ServerStatusSnapshot>),
+    /// 后台信令连接收到的设备状态变更事件批次。
+    DeviceStatusEvents(Vec<DeviceStatusEvent>),
     /// 最新有效的认证登录会话快照（由 `rc-daemon` 单点刷新返回）。
     AuthSession(Box<crate::auth_client::StoredAuthSession>),
     /// Refresh Token 已被吊销或需重新登录。

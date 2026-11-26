@@ -688,16 +688,50 @@ fn build_signal_client_options(state: &AppState) -> SignalClientOptions {
     });
     let device_pubkey = Some(state.auth.cert_manager().device_pubkey_hex());
     let allow_remote_assist = sync_prefs_from_disk_if_proxy(state).allow_remote_assist;
+    let allow_remote_control = state
+        .host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_owner_control;
     SignalClientOptions {
         token_provider: Some(token_provider),
         token_refresher: Some(token_refresher),
         device_pubkey,
         allow_remote_assist,
+        allow_remote_control: Some(allow_remote_control),
         dynamic_lan_discovery: true,
     }
 }
 
-/// 将最新的 `allow_remote_assist` / `OwnerTicketVerifier` / `mTLS` 策略热同步至正在运行的被控端监听服务。
+fn normalize_device_id_for_match(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect()
+}
+
+/// 若收到的 `DeviceStatusChanged` 指向本机设备，则热同步本机 `HostRuntime` 与活跃 `HostHandle` 的
+/// `allow_owner_control` 门控状态（防止远端 REST `PATCH` 关闭本机远控后局域网直连仍放行）。
+pub(crate) fn apply_local_device_status_policy(
+    state: &AppState,
+    ev: &rc_ui::signal_client::DeviceStatusEvent,
+) -> bool {
+    let Some(local_did) = local_device_id_snapshot(state) else {
+        return false;
+    };
+    let norm_local = normalize_device_id_for_match(&local_did);
+    let norm_ev = normalize_device_id_for_match(&ev.device_id);
+    if norm_local.is_empty() || norm_local != norm_ev {
+        return false;
+    }
+    let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+    host.allow_owner_control = ev.allow_remote_control;
+    if let Some(handle) = host.handle.as_ref() {
+        handle.set_allow_owner_control(ev.allow_remote_control);
+    }
+    true
+}
+
+/// 将最新的 `allow_remote_assist` / `allow_owner_control` / `OwnerTicketVerifier` / `mTLS` 策略热同步至正在运行的被控端监听服务。
 pub(crate) fn refresh_host_security_runtime(state: &AppState) {
     let (allow_remote_assist, default_encrypt) = {
         let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
@@ -709,6 +743,7 @@ pub(crate) fn refresh_host_security_runtime(state: &AppState) {
     let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
     host.allow_remote_assist = allow_remote_assist;
     if let Some(handle) = host.handle.as_ref() {
+        handle.set_allow_owner_control(host.allow_owner_control);
         handle.set_allow_remote_assist(allow_remote_assist);
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_bundle, accept_mtls_lan);
@@ -1632,6 +1667,7 @@ pub(crate) fn start_host_service_with_policy(
 
     let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = host.handle.as_ref() {
+        handle.set_allow_owner_control(host.allow_owner_control);
         handle.set_allow_remote_assist(allow_remote_assist);
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_config, accept_mtls_lan);
@@ -1649,6 +1685,7 @@ pub(crate) fn start_host_service_with_policy(
             auto_rotate_password: !host.custom_password,
             clipboard_enabled: true,
             audio_enabled: true,
+            allow_owner_control: host.allow_owner_control,
             allow_remote_assist,
             owner_verifier,
             mtls_config,
@@ -2491,6 +2528,11 @@ pub async fn save_server_config(
             disconnect_active_session(&app);
             window::close_session_and_tool_windows(&app);
             let (host_snap, cancelled_gen) = stop_host_service_with_cancelled(&state, false);
+            state
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .allow_owner_control = true;
             if let Some(generation) = cancelled_gen {
                 let _ = app.emit(
                     "host://update",
@@ -2902,6 +2944,8 @@ pub struct MyDeviceEntry {
     pub display_name: String,
     /// 是否允许他人远程协助。
     pub allow_remote_assist: bool,
+    /// 是否允许被远程控制（含同账号本人自控）。
+    pub allow_remote_control: bool,
     /// 是否已被禁用。
     pub disabled: bool,
     /// 是否在线。
@@ -2979,6 +3023,7 @@ fn map_my_device_entry(info: MyDeviceInfo, local_device_id: Option<&str>) -> MyD
         alias: info.alias,
         display_name,
         allow_remote_assist: info.allow_remote_assist,
+        allow_remote_control: info.allow_remote_control,
         disabled: info.disabled,
         online: info.online,
         in_session: info.in_session,
@@ -3445,6 +3490,11 @@ pub async fn probe_and_save_server(
             disconnect_active_session(&app);
             window::close_session_and_tool_windows(&app);
             let (host_snap, cancelled_gen) = stop_host_service_with_cancelled(&state, false);
+            state
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .allow_owner_control = true;
             if let Some(generation) = cancelled_gen {
                 let _ = app.emit(
                     "host://update",
@@ -3632,6 +3682,11 @@ fn perform_logout_cleanup(app: &AppHandle, notify_remote: bool) -> GateStatusSna
     disconnect_active_session(app);
     window::close_session_and_tool_windows(app);
     let (host_snap, cancelled_gen) = stop_host_service_with_cancelled(&state, false);
+    state
+        .host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_owner_control = true;
     if let Some(generation) = cancelled_gen {
         let _ = app.emit(
             "host://update",
@@ -7470,6 +7525,7 @@ mod tests {
                 alias: "办公室 Mac".to_string(),
                 device_pubkey: String::new(),
                 allow_remote_assist: true,
+                allow_remote_control: true,
                 disabled: false,
                 online: true,
                 in_session: false,
@@ -7481,8 +7537,189 @@ mod tests {
         assert_eq!(entry.formatted_id, "604 928 235");
         assert_eq!(entry.display_name, "办公室 Mac");
         assert!(entry.is_local);
+        assert!(entry.allow_remote_control);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn my_device_entry_allow_remote_control_serialization_and_android_filtering() {
+        let state = AppState::new_for_test();
+        let sig_opts = build_signal_client_options(&state);
+        assert_eq!(
+            sig_opts.allow_remote_control,
+            Some(true),
+            "macOS 桌面端信令注册选项应显式声明 allow_remote_control = Some(true)"
+        );
+
+        let mac_entry = map_my_device_entry(
+            MyDeviceInfo {
+                device_id: "604928235".to_string(),
+                formatted_id: "604 928 235".to_string(),
+                hostname: "Studio-Mac".to_string(),
+                os: "macos".to_string(),
+                app_version: "0.1.11".to_string(),
+                arch: "arm64".to_string(),
+                alias: String::new(),
+                device_pubkey: String::new(),
+                allow_remote_assist: false,
+                allow_remote_control: true,
+                disabled: false,
+                online: true,
+                in_session: false,
+                bound_at: None,
+                last_seen_at: None,
+            },
+            Some("999000111"),
+        );
+        let mac_json = serde_json::to_value(&mac_entry).expect("serialize mac MyDeviceEntry");
+        assert_eq!(
+            mac_json.get("allowRemoteControl"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        // 老服务端省略 allow_remote_control 字段时，Android 设备应默认反序列化为 false。
+        let legacy_android: MyDeviceInfo = serde_json::from_str(
+            r#"{
+                "device_id": "512345678",
+                "formatted_id": "512 345 678",
+                "hostname": "Pixel-9",
+                "os": "android",
+                "alias": "我的手机",
+                "allow_remote_assist": false,
+                "disabled": false,
+                "online": true,
+                "in_session": false
+            }"#,
+        )
+        .expect("deserialize legacy android MyDeviceInfo");
+        assert!(!legacy_android.allow_remote_control);
+        let android_off_entry = map_my_device_entry(legacy_android, Some("999000111"));
+        assert!(!android_off_entry.allow_remote_control);
+        let android_off_json =
+            serde_json::to_value(&android_off_entry).expect("serialize android MyDeviceEntry");
+        assert_eq!(
+            android_off_json.get("allowRemoteControl"),
+            Some(&serde_json::Value::Bool(false))
+        );
+
+        let android_on_entry = map_my_device_entry(
+            MyDeviceInfo {
+                device_id: "512345679".to_string(),
+                formatted_id: "512 345 679".to_string(),
+                hostname: "OnePlus".to_string(),
+                os: "android".to_string(),
+                app_version: "0.1.11".to_string(),
+                arch: "arm64".to_string(),
+                alias: "开启远控的手机".to_string(),
+                device_pubkey: String::new(),
+                allow_remote_assist: false,
+                allow_remote_control: true,
+                disabled: false,
+                online: true,
+                in_session: false,
+                bound_at: None,
+                last_seen_at: None,
+            },
+            Some("999000111"),
+        );
+        let local_entry = map_my_device_entry(
+            MyDeviceInfo {
+                device_id: "999000111".to_string(),
+                formatted_id: "999 000 111".to_string(),
+                hostname: "Local-Mac".to_string(),
+                os: "macos".to_string(),
+                app_version: "0.1.11".to_string(),
+                arch: "arm64".to_string(),
+                alias: String::new(),
+                device_pubkey: String::new(),
+                allow_remote_assist: false,
+                allow_remote_control: true,
+                disabled: false,
+                online: true,
+                in_session: false,
+                bound_at: None,
+                last_seen_at: None,
+            },
+            Some("999000111"),
+        );
+
+        let entries = [mac_entry, android_off_entry, android_on_entry, local_entry];
+        let controllable_ids: Vec<&str> = entries
+            .iter()
+            .filter(|d| !d.is_local && d.allow_remote_control)
+            .map(|d| d.device_id.as_str())
+            .collect();
+        assert_eq!(controllable_ids, vec!["604928235", "512345679"]);
+    }
+
+    #[test]
+    fn apply_local_device_status_policy_hot_syncs_host_allow_owner_control() {
+        let state = AppState::new_for_test();
+        {
+            let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+            rt.config.cached_device_id = Some("604928235".to_string());
+        }
+        let _ = start_host_service_on(&state, SocketAddr::from(([127, 0, 0, 1], 0)), false)
+            .expect("spawn fake host");
+        assert!(state.host.lock().unwrap().allow_owner_control);
+        assert_eq!(
+            build_signal_client_options(&state).allow_remote_control,
+            Some(true)
+        );
+
+        let other_ev = rc_ui::signal_client::DeviceStatusEvent {
+            device_id: "111222333".to_string(),
+            online: true,
+            hostname: "Other-Android".to_string(),
+            alias: String::new(),
+            os: "android".to_string(),
+            app_version: String::new(),
+            arch: String::new(),
+            allow_remote_assist: false,
+            allow_remote_control: false,
+        };
+        assert!(!apply_local_device_status_policy(&state, &other_ev));
+        assert!(state.host.lock().unwrap().allow_owner_control);
+
+        // 带空格的格式化设备码也应匹配本机并热同步为 false。
+        let self_disable_ev = rc_ui::signal_client::DeviceStatusEvent {
+            device_id: "604 928 235".to_string(),
+            online: true,
+            hostname: "Local-Mac".to_string(),
+            alias: String::new(),
+            os: "macos".to_string(),
+            app_version: "0.1.11".to_string(),
+            arch: "arm64".to_string(),
+            allow_remote_assist: false,
+            allow_remote_control: false,
+        };
+        assert!(apply_local_device_status_policy(&state, &self_disable_ev));
+        assert!(!state.host.lock().unwrap().allow_owner_control);
+        assert_eq!(
+            build_signal_client_options(&state).allow_remote_control,
+            Some(false)
+        );
+
+        // 停机后重建 HostHandle 时应保留远端同步下来的 allow_owner_control = false。
+        let _ = stop_host_service_with_cancelled(&state, true);
+        let _ = start_host_service_on(&state, SocketAddr::from(([127, 0, 0, 1], 0)), false)
+            .expect("respawn fake host");
+        assert!(!state.host.lock().unwrap().allow_owner_control);
+
+        let self_enable_ev = rc_ui::signal_client::DeviceStatusEvent {
+            device_id: "604928235".to_string(),
+            allow_remote_control: true,
+            ..self_disable_ev
+        };
+        assert!(apply_local_device_status_policy(&state, &self_enable_ev));
+        assert!(state.host.lock().unwrap().allow_owner_control);
+        assert_eq!(
+            build_signal_client_options(&state).allow_remote_control,
+            Some(true)
+        );
+
+        let _ = stop_host_service_with_cancelled(&state, true);
     }
 
     #[test]

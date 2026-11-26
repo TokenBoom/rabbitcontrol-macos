@@ -172,6 +172,41 @@
     return ic === "smartphone" || ic === "tablet" ? "mobiles" : "computers";
   }
 
+  function isMobileOs(os) {
+    var lower = String(os || "").toLowerCase();
+    return lower.indexOf("android") !== -1 || lower.indexOf("ios") !== -1;
+  }
+
+  function defaultAllowRemoteControlForOs(os) {
+    return !isMobileOs(os);
+  }
+
+  function canShowInSidebar(d) {
+    return Boolean(d && !d.isLocal && d.allowRemoteControl);
+  }
+
+  function findPreferredSidebarDevice() {
+    for (var i = 0; i < state.myDevices.length; i++) {
+      if (canShowInSidebar(state.myDevices[i]) && state.myDevices[i].online) {
+        return state.myDevices[i];
+      }
+    }
+    for (var j = 0; j < state.myDevices.length; j++) {
+      if (canShowInSidebar(state.myDevices[j])) {
+        return state.myDevices[j];
+      }
+    }
+    return null;
+  }
+
+  function isRemoteControlDisabled(device) {
+    if (!device || device.isLocal) return false;
+    if (typeof device.allowRemoteControl === "boolean") {
+      return !device.allowRemoteControl;
+    }
+    return false;
+  }
+
   function normalizeMyDevice(raw) {
     var did = String((raw && (raw.deviceId || raw.device_id)) || "");
     var formattedId = String((raw && (raw.formattedId || raw.formatted_id)) || formatDeviceId(did));
@@ -185,6 +220,12 @@
         did
     );
     var os = String((raw && raw.os) || "");
+    var allowRemoteControl =
+      raw && typeof raw.allowRemoteControl === "boolean"
+        ? raw.allowRemoteControl
+        : raw && typeof raw.allow_remote_control === "boolean"
+          ? raw.allow_remote_control
+          : defaultAllowRemoteControlForOs(os);
     return {
       id: did,
       deviceId: did,
@@ -201,6 +242,7 @@
       inSession: Boolean(raw && (raw.inSession || raw.in_session)),
       isLocal: Boolean(raw && (raw.isLocal || raw.is_local)),
       allowRemoteAssist: Boolean(raw && (raw.allowRemoteAssist || raw.allow_remote_assist)),
+      allowRemoteControl: allowRemoteControl,
       isMine: true
     };
   }
@@ -210,7 +252,10 @@
       for (var m = 0; m < state.myDevices.length; m++) {
         if (state.myDevices[m].id === id) return state.myDevices[m];
       }
-      return state.myDevices.length > 0 ? state.myDevices[0] : null;
+      for (var s = 0; s < state.myDevices.length; s++) {
+        if (canShowInSidebar(state.myDevices[s])) return state.myDevices[s];
+      }
+      return null;
     }
     for (var i = 0; i < MOCK.devices.length; i++) {
       if (MOCK.devices[i].id === id) return MOCK.devices[i];
@@ -347,7 +392,7 @@
 
     if (IS_TAURI) {
       state.myDevices.forEach(function (d) {
-        if (d.isLocal) return;
+        if (!canShowInSidebar(d)) return;
         var row = buildSidebarRow({
           key: "device:" + d.id,
           dot: d.online ? "online" : "offline",
@@ -475,7 +520,7 @@
   function inSidebar(id) {
     if (IS_TAURI) {
       for (var m = 0; m < state.myDevices.length; m++) {
-        if (state.myDevices[m].id === id && !state.myDevices[m].isLocal) return true;
+        if (state.myDevices[m].id === id && canShowInSidebar(state.myDevices[m])) return true;
       }
       return false;
     }
@@ -486,6 +531,11 @@
   }
 
   function selectDevice(id, route) {
+    var target = findDevice(id);
+    if (target && target.id === id && isRemoteControlDisabled(target)) {
+      toast("设备「" + target.name + "」未开启允许远程控制，请先在设备端开启");
+      return;
+    }
     state.deviceId = id;
     /* 侧栏无该设备行时保留原选中项（避免主窗出现「无任何高亮」的破态） */
     var key = inSidebar(id) ? "device:" + id : state.sidebarKey;
@@ -727,6 +777,10 @@
   function openSession(watchOnly, targetDevice, extraOpts) {
     var extra = extraOpts || {};
     var device = targetDevice || findDevice(state.deviceId);
+    if (isRemoteControlDisabled(device)) {
+      toast("设备「" + device.name + "」未开启允许远程控制，请先在设备端开启");
+      return;
+    }
     if (!extra.headless && device && isDeviceControlled(device)) {
       focusSessionWindow();
       return;
@@ -769,10 +823,14 @@
   }
 
   function openTool(tool, targetDevice) {
+    var device = targetDevice || findDevice(state.deviceId);
+    if (isRemoteControlDisabled(device)) {
+      toast("设备「" + device.name + "」未开启允许远程控制，请先在设备端开启");
+      return;
+    }
     if (tool === "watch") return openSession(true, targetDevice);
     if (tool === "transfer" || tool === "terminal" || tool === "portmap") {
       if (!IS_TAURI) return openWindow(tool);
-      var device = targetDevice || findDevice(state.deviceId);
       var active = state.activeSession;
       if (active && active.active && active.connected) {
         if (!device || isDeviceControlled(device)) {
@@ -1181,6 +1239,11 @@
         if (ownDev.isLocal) {
           pendingToolAfterConnect = null;
           toast("当前为本机设备，请选择其他在线设备连接");
+          return;
+        }
+        if (!ownDev.allowRemoteControl) {
+          pendingToolAfterConnect = null;
+          toast("设备「" + ownDev.name + "」未开启允许远程控制，请先在设备端开启");
           return;
         }
         options = {
@@ -1677,27 +1740,13 @@
     state.myDevices = rawList.map(normalizeMyDevice);
     if (IS_TAURI) {
       var curExists = state.myDevices.some(function (d) {
-        return d.id === state.deviceId && !d.isLocal;
+        return d.id === state.deviceId && canShowInSidebar(d);
       });
       if (!curExists) {
-        var preferred = null;
-        for (var i = 0; i < state.myDevices.length; i++) {
-          if (!state.myDevices[i].isLocal && state.myDevices[i].online) {
-            preferred = state.myDevices[i];
-            break;
-          }
-        }
-        if (!preferred) {
-          for (var j = 0; j < state.myDevices.length; j++) {
-            if (!state.myDevices[j].isLocal) {
-              preferred = state.myDevices[j];
-              break;
-            }
-          }
-        }
+        var preferred = findPreferredSidebarDevice();
         if (preferred) {
           state.deviceId = preferred.id;
-          if (state.route === "p1" || state.route === "p2") {
+          if (state.route === "p1") {
             go("p1", "device:" + preferred.id);
           }
         } else {
@@ -1721,9 +1770,12 @@
     var did = String(ev.device_id || ev.deviceId || "").replace(/\s+/g, "");
     if (!did) return;
     var found = false;
+    var updatedDevice = null;
+    var prevAllowRc = true;
     for (var i = 0; i < state.myDevices.length; i++) {
       var d = state.myDevices[i];
       if (d.id === did) {
+        prevAllowRc = Boolean(d.allowRemoteControl);
         if (typeof ev.online === "boolean") d.online = ev.online;
         if (typeof ev.hostname === "string" && ev.hostname) d.hostname = ev.hostname;
         if (typeof ev.alias === "string") d.alias = ev.alias;
@@ -1745,8 +1797,14 @@
         } else if (typeof ev.allowRemoteAssist === "boolean") {
           d.allowRemoteAssist = ev.allowRemoteAssist;
         }
+        if (typeof ev.allow_remote_control === "boolean") {
+          d.allowRemoteControl = ev.allow_remote_control;
+        } else if (typeof ev.allowRemoteControl === "boolean") {
+          d.allowRemoteControl = ev.allowRemoteControl;
+        }
         d.name = d.alias.trim() || d.hostname.trim() || d.formattedId || did;
         notifyMainRemoteUpdateDeviceStatus(d);
+        updatedDevice = d;
         found = true;
         break;
       }
@@ -1754,6 +1812,29 @@
     if (!found) {
       refreshMyDevices();
       return;
+    }
+    if (
+      updatedDevice &&
+      !updatedDevice.isLocal &&
+      !updatedDevice.allowRemoteControl &&
+      state.deviceId === updatedDevice.id
+    ) {
+      var nextPreferred = findPreferredSidebarDevice();
+      if (state.route === "p1") {
+        paintSidebarRows();
+        if (nextPreferred) {
+          selectDevice(nextPreferred.id, "p1");
+        } else {
+          state.deviceId = null;
+          go("p3", "all");
+        }
+        toast("设备「" + updatedDevice.name + "」已关闭允许远程控制");
+        return;
+      }
+      state.deviceId = nextPreferred ? nextPreferred.id : null;
+      if (prevAllowRc) {
+        toast("设备「" + updatedDevice.name + "」已关闭允许远程控制");
+      }
     }
     paintSidebarRows();
     if (state.route === "p3") renderP3();
@@ -1796,7 +1877,16 @@
   }
 
   function hasDeviceUpdate(device) {
-    if (!IS_TAURI || !device || !device.isMine || device.isLocal || !device.online) return false;
+    if (
+      !IS_TAURI ||
+      !device ||
+      !device.isMine ||
+      device.isLocal ||
+      !device.online ||
+      !device.allowRemoteControl
+    ) {
+      return false;
+    }
     if (!latestRelease || !latestRelease.version) return false;
     if (device.os && String(device.os).toLowerCase() !== "macos") return false;
     if (!device.appVersion) return false;
@@ -1868,6 +1958,10 @@
 
   function openMainRemoteUpdateModal(device) {
     if (!IS_TAURI || !device || !device.deviceId || device.isLocal) return;
+    if (isRemoteControlDisabled(device)) {
+      toast("设备「" + device.name + "」未开启允许远程控制，请先在设备端开启");
+      return;
+    }
     if (!device.online) {
       toast("设备「" + device.name + "」当前离线，无法远程更新");
       return;
@@ -2001,6 +2095,11 @@
     okBtn.addEventListener("click", function () {
       if (!resolvedRelease || !resolvedRelease.version) {
         loadLatestRelease();
+        return;
+      }
+      var latestDevice = findMyDeviceById(device.deviceId) || device;
+      if (isRemoteControlDisabled(latestDevice)) {
+        showErr("设备「" + latestDevice.name + "」已关闭允许远程控制，请先在设备端开启");
         return;
       }
       if (state.activeSession && state.activeSession.active && !isDeviceControlled(device)) {
@@ -2356,51 +2455,93 @@
     });
   }
 
+  function copyTextWithFeedback(text, doneMsg) {
+    var done = function () {
+      toast(doneMsg || "已复制");
+    };
+    var webCopy = function () {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {
+          fallbackCopy(text);
+          done();
+        });
+      } else {
+        fallbackCopy(text);
+        done();
+      }
+    };
+    if (IS_TAURI && Bridge && typeof Bridge.copyText === "function") {
+      Bridge.copyText(text).then(done, webCopy);
+    } else {
+      webCopy();
+    }
+  }
+
   function openDeviceContextMenu(x, y, device) {
     closeDeviceContextMenu();
     if (!IS_TAURI || !device || !device.isMine) return;
     var menu = el("div", "rc-ctx-menu");
     menu.setAttribute("role", "menu");
+    var rcDisabled = isRemoteControlDisabled(device);
 
-    var connBtn = el("button", "rc-ctx-menu__item", "连接桌面");
-    connBtn.type = "button";
-    connBtn.disabled = Boolean(device.isLocal || !device.online);
-    connBtn.addEventListener("click", function () {
-      closeDeviceContextMenu();
-      openSession(false, device);
-    });
+    if (!rcDisabled) {
+      var connBtn = el("button", "rc-ctx-menu__item", "连接桌面");
+      connBtn.type = "button";
+      connBtn.disabled = Boolean(device.isLocal || !device.online);
+      connBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        openSession(false, device);
+      });
 
-    var transferBtn = el("button", "rc-ctx-menu__item", "文件传输");
-    transferBtn.type = "button";
-    transferBtn.disabled = Boolean(device.isLocal || !device.online);
-    transferBtn.addEventListener("click", function () {
-      closeDeviceContextMenu();
-      openTool("transfer", device);
-    });
+      var transferBtn = el("button", "rc-ctx-menu__item", "文件传输");
+      transferBtn.type = "button";
+      transferBtn.disabled = Boolean(device.isLocal || !device.online);
+      transferBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        openTool("transfer", device);
+      });
 
-    var terminalBtn = el("button", "rc-ctx-menu__item", "远程终端");
-    terminalBtn.type = "button";
-    terminalBtn.disabled = Boolean(device.isLocal || !device.online);
-    terminalBtn.addEventListener("click", function () {
-      closeDeviceContextMenu();
-      openTool("terminal", device);
-    });
+      var terminalBtn = el("button", "rc-ctx-menu__item", "远程终端");
+      terminalBtn.type = "button";
+      terminalBtn.disabled = Boolean(device.isLocal || !device.online);
+      terminalBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        openTool("terminal", device);
+      });
 
-    var portmapBtn = el("button", "rc-ctx-menu__item", "端口映射");
-    portmapBtn.type = "button";
-    portmapBtn.disabled = Boolean(device.isLocal || !device.online);
-    portmapBtn.addEventListener("click", function () {
-      closeDeviceContextMenu();
-      openTool("portmap", device);
-    });
+      var portmapBtn = el("button", "rc-ctx-menu__item", "端口映射");
+      portmapBtn.type = "button";
+      portmapBtn.disabled = Boolean(device.isLocal || !device.online);
+      portmapBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        openTool("portmap", device);
+      });
 
-    var updateBtn = el("button", "rc-ctx-menu__item", "检查并更新此设备");
-    updateBtn.type = "button";
-    updateBtn.disabled = Boolean(device.isLocal || !device.online);
-    updateBtn.addEventListener("click", function () {
-      closeDeviceContextMenu();
-      openMainRemoteUpdateModal(device);
-    });
+      var updateBtn = el("button", "rc-ctx-menu__item", "检查并更新此设备");
+      updateBtn.type = "button";
+      updateBtn.disabled = Boolean(device.isLocal || !device.online);
+      updateBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        openMainRemoteUpdateModal(device);
+      });
+
+      menu.appendChild(connBtn);
+      menu.appendChild(transferBtn);
+      menu.appendChild(terminalBtn);
+      menu.appendChild(portmapBtn);
+      menu.appendChild(updateBtn);
+    }
+
+    var codeToCopy = device.formattedId || device.deviceId;
+    if (codeToCopy) {
+      var copyIdBtn = el("button", "rc-ctx-menu__item", "复制设备码");
+      copyIdBtn.type = "button";
+      copyIdBtn.addEventListener("click", function () {
+        closeDeviceContextMenu();
+        copyTextWithFeedback(codeToCopy, "已复制设备码");
+      });
+      menu.appendChild(copyIdBtn);
+    }
 
     var renameBtn = el("button", "rc-ctx-menu__item", "修改备注");
     renameBtn.type = "button";
@@ -2416,11 +2557,6 @@
       openRemoveDeviceModal(device);
     });
 
-    menu.appendChild(connBtn);
-    menu.appendChild(transferBtn);
-    menu.appendChild(terminalBtn);
-    menu.appendChild(portmapBtn);
-    menu.appendChild(updateBtn);
     menu.appendChild(renameBtn);
     menu.appendChild(removeBtn);
     document.body.appendChild(menu);
@@ -2823,7 +2959,8 @@
   }
 
   function buildP3Row(device) {
-    var row = el("div", "p3__row");
+    var rcDisabled = isRemoteControlDisabled(device);
+    var row = el("div", rcDisabled ? "p3__row p3__row--rc-disabled" : "p3__row");
     row.setAttribute("role", "button");
     row.tabIndex = 0;
     row.setAttribute("aria-label", device.name);
@@ -2838,6 +2975,9 @@
     if (device.isLocal) {
       ident.appendChild(el("span", "pill pill--local", "本机"));
     }
+    if (rcDisabled) {
+      ident.appendChild(el("span", "pill pill--warning p3__rc-off-pill", "未开启远控"));
+    }
     if (device.formattedId) {
       ident.appendChild(el("span", "p3__device-id", device.formattedId));
     }
@@ -2849,7 +2989,7 @@
     var actions = el("span", "p3__actions");
 
     if (device.isMine) {
-      if (!device.isLocal && hasDeviceUpdate(device)) {
+      if (!device.isLocal && !rcDisabled && hasDeviceUpdate(device)) {
         var updPill = el("button", "p3__update-pill", "升级 v" + latestRelease.version);
         updPill.type = "button";
         updPill.title = "点击确认后在后台升级此设备";
@@ -2862,7 +3002,12 @@
       if (!device.isLocal) {
         var connectBtn = el("button", "rc-btn rc-btn--secondary p3__action-pill", "连接桌面");
         connectBtn.type = "button";
-        connectBtn.disabled = !device.online;
+        connectBtn.disabled = !device.online || rcDisabled;
+        if (rcDisabled) {
+          connectBtn.title = "请先在该设备端开启「允许远程控制」";
+        } else if (!device.online) {
+          connectBtn.title = "设备当前离线";
+        }
         connectBtn.addEventListener("click", function (e) {
           e.stopPropagation();
           openSession(false, device);
@@ -2908,25 +3053,32 @@
       actions.appendChild(infoBtn);
     }
 
-    var enterBtn = el("button", "rc-btn rc-btn--ghost p3__row-btn");
-    enterBtn.type = "button";
-    enterBtn.setAttribute("aria-label", "进入设备");
-    enterBtn.appendChild(useIcon("chevron-right", 16));
-    enterBtn.addEventListener("click", function (e) {
-      e.stopPropagation();
-      selectDevice(device.id, "p1");
-    });
-    actions.appendChild(enterBtn);
+    if (!rcDisabled) {
+      var enterBtn = el("button", "rc-btn rc-btn--ghost p3__row-btn");
+      enterBtn.type = "button";
+      enterBtn.setAttribute("aria-label", "进入设备");
+      enterBtn.appendChild(useIcon("chevron-right", 16));
+      enterBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        selectDevice(device.id, "p1");
+      });
+      actions.appendChild(enterBtn);
+    }
 
     row.appendChild(actions);
 
-    row.addEventListener("click", function () {
+    var handleRowActivate = function () {
+      if (rcDisabled) {
+        toast("设备「" + device.name + "」未开启允许远程控制，请先在设备端开启");
+        return;
+      }
       selectDevice(device.id, "p1");
-    });
+    };
+    row.addEventListener("click", handleRowActivate);
     row.addEventListener("keydown", function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        selectDevice(device.id, "p1");
+        handleRowActivate();
       }
     });
 
