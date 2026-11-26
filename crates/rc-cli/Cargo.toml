@@ -15,7 +15,6 @@ bench-metrics = [
     "dep:serde_json",
     "dep:rc-net",
     "dep:rc-trace",
-    "dep:rc-client-core",
     "dep:rc-audio",
     "dep:rc-clipboard-macos",
     "dep:rc-encode-vt",
@@ -36,7 +35,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rc-net = { workspace = true, optional = true }
 rc-trace = { workspace = true, optional = true }
-rc-client-core = { workspace = true, optional = true }
+rc-client-core = { workspace = true }
 rc-audio = { workspace = true, optional = true }
 rc-clipboard-macos = { path = "../rc-clipboard-macos", optional = true }
 rc-types = { workspace = true }

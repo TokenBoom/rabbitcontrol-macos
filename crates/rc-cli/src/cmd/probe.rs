@@ -42,6 +42,7 @@ struct ProbeReport {
     decoders: Vec<CodecProbe>,
     platform: &'static str,
     arch: &'static str,
+    core_build_info: rc_client_core::version::CoreBuildInfo,
 }
 
 /// 执行 `probe` 子命令。探测本身不会失败（兜底假后端恒可用）。
@@ -119,6 +120,7 @@ fn probe_backends() -> ProbeReport {
             ],
             platform: platform(),
             arch: arch(),
+            core_build_info: rc_client_core::version::core_build_info(),
         }
     }
 
@@ -135,6 +137,7 @@ fn probe_backends() -> ProbeReport {
             decoders: vec![fake_codec()],
             platform: platform(),
             arch: arch(),
+            core_build_info: rc_client_core::version::core_build_info(),
         }
     }
 }
@@ -221,6 +224,18 @@ fn render_json(report: &ProbeReport) -> String {
     }
     let capture_json = format!("{{ {} }}", capture_fields.join(", "));
 
+    let cbi = &report.core_build_info;
+    let core_build_info_json = format!(
+        "{{ \"coreVersion\": {}, \"gitCommit\": {}, \"buildTimestamp\": {}, \"sessionProtocolVersion\": {}, \"punchVersion\": {}, \"beaconVersion\": {}, \"abiVersion\": {} }}",
+        json_string(cbi.core_version),
+        json_string(cbi.git_commit),
+        json_string(cbi.build_timestamp),
+        cbi.session_protocol_version,
+        cbi.punch_version,
+        cbi.beacon_version,
+        cbi.abi_version,
+    );
+
     format!(
         concat!(
             "{{\n",
@@ -228,7 +243,8 @@ fn render_json(report: &ProbeReport) -> String {
             "  \"encoders\": {encoders},\n",
             "  \"decoders\": {decoders},\n",
             "  \"platform\": {platform},\n",
-            "  \"arch\": {arch}\n",
+            "  \"arch\": {arch},\n",
+            "  \"core_build_info\": {core_build_info}\n",
             "}}"
         ),
         capture = capture_json,
@@ -236,6 +252,7 @@ fn render_json(report: &ProbeReport) -> String {
         decoders = render_codec_array(&report.decoders),
         platform = json_string(report.platform),
         arch = json_string(report.arch),
+        core_build_info = core_build_info_json,
     )
 }
 
@@ -252,6 +269,15 @@ fn render_human(report: &ProbeReport) -> String {
     let mut lines = Vec::new();
     lines.push("RabbitControl 后端探测".to_string());
     lines.push(format!("platform : {} ({})", report.platform, report.arch));
+    lines.push(format!(
+        "core     : {} (commit {}, session_proto={}, punch={}, beacon={}, abi={})",
+        report.core_build_info.core_version,
+        report.core_build_info.git_commit,
+        report.core_build_info.session_protocol_version,
+        report.core_build_info.punch_version,
+        report.core_build_info.beacon_version,
+        report.core_build_info.abi_version,
+    ));
 
     let mut capture_line = format!(
         "capture  : available={}  backend={}",
@@ -361,9 +387,32 @@ mod tests {
                 Some(b't') => self.parse_literal(b"true"),
                 Some(b'f') => self.parse_literal(b"false"),
                 Some(b'n') => self.parse_literal(b"null"),
+                Some(b'0'..=b'9') => self.parse_uint(),
                 other => Err(format!(
                     "unexpected token {:?} at offset {}",
                     other, self.pos
+                )),
+            }
+        }
+
+        fn parse_uint(&mut self) -> Result<(), String> {
+            match self.peek() {
+                Some(b'0') => {
+                    self.pos += 1;
+                    if matches!(self.peek(), Some(b'0'..=b'9')) {
+                        return Err(format!("leading zero in number at offset {}", self.pos));
+                    }
+                    Ok(())
+                }
+                Some(b'1'..=b'9') => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected digit at offset {}, got {:?}",
+                    self.pos, other
                 )),
             }
         }
@@ -525,6 +574,7 @@ mod tests {
             ],
             platform: "macos",
             arch: "aarch64",
+            core_build_info: rc_client_core::version::core_build_info(),
         }
     }
 
@@ -544,6 +594,14 @@ mod tests {
         assert!(json.contains("\"backend\": \"fake-loopback\", \"available\": true"));
         assert!(json.contains("\"platform\": \"macos\""));
         assert!(json.contains("\"arch\": \"aarch64\""));
+        assert!(json.contains("\"core_build_info\":"));
+        assert!(json.contains("\"coreVersion\":"));
+        assert!(json.contains("\"gitCommit\":"));
+        assert!(json.contains("\"buildTimestamp\":"));
+        assert!(json.contains("\"sessionProtocolVersion\":"));
+        assert!(json.contains("\"punchVersion\":"));
+        assert!(json.contains("\"beaconVersion\":"));
+        assert!(json.contains("\"abiVersion\":"));
     }
 
     #[test]
@@ -583,6 +641,7 @@ mod tests {
             }],
             platform: "linux",
             arch: "x86_64",
+            core_build_info: rc_client_core::version::core_build_info(),
         };
         let json = render_json(&report);
         JsonValidator::new(&json)
@@ -594,6 +653,7 @@ mod tests {
         assert!(json.contains("\"backend\": \"fake-loopback\""));
         assert!(json.contains("\"platform\": \"linux\""));
         assert!(json.contains("\"arch\": \"x86_64\""));
+        assert!(json.contains("\"core_build_info\":"));
     }
 
     #[test]
@@ -609,6 +669,7 @@ mod tests {
             decoders: vec![],
             platform: "macos",
             arch: "aarch64",
+            core_build_info: rc_client_core::version::core_build_info(),
         };
         let json = render_json(&report);
         JsonValidator::new(&json)
@@ -626,6 +687,10 @@ mod tests {
         let text = render_human(&report);
 
         assert!(text.contains("platform : macos (aarch64)"));
+        assert!(text.contains(&format!(
+            "core     : {}",
+            report.core_build_info.core_version
+        )));
         assert!(text.contains(
             "capture  : available=no  backend=sck  reason=screen recording permission not granted"
         ));
@@ -644,5 +709,9 @@ mod tests {
             .validate_all()
             .unwrap_or_else(|e| panic!("真实探测生成的 JSON 非法：{e}\n{json}"));
         assert!(json.contains("\"backend\": \"fake-loopback\", \"available\": true"));
+        assert!(json.contains(&format!(
+            "\"coreVersion\": \"{}\"",
+            rc_client_core::version::core_version()
+        )));
     }
 }

@@ -10,11 +10,18 @@ use super::CliResult;
 
 /// 执行 `version` 子命令。
 pub fn run() -> CliResult<ExitCode> {
+    let core = rc_client_core::version::core_build_info();
     println!(
-        "rc-cli {} (commit {}, built {})",
+        "rc-cli {} (commit {}, built {}; core {} commit {} session_proto={} punch={} beacon={} abi={})",
         env!("RC_CLI_VERSION"),
         env!("RC_CLI_GIT_COMMIT"),
         env!("RC_CLI_BUILD_TIME"),
+        core.core_version,
+        core.git_commit,
+        core.session_protocol_version,
+        core.punch_version,
+        core.beacon_version,
+        core.abi_version,
     );
     Ok(ExitCode::SUCCESS)
 }

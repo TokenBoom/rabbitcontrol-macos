@@ -5737,6 +5737,40 @@ pub struct AppVersionInfo {
     pub build: String,
 }
 
+/// Core 统一构建与协议版本元数据 DTO（面向前端 IPC，owned 字段便于序列化与反序列化）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreBuildInfoDto {
+    /// Core 语义化版本号（来自 `rc_client_core::version::core_version()`）。
+    pub core_version: String,
+    /// Core 构建时 Git 短提交哈希。
+    pub git_commit: String,
+    /// Core 构建时间戳。
+    pub build_timestamp: String,
+    /// 会话层控制协议版本号。
+    pub session_protocol_version: u8,
+    /// UDP P2P 打洞协议版本号。
+    pub punch_version: u8,
+    /// 局域网发现信标协议版本号。
+    pub beacon_version: u8,
+    /// Core 对外 ABI 版本号。
+    pub abi_version: u32,
+}
+
+impl From<rc_client_core::version::CoreBuildInfo> for CoreBuildInfoDto {
+    fn from(info: rc_client_core::version::CoreBuildInfo) -> Self {
+        Self {
+            core_version: info.core_version.to_string(),
+            git_commit: info.git_commit.to_string(),
+            build_timestamp: info.build_timestamp.to_string(),
+            session_protocol_version: info.session_protocol_version,
+            punch_version: info.punch_version,
+            beacon_version: info.beacon_version,
+            abi_version: info.abi_version,
+        }
+    }
+}
+
 /// 返回给前端「关于」弹窗的应用元信息（IPC `camelCase`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5757,6 +5791,12 @@ pub struct AppInfo {
     pub license: String,
     /// 应用简介。
     pub description: String,
+    /// Core 语义化版本号（来自 `rc_client_core::version::core_version()`）。
+    #[serde(default)]
+    pub core_version: String,
+    /// Core 完整构建与协议版本元数据（来自 `rc_client_core::version::core_build_info()`）。
+    #[serde(default)]
+    pub core_build_info: Option<CoreBuildInfoDto>,
 }
 
 fn normalize_version_candidate(raw: &str) -> String {
@@ -5861,6 +5901,7 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "低延迟远程桌面控制软件".to_string());
 
+    let core_info = rc_client_core::version::core_build_info();
     AppInfo {
         name: pkg_info.name.clone(),
         version: ver.version,
@@ -5870,6 +5911,8 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
         arch: std::env::consts::ARCH.to_string(),
         license: env!("CARGO_PKG_LICENSE").to_string(),
         description,
+        core_version: core_info.core_version.to_string(),
+        core_build_info: Some(CoreBuildInfoDto::from(core_info)),
     }
 }
 
@@ -9098,6 +9141,80 @@ mod tests {
                 build: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn app_info_exposes_core_version_and_build_info_without_breaking_legacy_json() {
+        let core_info = rc_client_core::version::core_build_info();
+        let app_info = AppInfo {
+            name: "RabbitControl".to_string(),
+            version: "0.1.13".to_string(),
+            build: "abc1234".to_string(),
+            bundle_id: "com.rabbitcontrol.dev".to_string(),
+            os: "macOS".to_string(),
+            arch: "aarch64".to_string(),
+            license: "AGPL-3.0-only".to_string(),
+            description: "低延迟远程桌面控制软件".to_string(),
+            core_version: core_info.core_version.to_string(),
+            core_build_info: Some(CoreBuildInfoDto::from(core_info.clone())),
+        };
+
+        let val = serde_json::to_value(&app_info).expect("serialize AppInfo");
+        assert_eq!(
+            val.get("coreVersion").and_then(|v| v.as_str()),
+            Some(rc_client_core::version::core_version())
+        );
+        assert_eq!(
+            val.get("coreVersion").and_then(|v| v.as_str()),
+            Some("0.1.26")
+        );
+        let cbi = val
+            .get("coreBuildInfo")
+            .and_then(|v| v.as_object())
+            .expect("coreBuildInfo object");
+        assert_eq!(
+            cbi.get("coreVersion").and_then(|v| v.as_str()),
+            Some(core_info.core_version)
+        );
+        assert_eq!(
+            cbi.get("gitCommit").and_then(|v| v.as_str()),
+            Some(core_info.git_commit)
+        );
+        assert_eq!(
+            cbi.get("buildTimestamp").and_then(|v| v.as_str()),
+            Some(core_info.build_timestamp)
+        );
+        assert_eq!(
+            cbi.get("sessionProtocolVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(core_info.session_protocol_version))
+        );
+        assert_eq!(
+            cbi.get("punchVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(core_info.punch_version))
+        );
+        assert_eq!(
+            cbi.get("beaconVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(core_info.beacon_version))
+        );
+        assert_eq!(
+            cbi.get("abiVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(core_info.abi_version))
+        );
+
+        // 旧版 JSON 不含 coreVersion / coreBuildInfo 时仍可零破坏反序列化。
+        let legacy = serde_json::json!({
+            "name": "RabbitControl",
+            "version": "0.1.12",
+            "build": "",
+            "bundleId": "com.rabbitcontrol.dev",
+            "os": "macOS",
+            "arch": "aarch64",
+            "license": "AGPL-3.0-only",
+            "description": "低延迟远程桌面控制软件"
+        });
+        let parsed: AppInfo = serde_json::from_value(legacy).expect("deserialize legacy AppInfo");
+        assert_eq!(parsed.core_version, "");
+        assert_eq!(parsed.core_build_info, None);
     }
 
     #[test]

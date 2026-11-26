@@ -106,7 +106,11 @@ fn probe_json_is_valid() {
         .stdout(predicate::str::contains("\"backend\": \"fake-loopback\""))
         .stdout(predicate::str::contains("\"available\": true"))
         .stdout(predicate::str::contains("\"platform\":"))
-        .stdout(predicate::str::contains("\"arch\":"));
+        .stdout(predicate::str::contains("\"arch\":"))
+        .stdout(predicate::str::contains("\"core_build_info\":"))
+        .stdout(predicate::str::contains("\"coreVersion\": \"0.1.26\""))
+        .stdout(predicate::str::contains("\"sessionProtocolVersion\":"))
+        .stdout(predicate::str::contains("\"abiVersion\":"));
 }
 
 /// macOS 真实探测：probe --json 报告 SCK 权限明细、VideoToolbox 条目与 fake-loopback 兜底；
