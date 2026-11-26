@@ -3033,6 +3033,16 @@ fn map_my_device_entry(info: MyDeviceInfo, local_device_id: Option<&str>) -> MyD
     }
 }
 
+/// 对「我的设备」列表排序：在线设备置顶、离线设备沉底，
+/// 同在线状态下本机置前并保留服务端返回的 `last_seen_at DESC, device_id ASC` 相对顺序。
+fn sort_my_device_entries(entries: &mut [MyDeviceEntry]) {
+    entries.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| b.is_local.cmp(&a.is_local))
+    });
+}
+
 fn sync_access_token_via_daemon_inner(
     auth: &AuthSessionManager,
     failed_token: Option<&str>,
@@ -3741,10 +3751,12 @@ pub async fn list_my_devices(app: AppHandle) -> Result<Vec<MyDeviceEntry>, Strin
         let list = with_valid_token_in_app(&app_for_blocking, &state, |client, token| {
             client.list_my_devices(token)
         })?;
-        Ok(list
+        let mut entries: Vec<MyDeviceEntry> = list
             .into_iter()
             .map(|d| map_my_device_entry(d, local_did.as_deref()))
-            .collect())
+            .collect();
+        sort_my_device_entries(&mut entries);
+        Ok(entries)
     })
     .await
     .map_err(|e| format!("拉取我的设备列表任务异常：{e}"))?
@@ -7720,6 +7732,52 @@ mod tests {
         );
 
         let _ = stop_host_service_with_cancelled(&state, true);
+    }
+
+    #[test]
+    fn sort_my_device_entries_places_online_above_offline() {
+        let make = |id: &str, online: bool, is_local: bool| MyDeviceEntry {
+            device_id: id.to_string(),
+            formatted_id: id.to_string(),
+            hostname: id.to_string(),
+            os: "macos".to_string(),
+            app_version: "0.1.11".to_string(),
+            arch: "arm64".to_string(),
+            alias: String::new(),
+            display_name: id.to_string(),
+            allow_remote_assist: false,
+            allow_remote_control: true,
+            disabled: false,
+            online,
+            in_session: false,
+            is_local,
+            bound_at: None,
+            last_seen_at: None,
+        };
+
+        let mut entries = vec![
+            make("offline-recent", false, false),
+            make("online-remote-1", true, false),
+            make("offline-local", false, true),
+            make("online-local", true, true),
+            make("offline-older", false, false),
+            make("online-remote-2", true, false),
+        ];
+
+        sort_my_device_entries(&mut entries);
+
+        let ids: Vec<&str> = entries.iter().map(|d| d.device_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "online-local",
+                "online-remote-1",
+                "online-remote-2",
+                "offline-local",
+                "offline-recent",
+                "offline-older",
+            ]
+        );
     }
 
     #[test]

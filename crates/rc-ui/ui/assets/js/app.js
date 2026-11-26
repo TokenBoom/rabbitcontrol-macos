@@ -207,6 +207,31 @@
     return false;
   }
 
+  function parseDeviceTimestamp(ts) {
+    if (!ts) return 0;
+    var parsed = Date.parse(ts);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function compareMyDevices(a, b) {
+    var onlineDiff = (b && b.online ? 1 : 0) - (a && a.online ? 1 : 0);
+    if (onlineDiff !== 0) return onlineDiff;
+    var localDiff = (b && b.isLocal ? 1 : 0) - (a && a.isLocal ? 1 : 0);
+    if (localDiff !== 0) return localDiff;
+    var tsDiff = parseDeviceTimestamp(b && b.lastSeenAt) - parseDeviceTimestamp(a && a.lastSeenAt);
+    if (tsDiff !== 0) return tsDiff;
+    var idA = String((a && a.deviceId) || "");
+    var idB = String((b && b.deviceId) || "");
+    if (idA < idB) return -1;
+    if (idA > idB) return 1;
+    return 0;
+  }
+
+  function sortMyDevices(list) {
+    if (!Array.isArray(list)) return [];
+    return list.sort(compareMyDevices);
+  }
+
   function normalizeMyDevice(raw) {
     var did = String((raw && (raw.deviceId || raw.device_id)) || "");
     var formattedId = String((raw && (raw.formattedId || raw.formatted_id)) || formatDeviceId(did));
@@ -243,6 +268,7 @@
       isLocal: Boolean(raw && (raw.isLocal || raw.is_local)),
       allowRemoteAssist: Boolean(raw && (raw.allowRemoteAssist || raw.allow_remote_assist)),
       allowRemoteControl: allowRemoteControl,
+      lastSeenAt: String((raw && (raw.lastSeenAt || raw.last_seen_at)) || ""),
       isMine: true
     };
   }
@@ -1737,7 +1763,7 @@
 
   function applyMyDevices(list) {
     var rawList = Array.isArray(list) ? list : [];
-    state.myDevices = rawList.map(normalizeMyDevice);
+    state.myDevices = sortMyDevices(rawList.map(normalizeMyDevice));
     if (IS_TAURI) {
       var curExists = state.myDevices.some(function (d) {
         return d.id === state.deviceId && canShowInSidebar(d);
@@ -1776,7 +1802,10 @@
       var d = state.myDevices[i];
       if (d.id === did) {
         prevAllowRc = Boolean(d.allowRemoteControl);
-        if (typeof ev.online === "boolean") d.online = ev.online;
+        if (typeof ev.online === "boolean") {
+          d.online = ev.online;
+          if (!ev.online) d.inSession = false;
+        }
         if (typeof ev.hostname === "string" && ev.hostname) d.hostname = ev.hostname;
         if (typeof ev.alias === "string") d.alias = ev.alias;
         if (typeof ev.os === "string" && ev.os) {
@@ -1813,6 +1842,7 @@
       refreshMyDevices();
       return;
     }
+    sortMyDevices(state.myDevices);
     if (
       updatedDevice &&
       !updatedDevice.isLocal &&
