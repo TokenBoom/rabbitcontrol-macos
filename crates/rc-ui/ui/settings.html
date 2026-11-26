@@ -283,7 +283,23 @@
           </div>
         </section>
 
-        <!-- G2 说明 -->
+        <!-- G2 自动更新镜像加速 -->
+        <section class="rc-group" aria-label="自动更新下载镜像">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-update-mirror">更新镜像加速前缀</div>
+              <div class="rc-setting-row__desc">可选填 HTTPS 镜像前缀（如 https://gh-proxy.com/），留空则直连 GitHub Releases；弱网时远程更新支持控制端中转推送。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <input type="text" class="rc-input rc-input--host" id="opt-update-mirror"
+                     aria-labelledby="row-update-mirror" placeholder="留空直连 GitHub"
+                     autocomplete="off" spellcheck="false" />
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-update-mirror-save">保存镜像</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- G3 说明 -->
         <section class="rc-group" aria-label="说明">
           <div class="rc-setting-row rc-setting-row--note">
             <div class="rc-setting-row__main">
@@ -1045,6 +1061,45 @@
           }
         });
       });
+
+      /* ── 自动更新镜像加速前缀配置 ───────────────────────────── */
+      var optUpdateMirror = document.getElementById("opt-update-mirror");
+      var btnUpdateMirrorSave = document.getElementById("btn-update-mirror-save");
+      if (optUpdateMirror && btnUpdateMirrorSave) {
+        if (IS_TAURI && typeof Bridge.getUpdateMirrorUrl === "function") {
+          Bridge.getUpdateMirrorUrl()
+            .then(function (url) {
+              if (typeof url === "string") optUpdateMirror.value = url;
+            })
+            .catch(function () {});
+        }
+        btnUpdateMirrorSave.addEventListener("click", function () {
+          var raw = optUpdateMirror.value.trim();
+          if (!IS_TAURI || typeof Bridge.saveUpdateMirrorUrl !== "function") {
+            toast("已保存更新镜像配置（浏览器预览模式）");
+            return;
+          }
+          btnUpdateMirrorSave.disabled = true;
+          Bridge.saveUpdateMirrorUrl(raw)
+            .then(function (saved) {
+              optUpdateMirror.value = typeof saved === "string" ? saved : raw;
+              toast(optUpdateMirror.value ? "已保存更新镜像加速前缀" : "已清除镜像，将直连 GitHub");
+            })
+            .catch(function (err) {
+              toast("保存镜像失败：" + String(err));
+            })
+            .then(function () {
+              btnUpdateMirrorSave.disabled = false;
+            });
+        });
+        optUpdateMirror.addEventListener("keydown", function (e) {
+          if (e.isComposing || e.keyCode === 229) return;
+          if (e.key === "Enter") {
+            e.preventDefault();
+            btnUpdateMirrorSave.click();
+          }
+        });
+      }
 
       /* ── Toast 占位交互（修改路径 / 打开文件夹）────────────── */
       Array.prototype.forEach.call(document.querySelectorAll("[data-toast]"), function (btn) {

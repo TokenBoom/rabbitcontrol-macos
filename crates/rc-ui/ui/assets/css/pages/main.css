@@ -2304,3 +2304,133 @@ body.is-tauri .p2__body.is-disabled .p2__verify-col {
   background: transparent;
   color: var(--text-disabled);
 }
+
+/* ────────────────────────────────────────────────────────────────
+ * 9. 设备版本标签、主窗可升级按钮与远程更新进度模态框
+ * ──────────────────────────────────────────────────────────────── */
+.p3__version,
+.titlebar__version {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--size-caption);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.titlebar__update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--bg-tool-tile-stroke);
+  border-radius: var(--r-pill);
+  background: var(--local-pill-bg);
+  color: var(--accent);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar__update-btn:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+
+.p3__update-pill {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--bg-tool-tile-stroke);
+  border-radius: var(--r-control);
+  background: var(--local-pill-bg);
+  color: var(--accent);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.p3__update-pill:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+
+.rc-modal__ver-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 10px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--local-pill-bg);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-semibold);
+}
+
+.rc-modal__notes {
+  max-height: 150px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--stroke-soft);
+  border-radius: var(--r-control);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-caption);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rc-modal__progress {
+  margin: 10px 0 8px;
+}
+
+.rc-modal__bar-track {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: var(--r-pill);
+  background: var(--bg-hover);
+}
+
+.rc-modal__bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  transition: width var(--dur-fast) var(--ease-out);
+}
+
+.rc-modal__progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.rc-modal__error {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--r-control);
+  background: var(--warning-bg);
+  color: var(--danger);
+  font-size: var(--size-caption);
+  line-height: 1.45;
+  word-break: break-word;
+}

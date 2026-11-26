@@ -222,6 +222,31 @@
     var moreEl = document.getElementById('more-menu');
     var moreItem = document.getElementById('menu-more');
     var showHudBtn = document.getElementById('opt-show-hud');
+    var btnRemoteUpdate = document.getElementById('btn-remote-update');
+    var menuRemoteUpdateSep = document.getElementById('menu-remote-update-sep');
+    var btnMenuRemoteUpdate = document.getElementById('btn-menu-remote-update');
+    var menuRemoteUpdateLabel = document.getElementById('menu-remote-update-label');
+    var remoteUpdateModalBackdrop = document.getElementById('remote-update-modal-backdrop');
+    var remoteUpdateCloseBtn = document.getElementById('btn-remote-update-close');
+    var remoteUpdateVerPill = document.getElementById('remote-update-ver-pill');
+    var remoteUpdateArch = document.getElementById('remote-update-arch');
+    var remoteUpdateDesc = document.getElementById('remote-update-desc');
+    var remoteUpdateNotes = document.getElementById('remote-update-notes');
+    var remoteUpdateProgress = document.getElementById('remote-update-progress');
+    var remoteUpdateBarFill = document.getElementById('remote-update-bar-fill');
+    var remoteUpdateStage = document.getElementById('remote-update-stage');
+    var remoteUpdateBytes = document.getElementById('remote-update-bytes');
+    var remoteUpdateError = document.getElementById('remote-update-error');
+    var remoteUpdateCancelBtn = document.getElementById('btn-remote-update-cancel');
+    var remoteUpdateConfirmBtn = document.getElementById('btn-remote-update-confirm');
+    var remoteUpdateState = {
+      hostVersion: null,
+      latestRelease: null,
+      inProgress: false,
+      stage: 'idle',
+      targetVersion: '',
+      lastError: ''
+    };
     var relayEl = document.getElementById('opt-relay');
     var clipboardItem = document.getElementById('menu-clipboard');
     var clipboardStateEl = document.getElementById('menu-clipboard-state');
@@ -1500,7 +1525,308 @@
       if (privacyModalBackdrop && !privacyModalBackdrop.hidden) return true;
       if (privacyPreviewOverlay && !privacyPreviewOverlay.hidden) return true;
       if (shortcutsModalBackdrop && !shortcutsModalBackdrop.hidden) return true;
+      if (remoteUpdateModalBackdrop && !remoteUpdateModalBackdrop.hidden) return true;
       return false;
+    }
+
+    /* ── S1 远程升级被控端（A1 + A3：严格仅本人自控可见 + 弹窗显式确认）── */
+    function parseSemverParts(raw) {
+      var clean = String(raw || '').trim().replace(/^[vV]/, '').split('-')[0].split('+')[0];
+      var parts = clean.split('.');
+      if (parts.length < 2 || parts.length > 3) return null;
+      var nums = [];
+      for (var i = 0; i < 3; i++) {
+        var seg = parts[i] === undefined ? '0' : parts[i];
+        if (!/^\d+$/.test(seg)) return null;
+        nums.push(parseInt(seg, 10));
+      }
+      return nums;
+    }
+
+    function isNewerSemver(candidate, current) {
+      var a = parseSemverParts(candidate);
+      var b = parseSemverParts(current);
+      if (!a || !b) return false;
+      for (var i = 0; i < 3; i++) {
+        if (a[i] !== b[i]) return a[i] > b[i];
+      }
+      return false;
+    }
+
+    function formatUpdateBytes(bytes) {
+      var n = Number(bytes || 0);
+      if (!isFinite(n) || n <= 0) return '0 B';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    var postRestartVerifyTimer = 0;
+
+    function cancelPostRestartVerifyTimer() {
+      if (postRestartVerifyTimer) {
+        window.clearTimeout(postRestartVerifyTimer);
+        postRestartVerifyTimer = 0;
+      }
+    }
+
+    function syncRemoteUpdateUi() {
+      var hv = remoteUpdateState.hostVersion;
+      var rel = remoteUpdateState.latestRelease;
+      var targetVer = (rel && rel.version) || remoteUpdateState.targetVersion || '';
+      /* 安全红线（A3）：非本人自控会话严禁展示任何升级图标与入口 */
+      var isOwnerCapable = Boolean(hv && hv.isOwnerSession === true && hv.updateCapable === true);
+      var hasNewer = Boolean(isOwnerCapable && rel && rel.version && isNewerSemver(rel.version, hv.version));
+      var visible = isOwnerCapable && (hasNewer || remoteUpdateState.inProgress);
+
+      if (btnRemoteUpdate) {
+        btnRemoteUpdate.hidden = !visible;
+        if (visible && targetVer) {
+          btnRemoteUpdate.title = remoteUpdateState.inProgress
+            ? '被控端正在升级至 v' + targetVer
+            : '被控端可升级至 v' + targetVer + '（当前 v' + hv.version + '），点击确认升级';
+        }
+      }
+      if (menuRemoteUpdateSep) menuRemoteUpdateSep.hidden = !visible;
+      if (btnMenuRemoteUpdate) btnMenuRemoteUpdate.hidden = !visible;
+      if (menuRemoteUpdateLabel && targetVer) {
+        menuRemoteUpdateLabel.textContent = remoteUpdateState.inProgress
+          ? '正在升级被控端…'
+          : '升级被控端至 v' + targetVer;
+      }
+      var awaitingPostRestartHostVersion =
+        remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting' && !hv;
+      if (
+        !isOwnerCapable &&
+        remoteUpdateModalBackdrop &&
+        !remoteUpdateModalBackdrop.hidden &&
+        !awaitingPostRestartHostVersion
+      ) {
+        remoteUpdateModalBackdrop.hidden = true;
+      }
+    }
+
+    function closeRemoteUpdateModal() {
+      if (!remoteUpdateModalBackdrop) return;
+      if (remoteUpdateState.stage === 'installing') return;
+      if (!remoteUpdateState.inProgress) {
+        remoteUpdateState.lastError = '';
+      }
+      remoteUpdateModalBackdrop.hidden = true;
+    }
+
+    function openRemoteUpdateModal() {
+      if (!remoteUpdateModalBackdrop) return;
+      var hv = remoteUpdateState.hostVersion;
+      var rel = remoteUpdateState.latestRelease;
+      var targetVer = (rel && rel.version) || remoteUpdateState.targetVersion || '';
+      if (
+        !hv ||
+        hv.isOwnerSession !== true ||
+        !hv.updateCapable ||
+        !targetVer ||
+        (!rel && !remoteUpdateState.inProgress)
+      ) {
+        return;
+      }
+      closeAllPopovers();
+      if (remoteUpdateVerPill) {
+        remoteUpdateVerPill.textContent = 'v' + hv.version + ' → v' + targetVer;
+      }
+      if (remoteUpdateArch) {
+        remoteUpdateArch.textContent = (hv.os || 'macos') + ' · ' + (hv.arch || '');
+      }
+      if (remoteUpdateDesc) {
+        remoteUpdateDesc.textContent = hv.serviceInstalled
+          ? '升级期间被控端将下载并校验官方签名包，安装完成后会自动重启后台服务并无缝恢复当前远控连接。若被控端直连下载失败，将自动由本机中转推送安装包。'
+          : '升级期间被控端将下载并校验官方签名包，安装完成后会自动重启并尝试恢复连接（若应用目录无写权限，需先在被控端安装系统级后台服务）。';
+      }
+      if (remoteUpdateNotes) {
+        if (rel && rel.notes && String(rel.notes).trim()) {
+          remoteUpdateNotes.hidden = false;
+          remoteUpdateNotes.textContent = String(rel.notes).trim();
+        } else {
+          remoteUpdateNotes.hidden = true;
+        }
+      }
+      if (!rel && IS_TAURI && typeof Bridge.getCachedRelease === 'function') {
+        Bridge.getCachedRelease()
+          .then(function (cached) {
+            if (cached && cached.version) {
+              remoteUpdateState.latestRelease = cached;
+              if (remoteUpdateNotes && cached.notes && String(cached.notes).trim()) {
+                remoteUpdateNotes.hidden = false;
+                remoteUpdateNotes.textContent = String(cached.notes).trim();
+              }
+              syncRemoteUpdateUi();
+            }
+          })
+          .catch(function () {});
+      }
+      if (!remoteUpdateState.inProgress) {
+        if (remoteUpdateProgress) remoteUpdateProgress.hidden = true;
+        if (remoteUpdateError) {
+          if (remoteUpdateState.lastError) {
+            remoteUpdateError.hidden = false;
+            remoteUpdateError.textContent = remoteUpdateState.lastError;
+          } else {
+            remoteUpdateError.hidden = true;
+          }
+        }
+        if (remoteUpdateConfirmBtn) {
+          remoteUpdateConfirmBtn.hidden = false;
+          remoteUpdateConfirmBtn.disabled = false;
+          remoteUpdateConfirmBtn.textContent = remoteUpdateState.lastError ? '重试升级' : '确认升级';
+        }
+        if (remoteUpdateCancelBtn) {
+          remoteUpdateCancelBtn.disabled = false;
+          remoteUpdateCancelBtn.textContent = remoteUpdateState.lastError ? '关闭' : '取消';
+        }
+      }
+      remoteUpdateModalBackdrop.hidden = false;
+    }
+
+    function applyRemoteUpdateStatus(data) {
+      if (!data || typeof data !== 'object') return;
+      var st = String(data.stage || '');
+      remoteUpdateState.stage = st;
+      if (data.targetVersion) {
+        remoteUpdateState.targetVersion = String(data.targetVersion);
+      }
+      var pct = Math.max(0, Math.min(100, Number(data.progressPct || 0)));
+
+      if (remoteUpdateProgress) remoteUpdateProgress.hidden = false;
+      if (remoteUpdateBarFill) remoteUpdateBarFill.style.width = pct + '%';
+      if (remoteUpdateStage) {
+        remoteUpdateStage.textContent = String(data.message || '正在升级被控端…');
+      }
+      if (remoteUpdateBytes) {
+        if (data.totalBytes && Number(data.totalBytes) > 0) {
+          remoteUpdateBytes.textContent =
+            formatUpdateBytes(data.downloadedBytes) +
+            ' / ' +
+            formatUpdateBytes(data.totalBytes) +
+            ' (' +
+            pct +
+            '%)';
+        } else if (pct > 0) {
+          remoteUpdateBytes.textContent = pct + '%';
+        } else {
+          remoteUpdateBytes.textContent = '';
+        }
+      }
+
+      if (st === 'downloading' || st === 'relaying' || st === 'verifying') {
+        remoteUpdateState.inProgress = true;
+        remoteUpdateState.lastError = '';
+        if (remoteUpdateError) remoteUpdateError.hidden = true;
+        if (remoteUpdateConfirmBtn) {
+          remoteUpdateConfirmBtn.disabled = true;
+          remoteUpdateConfirmBtn.textContent = st === 'relaying' ? '中转推送中…' : '升级中…';
+        }
+        if (remoteUpdateCancelBtn) {
+          remoteUpdateCancelBtn.disabled = false;
+          remoteUpdateCancelBtn.textContent = '取消升级';
+        }
+      } else if (st === 'installing' || st === 'restarting') {
+        remoteUpdateState.inProgress = true;
+        remoteUpdateState.lastError = '';
+        if (remoteUpdateError) remoteUpdateError.hidden = true;
+        if (remoteUpdateConfirmBtn) {
+          remoteUpdateConfirmBtn.disabled = true;
+          remoteUpdateConfirmBtn.textContent = st === 'restarting' ? '等待重连…' : '安装中…';
+        }
+        if (remoteUpdateCancelBtn) {
+          remoteUpdateCancelBtn.disabled = st === 'installing';
+          remoteUpdateCancelBtn.textContent = st === 'restarting' ? '隐藏窗口' : '安装中…';
+        }
+        if (st === 'restarting') {
+          toast('被控端已完成安装，正在重启并自动重连…');
+        }
+      } else if (st === 'failed') {
+        var errMsg = String(data.error || data.message || '被控端升级失败');
+        remoteUpdateState.inProgress = false;
+        remoteUpdateState.lastError = errMsg;
+        if (remoteUpdateError) {
+          remoteUpdateError.hidden = false;
+          remoteUpdateError.textContent = errMsg;
+        }
+        if (remoteUpdateModalBackdrop && remoteUpdateModalBackdrop.hidden) {
+          toast('被控端升级失败：' + errMsg);
+        }
+        if (remoteUpdateConfirmBtn) {
+          remoteUpdateConfirmBtn.hidden = false;
+          remoteUpdateConfirmBtn.disabled = false;
+          remoteUpdateConfirmBtn.textContent = '重试升级';
+        }
+        if (remoteUpdateCancelBtn) {
+          remoteUpdateCancelBtn.disabled = false;
+          remoteUpdateCancelBtn.textContent = '关闭';
+        }
+      }
+      syncRemoteUpdateUi();
+    }
+
+    if (btnRemoteUpdate) {
+      btnRemoteUpdate.addEventListener('click', function () {
+        openRemoteUpdateModal();
+      });
+    }
+    if (btnMenuRemoteUpdate) {
+      btnMenuRemoteUpdate.addEventListener('click', function () {
+        openRemoteUpdateModal();
+      });
+    }
+    if (remoteUpdateCloseBtn) {
+      remoteUpdateCloseBtn.addEventListener('click', closeRemoteUpdateModal);
+    }
+    if (remoteUpdateCancelBtn) {
+      remoteUpdateCancelBtn.addEventListener('click', function () {
+        if (
+          remoteUpdateState.inProgress &&
+          remoteUpdateState.stage !== 'restarting' &&
+          remoteUpdateState.stage !== 'installing' &&
+          Bridge &&
+          typeof Bridge.cancelRemoteUpdate === 'function'
+        ) {
+          remoteUpdateCancelBtn.disabled = true;
+          Bridge.cancelRemoteUpdate().catch(function () {});
+          remoteUpdateState.inProgress = false;
+          remoteUpdateState.stage = 'idle';
+          syncRemoteUpdateUi();
+        }
+        closeRemoteUpdateModal();
+      });
+    }
+    if (remoteUpdateConfirmBtn) {
+      remoteUpdateConfirmBtn.addEventListener('click', function () {
+        var rel = remoteUpdateState.latestRelease;
+        if (!Bridge || typeof Bridge.triggerRemoteUpdate !== 'function' || !rel || !rel.version) {
+          return;
+        }
+        remoteUpdateState.inProgress = true;
+        remoteUpdateState.stage = 'downloading';
+        remoteUpdateState.targetVersion = String(rel.version);
+        remoteUpdateState.lastError = '';
+        if (remoteUpdateError) remoteUpdateError.hidden = true;
+        if (remoteUpdateProgress) remoteUpdateProgress.hidden = false;
+        if (remoteUpdateBarFill) remoteUpdateBarFill.style.width = '0%';
+        if (remoteUpdateStage) remoteUpdateStage.textContent = '正在下发升级指令至被控端…';
+        if (remoteUpdateBytes) remoteUpdateBytes.textContent = '';
+        remoteUpdateConfirmBtn.disabled = true;
+        remoteUpdateConfirmBtn.textContent = '升级中…';
+        if (remoteUpdateCancelBtn) remoteUpdateCancelBtn.textContent = '取消升级';
+        syncRemoteUpdateUi();
+
+        Bridge.triggerRemoteUpdate(rel.version).catch(function (err) {
+          applyRemoteUpdateStatus({
+            stage: 'failed',
+            progressPct: 0,
+            message: String(err || '触发远程更新失败'),
+            error: String(err || '触发远程更新失败')
+          });
+        });
+      });
     }
 
     /* 「需关注」判定：仅当 防窥模式=关闭 且 自动锁屏=关 时才显示 */
@@ -3047,6 +3373,12 @@
           closeShortcutsModal();
           return;
         }
+        if (remoteUpdateModalBackdrop && !remoteUpdateModalBackdrop.hidden) {
+          e.preventDefault();
+          swallowEscapeKeyup = true;
+          closeRemoteUpdateModal();
+          return;
+        }
         /* Esc 仅在有打开的菜单/气泡时逐级关闭并吞掉按压与抬起事件；否则透传给被控端 */
         if (activeNestedEl && !activeNestedEl.hidden) {
           e.preventDefault();
@@ -3254,6 +3586,16 @@
         streamState.presets = DEFAULT_MOCK_PRESETS.slice();
         syncCodecMenuUi();
         renderAllResolutionLists();
+        remoteUpdateState.hostVersion = null;
+        if (!sessionSwitchingPending) {
+          cancelPostRestartVerifyTimer();
+          remoteUpdateState.inProgress = false;
+          remoteUpdateState.stage = 'idle';
+          remoteUpdateState.targetVersion = '';
+          remoteUpdateState.lastError = '';
+          if (remoteUpdateModalBackdrop) remoteUpdateModalBackdrop.hidden = true;
+        }
+        syncRemoteUpdateUi();
       }
 
       function handleSessionUpdate(upd) {
@@ -3290,6 +3632,29 @@
           sessionSwitchingPending = false;
           sessionSwitchAttempts = 0;
           cancelSessionSwitchTimer();
+          if (
+            remoteUpdateState.inProgress &&
+            remoteUpdateState.stage === 'restarting' &&
+            !remoteUpdateState.hostVersion
+          ) {
+            cancelPostRestartVerifyTimer();
+            postRestartVerifyTimer = window.setTimeout(function () {
+              postRestartVerifyTimer = 0;
+              if (
+                remoteUpdateState.inProgress &&
+                remoteUpdateState.stage === 'restarting' &&
+                !remoteUpdateState.hostVersion
+              ) {
+                remoteUpdateState.inProgress = false;
+                remoteUpdateState.stage = 'idle';
+                remoteUpdateState.targetVersion = '';
+                remoteUpdateState.lastError = '';
+                if (remoteUpdateModalBackdrop) remoteUpdateModalBackdrop.hidden = true;
+                syncRemoteUpdateUi();
+              }
+            }, 8000);
+          }
+          syncRemoteUpdateUi();
           seenNegotiated = true;
           cancelEndedCloseTimer();
           stopLocalTicker();
@@ -3375,6 +3740,61 @@
         }
         if (upd.kind === 'virtual_display_error') {
           toast('虚拟屏操作失败：' + String(data.message || '系统不支持或权限不足'));
+          return;
+        }
+        if (upd.kind === 'host_version') {
+          cancelPostRestartVerifyTimer();
+          remoteUpdateState.hostVersion = data;
+          if (remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting') {
+            if (!data || data.isOwnerSession !== true) {
+              remoteUpdateState.inProgress = false;
+              remoteUpdateState.stage = 'idle';
+              remoteUpdateState.targetVersion = '';
+              remoteUpdateState.lastError = '';
+              if (remoteUpdateModalBackdrop) remoteUpdateModalBackdrop.hidden = true;
+              syncRemoteUpdateUi();
+              return;
+            }
+            if (data.version) {
+              var expectedTarget =
+                remoteUpdateState.targetVersion ||
+                (remoteUpdateState.latestRelease && remoteUpdateState.latestRelease.version) ||
+                '';
+              if (expectedTarget && !isNewerSemver(expectedTarget, data.version)) {
+                remoteUpdateState.inProgress = false;
+                remoteUpdateState.stage = 'succeeded';
+                remoteUpdateState.lastError = '';
+                closeRemoteUpdateModal();
+                toast('被控端已成功升级至 v' + data.version);
+              } else if (expectedTarget) {
+                var staleMsg =
+                  '被控端重连后仍为旧版本 v' +
+                  data.version +
+                  '（目标 v' +
+                  expectedTarget +
+                  '），升级未生效，可重试';
+                applyRemoteUpdateStatus({
+                  stage: 'failed',
+                  progressPct: 0,
+                  message: staleMsg,
+                  error: staleMsg
+                });
+                return;
+              } else {
+                remoteUpdateState.inProgress = false;
+                remoteUpdateState.stage = 'idle';
+                remoteUpdateState.lastError = '';
+                closeRemoteUpdateModal();
+              }
+            }
+          }
+          syncRemoteUpdateUi();
+          return;
+        }
+        if (upd.kind === 'remote_update_status') {
+          if (remoteUpdateState.hostVersion && remoteUpdateState.hostVersion.isOwnerSession === true) {
+            applyRemoteUpdateStatus(data);
+          }
           return;
         }
         if (upd.kind === 'display_config') {
@@ -3543,11 +3963,16 @@
             cancelSessionSwitchTimer();
           } else if (
             (sessionSwitchingPending ||
+              (remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting') ||
               (typeof reason === 'string' && reason.indexOf('正在切换系统桌面') !== -1)) &&
             typeof Bridge.reconnectLastSession === 'function'
           ) {
             sessionSwitchingPending = true;
-            toast(reason);
+            toast(
+              remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting'
+                ? '被控端正在重启升级，自动重连中…'
+                : reason
+            );
             scheduleSessionSwitchRetry();
             return;
           }
@@ -3578,6 +4003,35 @@
         Bridge.sessionSnapshot()
           .then(function (snap) {
             if (snap) handleSessionUpdate(snap);
+          })
+          .catch(function () {});
+      }
+      if (typeof Bridge.getSessionHostVersion === 'function') {
+        Bridge.getSessionHostVersion()
+          .then(function (hv) {
+            if (hv) {
+              remoteUpdateState.hostVersion = hv;
+              syncRemoteUpdateUi();
+            }
+          })
+          .catch(function () {});
+      }
+      if (typeof Bridge.getCachedRelease === 'function') {
+        Bridge.getCachedRelease()
+          .then(function (rel) {
+            if (rel && rel.version) {
+              remoteUpdateState.latestRelease = rel;
+              syncRemoteUpdateUi();
+              return;
+            }
+            if (typeof Bridge.checkForUpdates === 'function') {
+              return Bridge.checkForUpdates().then(function (res) {
+                if (res && res.release && res.release.version) {
+                  remoteUpdateState.latestRelease = res.release;
+                  syncRemoteUpdateUi();
+                }
+              });
+            }
           })
           .catch(function () {});
       }

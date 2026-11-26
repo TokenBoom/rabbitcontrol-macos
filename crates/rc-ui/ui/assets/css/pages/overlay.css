@@ -895,6 +895,128 @@ body.rc-preview-mode > #app {
   margin-top: 12px;
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * 本机检查更新弹窗（O2「检查更新」与关于弹窗复用）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-update {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  padding: 20px 22px 18px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-popover);
+  background: var(--popover-bg);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  color: var(--text-primary);
+  pointer-events: auto;
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-update__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.rc-update__title {
+  margin: 0;
+  font-size: var(--size-h2);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.rc-update__badge[hidden] {
+  display: none;
+}
+
+.rc-update__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--local-pill-bg);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+}
+
+.rc-update__summary {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: var(--size-secondary);
+  line-height: 20px;
+}
+
+.rc-update__notes {
+  max-height: 168px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--stroke-soft);
+  border-radius: var(--r-control);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-caption);
+  line-height: 19px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rc-update__progress {
+  margin: 12px 0 14px;
+}
+
+.rc-update__bar-track {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: var(--r-pill);
+  background: var(--bg-hover);
+}
+
+.rc-update__bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  transition: width var(--dur-fast) var(--ease-out);
+}
+
+.rc-update__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.rc-update__error {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: var(--r-control);
+  background: var(--warning-bg);
+  color: var(--danger);
+  font-size: var(--size-caption);
+  line-height: 18px;
+  word-break: break-word;
+}
+
+.rc-update__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .rc-popover,
   .rc-tools,

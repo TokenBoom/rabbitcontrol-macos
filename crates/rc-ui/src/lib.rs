@@ -11,9 +11,10 @@ pub mod metal_attach;
 pub mod permissions;
 pub mod service_ipc;
 pub mod service_manager;
+pub mod updater_macos;
 
 pub use rc_client_core::{
     app_prefs, auth_client, cert_manager, config_paths, display_ctrl, host_bridge, hud,
     input_bridge, lan_discovery, model, p2p, platform, relay_transport, server_config,
-    session_bridge, signal_client,
+    session_bridge, signal_client, updater,
 };

@@ -118,6 +118,15 @@ pub enum ServiceRequest {
     QuitAll,
     /// 检测到磁盘二进制已更新时请求平滑重启：不写 `manual-stop` 优雅退出，由 `launchd` 拉起新版。
     RestartForUpgrade,
+    /// 请求 root `rc-daemon` 独立复核 DMG 的 SHA-256 与代码签名证书钉扎，并原子替换已安装的 `RabbitControl.app`。
+    InstallVerifiedUpdate {
+        /// 本地待验证安装的 DMG 路径。
+        dmg_path: String,
+        /// 期望的 64 位小写 SHA-256 十六进制摘要。
+        expected_sha256: String,
+        /// 请求替换的目标 `.app` 路径（由 `rc-daemon` 按白名单独立复核）。
+        target_app_path: String,
+    },
     /// 请求后台立刻重新检查系统权限快照。
     TriggerPermissionCheck,
 }

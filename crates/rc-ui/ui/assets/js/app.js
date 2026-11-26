@@ -193,6 +193,8 @@
       alias: alias,
       name: displayName,
       os: os,
+      appVersion: String((raw && (raw.appVersion || raw.app_version)) || ""),
+      arch: String((raw && raw.arch) || ""),
       icon: iconForOs(os),
       group: groupForOs(os),
       online: Boolean(raw && raw.online),
@@ -250,6 +252,26 @@
       name.title = device.name;
       name.setAttribute("data-tauri-drag-region", "");
       titlebarContext.appendChild(name);
+
+      if (device.appVersion) {
+        var verBadge = el("span", "titlebar__version", "v" + device.appVersion);
+        verBadge.setAttribute("data-tauri-drag-region", "");
+        titlebarContext.appendChild(verBadge);
+      }
+
+      if (hasDeviceUpdate(device)) {
+        var updBtn = el(
+          "button",
+          "titlebar__update-btn",
+          "可升级至 v" + latestRelease.version
+        );
+        updBtn.type = "button";
+        updBtn.title = "点击确认后在后台升级此设备（不弹出远控桌面）";
+        updBtn.addEventListener("click", function () {
+          openMainRemoteUpdateModal(device);
+        });
+        titlebarContext.appendChild(updBtn);
+      }
 
       var more = el("button", "rc-btn rc-btn--ghost titlebar__more");
       more.type = "button";
@@ -1054,7 +1076,10 @@
     renderP2DeviceId();
   }
 
+  var sessionLaunchSeq = 0;
+
   function launchSessionWithTarget(addr, watchOnly, password, deviceName, headless) {
+    sessionLaunchSeq += 1;
     var cfg = {
       target: addr,
       watchOnly: Boolean(watchOnly),
@@ -1707,12 +1732,21 @@
           d.icon = iconForOs(ev.os);
           d.group = groupForOs(ev.os);
         }
+        var evAppVer =
+          typeof ev.app_version === "string"
+            ? ev.app_version
+            : typeof ev.appVersion === "string"
+              ? ev.appVersion
+              : "";
+        if (evAppVer) d.appVersion = evAppVer;
+        if (typeof ev.arch === "string" && ev.arch) d.arch = ev.arch;
         if (typeof ev.allow_remote_assist === "boolean") {
           d.allowRemoteAssist = ev.allow_remote_assist;
         } else if (typeof ev.allowRemoteAssist === "boolean") {
           d.allowRemoteAssist = ev.allowRemoteAssist;
         }
         d.name = d.alias.trim() || d.hostname.trim() || d.formattedId || did;
+        notifyMainRemoteUpdateDeviceStatus(d);
         found = true;
         break;
       }
@@ -1740,6 +1774,429 @@
           refreshGateStatus();
         }
       });
+  }
+
+  /* ── 自动更新版本缓存与主窗无头远程升级控制器（A1 + A3）────── */
+  var latestRelease = null;
+  var silentUpdateChecked = false;
+  var activeMainRemoteUpdate = null;
+
+  function isNewerSemver(candidate, current) {
+    if (Overlay && typeof Overlay.isNewerVersion === "function") {
+      return Overlay.isNewerVersion(candidate, current);
+    }
+    return false;
+  }
+
+  function formatBytesHuman(bytes) {
+    if (Overlay && typeof Overlay.formatUpdateBytes === "function") {
+      return Overlay.formatUpdateBytes(bytes);
+    }
+    return String(bytes || 0) + " B";
+  }
+
+  function hasDeviceUpdate(device) {
+    if (!IS_TAURI || !device || !device.isMine || device.isLocal || !device.online) return false;
+    if (!latestRelease || !latestRelease.version) return false;
+    if (device.os && String(device.os).toLowerCase() !== "macos") return false;
+    if (!device.appVersion) return false;
+    return isNewerSemver(latestRelease.version, device.appVersion);
+  }
+
+  function runSilentUpdateCheckOnce() {
+    if (!IS_TAURI || silentUpdateChecked || typeof Bridge.checkForUpdates !== "function") return;
+    silentUpdateChecked = true;
+    Bridge.checkForUpdates()
+      .then(function (res) {
+        if (res && res.release && res.release.version) {
+          latestRelease = res.release;
+          if (state.route === "p3") renderP3();
+          if (state.route === "p1") {
+            renderP1();
+            renderTitlebar();
+          }
+        }
+      })
+      .catch(function () {});
+  }
+
+  function cleanupMainRemoteUpdate(disconnectHeadless) {
+    var ctx = activeMainRemoteUpdate;
+    if (!ctx) return;
+    ctx.cancelled = true;
+    activeMainRemoteUpdate = null;
+    if (ctx.waitTimer) {
+      window.clearTimeout(ctx.waitTimer);
+      ctx.waitTimer = 0;
+    }
+    if (typeof ctx.unlisten === "function") {
+      try {
+        ctx.unlisten();
+      } catch (err) {
+        /* ignore */
+      }
+      ctx.unlisten = null;
+    }
+    if (
+      disconnectHeadless &&
+      ctx.openedHeadless &&
+      ctx.openResolved &&
+      ctx.launchSeq === sessionLaunchSeq &&
+      state.activeSession &&
+      state.activeSession.active &&
+      isDeviceControlled(ctx.device) &&
+      IS_TAURI &&
+      typeof Bridge.sessionCommand === "function"
+    ) {
+      Bridge.sessionCommand({ kind: "disconnect" }).catch(function () {});
+    }
+  }
+
+  function notifyMainRemoteUpdateDeviceStatus(device) {
+    var ctx = activeMainRemoteUpdate;
+    if (!ctx || !device || ctx.deviceId !== device.id) return;
+    if (
+      ctx.stage === "restarting" &&
+      device.online &&
+      device.appVersion &&
+      !isNewerSemver(ctx.targetVersion, device.appVersion)
+    ) {
+      ctx.stage = "succeeded";
+      if (ctx.onSucceeded) ctx.onSucceeded(device.appVersion);
+    }
+  }
+
+  function openMainRemoteUpdateModal(device) {
+    if (!IS_TAURI || !device || !device.deviceId || device.isLocal) return;
+    if (!device.online) {
+      toast("设备「" + device.name + "」当前离线，无法远程更新");
+      return;
+    }
+    if (state.activeSession && state.activeSession.active && !isDeviceControlled(device)) {
+      toast("当前正在远程控制其他设备，请先断开当前会话后再在后台升级「" + device.name + "」");
+      return;
+    }
+
+    var wrap = el("div", "rc-modal__update-wrap");
+    var verBadge = el("div", "rc-modal__ver-badge", "正在获取最新版本信息…");
+    var descEl = el(
+      "p",
+      "rc-modal__desc",
+      "升级完成后被控端将自动重启并恢复在线，整个过程在后台完成，不会弹出远控桌面窗口。"
+    );
+    var notesEl = el("pre", "rc-modal__notes");
+    notesEl.hidden = true;
+
+    var progWrap = el("div", "rc-modal__progress");
+    progWrap.hidden = true;
+    var track = el("div", "rc-modal__bar-track");
+    var fill = el("div", "rc-modal__bar-fill");
+    track.appendChild(fill);
+    var meta = el("div", "rc-modal__progress-meta");
+    var stageEl = el("span", null, "准备连接被控端…");
+    var bytesEl = el("span", null, "");
+    meta.appendChild(stageEl);
+    meta.appendChild(bytesEl);
+    progWrap.appendChild(track);
+    progWrap.appendChild(meta);
+
+    var errEl = el("div", "rc-modal__error");
+    errEl.hidden = true;
+
+    wrap.appendChild(verBadge);
+    wrap.appendChild(descEl);
+    wrap.appendChild(notesEl);
+    wrap.appendChild(progWrap);
+    wrap.appendChild(errEl);
+
+    var actions = el("div", "rc-modal__actions");
+    var cancelBtn = el("button", "rc-btn rc-btn--secondary", "取消");
+    cancelBtn.type = "button";
+    var okBtn = el("button", "rc-btn rc-btn--primary", "确认升级");
+    okBtn.type = "button";
+    okBtn.disabled = true;
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+
+    var resolvedRelease = null;
+    var modalClosed = false;
+
+    function showErr(msg) {
+      if (modalClosed) return;
+      errEl.hidden = false;
+      errEl.textContent = String(msg || "远程更新失败");
+      okBtn.hidden = false;
+      okBtn.disabled = false;
+      okBtn.textContent = "重试";
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "关闭";
+    }
+
+    function applyRelease(rel) {
+      if (modalClosed) return;
+      resolvedRelease = rel;
+      latestRelease = rel;
+      errEl.hidden = true;
+      var curLabel = device.appVersion ? "v" + device.appVersion : "当前版本";
+      verBadge.textContent = curLabel + " → v" + rel.version;
+      if (rel.notes && String(rel.notes).trim()) {
+        notesEl.hidden = false;
+        notesEl.textContent = String(rel.notes).trim();
+      }
+      if (device.appVersion && !isNewerSemver(rel.version, device.appVersion)) {
+        descEl.textContent =
+          "设备「" + device.name + "」当前已是最新版本（v" + device.appVersion + "），无需升级。";
+        okBtn.hidden = true;
+        cancelBtn.textContent = "关闭";
+        return;
+      }
+      okBtn.hidden = false;
+      okBtn.disabled = false;
+      okBtn.textContent = "确认升级";
+    }
+
+    function loadLatestRelease() {
+      if (modalClosed || typeof Bridge.checkForUpdates !== "function") return;
+      errEl.hidden = true;
+      verBadge.textContent = "正在获取最新版本信息…";
+      okBtn.disabled = true;
+      okBtn.textContent = "检查中…";
+      Bridge.checkForUpdates()
+        .then(function (res) {
+          if (modalClosed) return;
+          if (res && res.release && res.release.version) {
+            applyRelease(res.release);
+          } else {
+            showErr("未获取到有效的最新版本信息");
+          }
+        })
+        .catch(function (err) {
+          showErr("检查更新失败：" + String(err));
+        });
+    }
+
+    function abortAndCleanupModal() {
+      if (modalClosed) return;
+      modalClosed = true;
+      if (
+        activeMainRemoteUpdate &&
+        activeMainRemoteUpdate.stage !== "restarting" &&
+        activeMainRemoteUpdate.stage !== "succeeded" &&
+        activeMainRemoteUpdate.stage !== "installing"
+      ) {
+        if (typeof Bridge.cancelRemoteUpdate === "function") {
+          Bridge.cancelRemoteUpdate().catch(function () {});
+        }
+        cleanupMainRemoteUpdate(true);
+      } else {
+        cleanupMainRemoteUpdate(false);
+      }
+    }
+
+    cancelBtn.addEventListener("click", function () {
+      abortAndCleanupModal();
+      closeModal();
+    });
+
+    okBtn.addEventListener("click", function () {
+      if (!resolvedRelease || !resolvedRelease.version) {
+        loadLatestRelease();
+        return;
+      }
+      if (state.activeSession && state.activeSession.active && !isDeviceControlled(device)) {
+        showErr("当前正在远程控制其他设备，请先断开当前会话后再升级此设备");
+        return;
+      }
+      cleanupMainRemoteUpdate(false);
+      errEl.hidden = true;
+      progWrap.hidden = false;
+      fill.style.width = "0%";
+      stageEl.textContent = "正在静默建立加密控制通道…";
+      bytesEl.textContent = "";
+      okBtn.disabled = true;
+      okBtn.textContent = "升级中…";
+      cancelBtn.textContent = "取消升级";
+
+      var targetVer = String(resolvedRelease.version);
+      var alreadyConnected = isDeviceControlled(device);
+      var ctx = {
+        deviceId: device.id,
+        device: device,
+        launchSeq: 0,
+        targetVersion: targetVer,
+        openedHeadless: !alreadyConnected,
+        openResolved: alreadyConnected,
+        cancelled: false,
+        triggered: false,
+        stage: "connecting",
+        waitTimer: 0,
+        unlisten: null,
+        onSucceeded: function (newVer) {
+          if (modalClosed) return;
+          progWrap.hidden = false;
+          fill.style.width = "100%";
+          stageEl.textContent = "升级完成，设备已上线（v" + newVer + "）";
+          bytesEl.textContent = "100%";
+          okBtn.hidden = true;
+          cancelBtn.disabled = false;
+          cancelBtn.textContent = "完成";
+          cleanupMainRemoteUpdate(false);
+          toast("设备「" + device.name + "」已升级至 v" + newVer);
+        }
+      };
+      activeMainRemoteUpdate = ctx;
+
+      function tryTriggerWithHostVersion(hv) {
+        if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx || ctx.triggered) return;
+        if (!hv || typeof hv !== "object") return;
+        ctx.triggered = true;
+        if (ctx.waitTimer) {
+          window.clearTimeout(ctx.waitTimer);
+          ctx.waitTimer = 0;
+        }
+        if (!hv.isOwnerSession) {
+          cleanupMainRemoteUpdate(true);
+          showErr("安全限制：仅本人同账号自控会话允许远程升级被控端");
+          return;
+        }
+        if (!hv.updateCapable) {
+          cleanupMainRemoteUpdate(true);
+          showErr("目标设备当前环境暂不支持自动安装更新");
+          return;
+        }
+        if (hv.version && !isNewerSemver(targetVer, hv.version)) {
+          cleanupMainRemoteUpdate(true);
+          stageEl.textContent = "目标设备已是最新版本（v" + hv.version + "）";
+          fill.style.width = "100%";
+          okBtn.hidden = true;
+          cancelBtn.textContent = "关闭";
+          return;
+        }
+        stageEl.textContent = "已校验机主权限，正在下发升级指令…";
+        Bridge.triggerRemoteUpdate(targetVer).catch(function (err) {
+          if (activeMainRemoteUpdate !== ctx || ctx.cancelled) return;
+          cleanupMainRemoteUpdate(true);
+          showErr(err);
+        });
+      }
+
+      function onUpdateEvent(upd) {
+        if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx || !upd || !upd.kind) return;
+        if (!ctx.openResolved && upd.kind === "ended") return;
+        var data = upd.data || upd;
+        if (upd.kind === "host_version") {
+          tryTriggerWithHostVersion(data);
+          return;
+        }
+        if (upd.kind === "remote_update_status") {
+          var st = String(data.stage || "");
+          ctx.stage = st;
+          var pct = Math.max(0, Math.min(100, Number(data.progressPct || 0)));
+          fill.style.width = pct + "%";
+          stageEl.textContent = String(data.message || "处理中…");
+          if (data.totalBytes && Number(data.totalBytes) > 0) {
+            bytesEl.textContent =
+              formatBytesHuman(data.downloadedBytes) +
+              " / " +
+              formatBytesHuman(data.totalBytes) +
+              " (" +
+              pct +
+              "%)";
+          } else if (pct > 0) {
+            bytesEl.textContent = pct + "%";
+          }
+          if (st === "installing" || st === "restarting") {
+            cancelBtn.textContent = st === "restarting" ? "后台等待" : "安装中…";
+            cancelBtn.disabled = st === "installing";
+          } else if (st === "failed") {
+            cleanupMainRemoteUpdate(true);
+            showErr(data.error || data.message || "被控端更新失败");
+          }
+          return;
+        }
+        if (upd.kind === "ended" && ctx.stage !== "restarting" && ctx.stage !== "succeeded") {
+          cleanupMainRemoteUpdate(false);
+          showErr("远程连接已断开：" + String(data.reason || "请稍后重试"));
+        }
+      }
+
+      Bridge.onSessionUpdate(onUpdateEvent)
+        .then(function (unlisten) {
+          if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) {
+            if (typeof unlisten === "function") unlisten();
+            return;
+          }
+          ctx.unlisten = unlisten;
+
+          ctx.waitTimer = window.setTimeout(function () {
+            if (activeMainRemoteUpdate === ctx && !ctx.triggered) {
+              cleanupMainRemoteUpdate(true);
+              showErr("等待被控端上报版本超时（目标设备可能为旧版本，请先手动升级一次）");
+            }
+          }, 15000);
+
+          if (alreadyConnected) {
+            Bridge.getSessionHostVersion()
+              .then(function (hv) {
+                if (hv) tryTriggerWithHostVersion(hv);
+              })
+              .catch(function () {});
+          } else {
+            var myLaunchSeq = ++sessionLaunchSeq;
+            ctx.launchSeq = myLaunchSeq;
+            Bridge.openSession({
+              target: device.deviceId,
+              watchOnly: false,
+              preferHardware: true,
+              clipboardEnabled: false,
+              audioEnabled: false,
+              deviceName: device.name,
+              headless: true
+            })
+              .then(function () {
+                ctx.openResolved = true;
+                if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) {
+                  if (
+                    sessionLaunchSeq === myLaunchSeq &&
+                    (!state.activeSession || !state.activeSession.active || isDeviceControlled(device)) &&
+                    typeof Bridge.sessionCommand === "function"
+                  ) {
+                    Bridge.sessionCommand({ kind: "disconnect" }).catch(function () {});
+                  }
+                  return null;
+                }
+                return Bridge.getSessionHostVersion();
+              })
+              .then(function (hv) {
+                if (hv) tryTriggerWithHostVersion(hv);
+              })
+              .catch(function (err) {
+                if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) return;
+                cleanupMainRemoteUpdate(false);
+                showErr("静默连接被控端失败：" + String(err));
+              });
+          }
+        })
+        .catch(function (err) {
+          if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) return;
+          cleanupMainRemoteUpdate(false);
+          showErr(err);
+        });
+    });
+
+    showModal({
+      title: "远程升级「" + device.name + "」",
+      content: wrap,
+      actions: actions,
+      dismissible: false,
+      onCancel: abortAndCleanupModal
+    });
+
+    if (latestRelease && latestRelease.version) {
+      applyRelease(latestRelease);
+    } else {
+      loadLatestRelease();
+    }
   }
 
   /* ── 设备上下文菜单 / 重命名 / 移除 / 改密弹窗 ───────────────── */
@@ -1937,6 +2394,14 @@
       openTool("portmap", device);
     });
 
+    var updateBtn = el("button", "rc-ctx-menu__item", "检查并更新此设备");
+    updateBtn.type = "button";
+    updateBtn.disabled = Boolean(device.isLocal || !device.online);
+    updateBtn.addEventListener("click", function () {
+      closeDeviceContextMenu();
+      openMainRemoteUpdateModal(device);
+    });
+
     var renameBtn = el("button", "rc-ctx-menu__item", "修改备注");
     renameBtn.type = "button";
     renameBtn.addEventListener("click", function () {
@@ -1955,6 +2420,7 @@
     menu.appendChild(transferBtn);
     menu.appendChild(terminalBtn);
     menu.appendChild(portmapBtn);
+    menu.appendChild(updateBtn);
     menu.appendChild(renameBtn);
     menu.appendChild(removeBtn);
     document.body.appendChild(menu);
@@ -2375,11 +2841,24 @@
     if (device.formattedId) {
       ident.appendChild(el("span", "p3__device-id", device.formattedId));
     }
+    if (device.appVersion) {
+      ident.appendChild(el("span", "p3__version", "v" + device.appVersion));
+    }
     row.appendChild(ident);
 
     var actions = el("span", "p3__actions");
 
     if (device.isMine) {
+      if (!device.isLocal && hasDeviceUpdate(device)) {
+        var updPill = el("button", "p3__update-pill", "升级 v" + latestRelease.version);
+        updPill.type = "button";
+        updPill.title = "点击确认后在后台升级此设备";
+        updPill.addEventListener("click", function (e) {
+          e.stopPropagation();
+          openMainRemoteUpdateModal(device);
+        });
+        actions.appendChild(updPill);
+      }
       if (!device.isLocal) {
         var connectBtn = el("button", "rc-btn rc-btn--secondary p3__action-pill", "连接桌面");
         connectBtn.type = "button";
@@ -2696,6 +3175,7 @@
         }
       }
       refreshMyDevices();
+      runSilentUpdateCheckOnce();
       checkAndRenderPermBanner();
       runStartupPermissionCheckOnce();
       return;

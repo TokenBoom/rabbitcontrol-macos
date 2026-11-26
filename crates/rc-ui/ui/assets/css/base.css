@@ -165,6 +165,11 @@ body {
 /* ────────────────────────────────────────────────────────────────
  * 5. Button（Primary / Secondary / Danger / Ghost 及其禁用态）
  * ──────────────────────────────────────────────────────────────── */
+.btn[hidden],
+.rc-btn[hidden] {
+  display: none;
+}
+
 .btn,
 .rc-btn {
   display: inline-flex;

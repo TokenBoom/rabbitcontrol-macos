@@ -379,6 +379,10 @@ fn start_background_poller(app: AppHandle) {
                                     // 不并入 `"session://update"`，亦不覆写 `last_session_update`。
                                     continue;
                                 }
+                                SessionUpdate::HostVersion(ref hv) => {
+                                    *st.host_version.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some((sid, hv.clone()));
+                                }
                                 _ => {}
                             }
                             if matches!(upd, SessionUpdate::Ended { .. }) {
@@ -401,6 +405,7 @@ fn start_background_poller(app: AppHandle) {
                             // 防止新窗口拉到过期 `Ended` 并清空 W4 映射列表；远端后台 PTY 继续由被控端保活。
                             ended_session = slot.take();
                             state::clear_session_snapshot_locked(&st.last_session_update);
+                            *st.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             portmap_update = Some(Vec::new());
                         } else if let Some(latest) = updates.iter().rev().find(|u| {
                             !matches!(
@@ -411,6 +416,8 @@ fn start_background_poller(app: AppHandle) {
                                     | SessionUpdate::MouseModeState { .. }
                                     | SessionUpdate::DisplaysState { .. }
                                     | SessionUpdate::VirtualDisplayError { .. }
+                                    | SessionUpdate::HostVersion(_)
+                                    | SessionUpdate::RemoteUpdateStatus(_)
                             )
                         }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。
@@ -950,6 +957,7 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
 /// 本机被控端服务默认关闭，仅在用户手动开启「允许他人远程协助」并通过系统权限预检后启动。
 fn main() {
     rc_platform_macos::register_all();
+    rc_ui::updater_macos::register_macos_update_hooks();
 
     // 单实例守护：若已有控制端 GUI 实例正在监听 `gui.sock`，直接将其主窗口唤起到前台并退出本进程。
     let gui_sock = config_paths::gui_socket_path();
@@ -974,6 +982,17 @@ fn main() {
         .manage(AppState::new())
         .setup(|app| {
             let state = app.state::<AppState>();
+            let app_for_standalone_upd = app.handle().clone();
+            rc_ui::updater_macos::register_standalone_pre_restart_hook(Arc::new(move || {
+                let st = app_for_standalone_upd.state::<AppState>();
+                let handle_opt = {
+                    let mut host = st.host.lock().unwrap_or_else(|e| e.into_inner());
+                    host.handle.take()
+                };
+                if let Some(mut handle) = handle_opt {
+                    handle.stop_with_reason(rc_session::proto::ByeReason::SessionSwitching);
+                }
+            }));
 
             // 0) 按当前显示器尺寸自适应主窗口大小并居中（兼容 13"/14" 笔记本与 2K/4K 大屏），
             //    并启动 `gui.sock` 单实例唤醒通道供后台菜单栏与重复启动实例直接前置本窗口。
@@ -1276,6 +1295,15 @@ fn main() {
             commands::session_snapshot,
             commands::get_app_prefs,
             commands::get_app_info,
+            commands::check_for_updates,
+            commands::get_cached_release,
+            commands::start_self_update,
+            commands::cancel_self_update,
+            commands::get_update_mirror_url,
+            commands::save_update_mirror_url,
+            commands::get_session_host_version,
+            commands::trigger_remote_update,
+            commands::cancel_remote_update,
             commands::save_stream_prefs,
             commands::get_device_snapshots,
             commands::get_active_session_info,

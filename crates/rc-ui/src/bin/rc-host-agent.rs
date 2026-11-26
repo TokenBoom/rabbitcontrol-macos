@@ -1170,6 +1170,7 @@ fn perform_quit_all(agent: &Arc<Mutex<AgentInner>>, stop_flag: &Arc<AtomicBool>,
 
 fn main() {
     rc_platform_macos::register_all();
+    rc_ui::updater_macos::register_macos_update_hooks();
 
     if !should_run_at_startup() {
         return;
@@ -1367,8 +1368,9 @@ fn main() {
                 stop_ipc.store(true, Ordering::Release);
                 ServiceResponse::Ok
             }
-            ServiceRequest::EnsureAccessToken { .. } => ServiceResponse::Error {
-                message: "EnsureAccessToken 仅由 rc-daemon 处理".to_string(),
+            ServiceRequest::EnsureAccessToken { .. }
+            | ServiceRequest::InstallVerifiedUpdate { .. } => ServiceResponse::Error {
+                message: "该请求仅由 rc-daemon 处理".to_string(),
             },
         },
     ) {

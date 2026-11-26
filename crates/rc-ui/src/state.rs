@@ -833,6 +833,14 @@ pub struct AppState {
     pub shortcut_tap: Mutex<Option<rc_input_macos::SystemShortcutTap>>,
     /// 最近一次建立的活动会话连接参数（供 `ByeReason::SessionSwitching` 自动重连复用，不含口令出参）。
     pub last_session_params: Mutex<Option<(bool, ActiveSessionMeta)>>,
+    /// 最近一次拉取到的 GitHub Release 元数据缓存（供检查更新、自更新与远程更新复用）。
+    pub latest_release: Mutex<Option<rc_ui::updater::ReleaseInfo>>,
+    /// 当前是否已有本机自更新后台任务在执行（单任务防重入）。
+    pub self_update_running: Arc<AtomicBool>,
+    /// 本机自更新取消标志。
+    pub self_update_cancel: Arc<AtomicBool>,
+    /// 当前活动会话对端被控端上报的版本与更新能力元数据（绑定会话代际号 `sid`）。
+    pub host_version: Mutex<Option<(u64, rc_ui::updater::RemoteHostVersion)>>,
     /// 单调递增会话代际号分配器（从 1 开始）。
     next_session_id: AtomicU64,
     /// §6.0 mock 设备表（侧栏 3 台）。
@@ -947,6 +955,10 @@ impl AppState {
             #[cfg(target_os = "macos")]
             shortcut_tap: Mutex::new(None),
             last_session_params: Mutex::new(None),
+            latest_release: Mutex::new(None),
+            self_update_running: Arc::new(AtomicBool::new(false)),
+            self_update_cancel: Arc::new(AtomicBool::new(false)),
+            host_version: Mutex::new(None),
             next_session_id: AtomicU64::new(1),
             devices: default_mock_devices(),
             dropped_unmapped_keys: AtomicU64::new(0),

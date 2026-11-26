@@ -385,6 +385,7 @@ pub(crate) fn disconnect_active_session_with_lock(
         // H9：递增会话打开代次，使任何在途的 `open_session` (`request_connect`) 醒来后自动作废。
         let new_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
         (slot.take(), should_lock, new_epoch)
     };
     if let Some(session) = old {
@@ -586,6 +587,7 @@ fn activate_session_with_cfg(
         let old = slot.take();
         // 在 `session` 锁内原子清空旧快照（U-H2 / U-H3），防止新窗口拉到旧会话的 `Ended` / `Negotiated`。
         state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let handle = SessionHandle::spawn_with_surface(
             ui_cfg,
             preallocated_layer.map(metal_attach::MainThreadMetalLayer::into_render_surface),
@@ -838,6 +840,7 @@ pub async fn open_session(
     let previous = {
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
         state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
         slot.take()
     };
     if let Some(old) = previous {
@@ -1032,6 +1035,7 @@ pub async fn set_session_relay_mode(
     let previous = {
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
         state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
         slot.take()
     };
     if let Some(old) = previous {
@@ -2869,6 +2873,10 @@ pub struct MyDeviceEntry {
     pub hostname: String,
     /// 操作系统标识（`"macos"` / `"windows"` / `"linux"`）。
     pub os: String,
+    /// 客户端上报的语义版本号（旧版本客户端为空串）。
+    pub app_version: String,
+    /// 客户端上报的 CPU 架构（如 `"arm64"` / `"x86_64"`，旧版本客户端为空串）。
+    pub arch: String,
     /// 用户自定义设备备注。
     pub alias: String,
     /// 展示名称（优先 `alias`，其次 `hostname`，兜底 `formatted_id`）。
@@ -2947,6 +2955,8 @@ fn map_my_device_entry(info: MyDeviceInfo, local_device_id: Option<&str>) -> MyD
         formatted_id,
         hostname: info.hostname,
         os: info.os,
+        app_version: info.app_version,
+        arch: info.arch,
         alias: info.alias,
         display_name,
         allow_remote_assist: info.allow_remote_assist,
@@ -3191,6 +3201,8 @@ fn bind_device_and_ensure_cert(
                     device_key: cfg.device_key.clone(),
                     hostname: Some(hostname.clone()),
                     os: Some(os_name.clone()),
+                    app_version: Some(rc_ui::updater_macos::resolve_current_app_version()),
+                    arch: Some(rc_ui::updater_macos::current_macos_arch().to_string()),
                     alias: None,
                     device_pubkey: Some(pubkey_hex.clone()),
                     allow_remote_assist: Some(allow_remote_assist),
@@ -4686,6 +4698,504 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
         license: env!("CARGO_PKG_LICENSE").to_string(),
         description,
     }
+}
+
+/// 构造 `UpdateCheckResult`（计算 `has_update` 与当前架构匹配安装包）。
+fn build_update_check_result(
+    release: rc_ui::updater::ReleaseInfo,
+) -> rc_ui::updater::UpdateCheckResult {
+    let current_version = rc_ui::updater_macos::resolve_current_app_version();
+    let arch = rc_ui::updater_macos::current_macos_arch().to_string();
+    let latest_version = release.version.clone();
+    let has_update = rc_ui::updater::is_newer_version(&latest_version, &current_version);
+    let selected_asset = rc_ui::updater::select_asset_for_target(&release, "macos", &arch);
+    rc_ui::updater::UpdateCheckResult {
+        current_version,
+        latest_version,
+        has_update,
+        arch,
+        release,
+        selected_asset,
+    }
+}
+
+/// IPC 命令：检查最新版本（从 GitHub Releases 拉取元数据与 SHA-256 校验值并缓存在 `AppState`）。
+#[tauri::command]
+pub async fn check_for_updates(
+    app: AppHandle,
+) -> Result<rc_ui::updater::UpdateCheckResult, String> {
+    let app_for_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_blocking.state::<AppState>();
+        let mirror_url = sync_prefs_from_disk_if_proxy(&state).update_mirror_url;
+        let release = rc_ui::updater_macos::fetch_latest_release(&mirror_url)?;
+        *state
+            .latest_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(release.clone());
+        Ok(build_update_check_result(release))
+    })
+    .await
+    .map_err(|e| format!("检查更新任务异常：{e}"))?
+}
+
+/// IPC 命令：读取最近一次缓存的 Release 元数据（若尚未检查则返回 `None`）。
+#[tauri::command]
+pub fn get_cached_release(state: State<'_, AppState>) -> Option<rc_ui::updater::ReleaseInfo> {
+    state
+        .latest_release
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// IPC 命令：读取「设置 → 网络」配置的更新镜像加速前缀。
+#[tauri::command]
+pub fn get_update_mirror_url(state: State<'_, AppState>) -> String {
+    sync_prefs_from_disk_if_proxy(&state).update_mirror_url
+}
+
+/// IPC 命令：保存「设置 → 网络」更新镜像加速前缀至 `prefs.json` 并同步通知后台服务。
+#[tauri::command]
+pub fn save_update_mirror_url(
+    mirror_url: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.require_unlocked()?;
+    let sanitized = rc_ui::updater::sanitize_update_mirror_url(&mirror_url)?;
+    let prefs_path = app_prefs::default_prefs_path();
+    let _io = state
+        .prefs_io_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+    let (prev, next) = {
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = prefs.clone();
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
+        prefs.apply_update_mirror_url(&sanitized)?;
+        (prev, prefs.clone())
+    };
+    if let Err(err) = app_prefs::save_to_path(&prefs_path, &next) {
+        *state.prefs.lock().unwrap_or_else(|e| e.into_inner()) = prev;
+        return Err(err);
+    }
+    notify_background_services_reload(&state, false);
+    Ok(next.update_mirror_url)
+}
+
+/// IPC 命令：启动本机自更新（下载 → SHA-256 校验 → codesign 证书钉扎 → 原子替换 → 重启）。
+#[tauri::command]
+pub async fn start_self_update(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.require_unlocked()?;
+    if !cfg!(target_os = "macos") {
+        return Err("当前平台暂不支持自动安装更新".to_string());
+    }
+    if state
+        .self_update_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("正在执行本机更新，请勿重复操作".to_string());
+    }
+    state.self_update_cancel.store(false, Ordering::Release);
+
+    let running_flag = Arc::clone(&state.self_update_running);
+    let cancel_flag = Arc::clone(&state.self_update_cancel);
+    let app_bg = app.clone();
+
+    std::thread::Builder::new()
+        .name("rc-self-update".to_string())
+        .spawn(move || {
+            struct RunningGuard(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for RunningGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = RunningGuard(running_flag);
+
+            let emit_progress = |p: rc_ui::updater::UpdateProgress| {
+                let _ = app_bg.emit("updater://progress", &p);
+            };
+
+            let st = app_bg.state::<AppState>();
+            let mirror_url = sync_prefs_from_disk_if_proxy(&st).update_mirror_url;
+            let cached = st
+                .latest_release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let release = match cached {
+                Some(r) => r,
+                None => match rc_ui::updater_macos::fetch_latest_release(&mirror_url) {
+                    Ok(r) => {
+                        *st.latest_release.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(r.clone());
+                        r
+                    }
+                    Err(err) => {
+                        emit_progress(rc_ui::updater::UpdateProgress {
+                            stage: rc_ui::updater::UpdateStage::Failed,
+                            progress_pct: 0,
+                            downloaded_bytes: 0,
+                            total_bytes: 0,
+                            target_version: String::new(),
+                            message: err.clone(),
+                            need_controller_relay: false,
+                            error: Some(err),
+                        });
+                        return;
+                    }
+                },
+            };
+
+            let current_ver = rc_ui::updater_macos::resolve_current_app_version();
+            if !rc_ui::updater::is_newer_version(&release.version, &current_ver) {
+                let err = format!("当前已是最新版本（v{current_ver}），无需更新");
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    target_version: release.version,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            }
+
+            let arch = rc_ui::updater_macos::current_macos_arch();
+            let Some(asset) = rc_ui::updater::select_asset_for_target(&release, "macos", arch)
+            else {
+                let err = format!("未找到适用于当前架构（{arch}）的 macOS 安装包");
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    target_version: release.version,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            };
+            let Some(expected_sha) = asset
+                .sha256
+                .clone()
+                .filter(|s| rc_ui::updater::is_valid_sha256_hex(s))
+            else {
+                let err = "当前 Release 缺少有效的 SHA-256 校验摘要，已中止更新".to_string();
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    target_version: release.version,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            };
+
+            let target_ver = release.version.clone();
+            emit_progress(rc_ui::updater::UpdateProgress {
+                stage: rc_ui::updater::UpdateStage::Downloading,
+                progress_pct: 0,
+                downloaded_bytes: 0,
+                total_bytes: asset.size,
+                target_version: target_ver.clone(),
+                message: format!("正在下载 v{target_ver}..."),
+                need_controller_relay: false,
+                error: None,
+            });
+
+            let mut rand_bytes = [0u8; 8];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand_bytes);
+            let suffix: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let dest_path = std::env::temp_dir().join(format!(
+                "rc-self-update-{}-{suffix}.dmg",
+                std::process::id()
+            ));
+            struct CleanupTmp(std::path::PathBuf);
+            impl Drop for CleanupTmp {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _cleanup = CleanupTmp(dest_path.clone());
+
+            let effective_url = if !mirror_url.is_empty() {
+                rc_ui::updater::apply_mirror_prefix(&mirror_url, &asset.download_url)
+                    .unwrap_or_else(|_| asset.download_url.clone())
+            } else {
+                asset.download_url.clone()
+            };
+
+            let mut progress_cb = |done: u64, total: u64| {
+                let effective_total = if total > 0 { total } else { asset.size };
+                let pct = if effective_total > 0 {
+                    done.saturating_mul(100)
+                        .checked_div(effective_total)
+                        .unwrap_or(0)
+                        .min(100) as u8
+                } else {
+                    0
+                };
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Downloading,
+                    progress_pct: pct,
+                    downloaded_bytes: done,
+                    total_bytes: effective_total,
+                    target_version: target_ver.clone(),
+                    message: format!("正在下载 v{target_ver}..."),
+                    need_controller_relay: false,
+                    error: None,
+                });
+            };
+
+            let dl_res = match rc_ui::updater_macos::download_update_package(
+                &effective_url,
+                &expected_sha,
+                &dest_path,
+                &cancel_flag,
+                &mut progress_cb,
+            ) {
+                Ok(()) => Ok(()),
+                Err(first_err)
+                    if effective_url != asset.download_url
+                        && !cancel_flag.load(Ordering::Acquire) =>
+                {
+                    // 镜像下载失败时自动回退 GitHub 直连重试一次。
+                    rc_ui::updater_macos::download_update_package(
+                        &asset.download_url,
+                        &expected_sha,
+                        &dest_path,
+                        &cancel_flag,
+                        &mut progress_cb,
+                    )
+                    .map_err(|direct_err| {
+                        format!("镜像与直连下载均失败（镜像: {first_err}；直连: {direct_err}）")
+                    })
+                }
+                Err(e) => Err(e),
+            };
+
+            if let Err(err) = dl_res {
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: 0,
+                    total_bytes: asset.size,
+                    target_version: target_ver,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            }
+
+            if cancel_flag.load(Ordering::Acquire) {
+                let err = "已取消更新下载".to_string();
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: 0,
+                    total_bytes: asset.size,
+                    target_version: target_ver,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            }
+
+            emit_progress(rc_ui::updater::UpdateProgress {
+                stage: rc_ui::updater::UpdateStage::Installing,
+                progress_pct: 100,
+                downloaded_bytes: asset.size,
+                total_bytes: asset.size,
+                target_version: target_ver.clone(),
+                message: "校验签名通过，正在原子替换应用...".to_string(),
+                need_controller_relay: false,
+                error: None,
+            });
+
+            if let Err(err) = rc_ui::updater_macos::install_verified_update(
+                &dest_path,
+                &expected_sha,
+                true,
+                false,
+            ) {
+                emit_progress(rc_ui::updater::UpdateProgress {
+                    stage: rc_ui::updater::UpdateStage::Failed,
+                    progress_pct: 0,
+                    downloaded_bytes: asset.size,
+                    total_bytes: asset.size,
+                    target_version: target_ver,
+                    message: err.clone(),
+                    need_controller_relay: false,
+                    error: Some(err),
+                });
+                return;
+            }
+
+            emit_progress(rc_ui::updater::UpdateProgress {
+                stage: rc_ui::updater::UpdateStage::Restarting,
+                progress_pct: 100,
+                downloaded_bytes: asset.size,
+                total_bytes: asset.size,
+                target_version: target_ver.clone(),
+                message: format!("v{target_ver} 安装完成，正在重启应用..."),
+                need_controller_relay: false,
+                error: None,
+            });
+        })
+        .map_err(|e| {
+            state.self_update_running.store(false, Ordering::Release);
+            format!("启动更新线程失败：{e}")
+        })?;
+
+    Ok(())
+}
+
+/// IPC 命令：取消正在进行的本机自更新下载。
+#[tauri::command]
+pub fn cancel_self_update(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.self_update_cancel.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// IPC 命令：读取当前活动会话中对端被控端上报的版本与更新能力元数据。
+#[tauri::command]
+pub fn get_session_host_version(
+    state: State<'_, AppState>,
+) -> Option<rc_ui::updater::RemoteHostVersion> {
+    let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let active = slot.as_ref()?;
+    if active.disconnecting {
+        return None;
+    }
+    let hv = state.host_version.lock().unwrap_or_else(|e| e.into_inner());
+    hv.as_ref()
+        .filter(|(sid, _)| *sid == active.id)
+        .map(|(_, info)| info.clone())
+}
+
+/// IPC 命令：向当前活动会话的对端被控端发起经用户明确确认的远程更新。
+///
+/// 安全红线（A3）：仅当被控端经 `OwnerTicket` Ed25519 PoP 确认 `is_owner_session == true`
+/// 时才允许放行；非本人自控的临时协助会话一律 fail-closed 拒绝。
+#[tauri::command]
+pub async fn trigger_remote_update(
+    target_version: Option<String>,
+    app: AppHandle,
+) -> Result<rc_ui::updater::RemoteHostVersion, String> {
+    let app_for_blocking = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_blocking.state::<AppState>();
+        state.require_unlocked()?;
+
+        let (sid, host_ver) = {
+            let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(active) = slot.as_ref().filter(|a| !a.disconnecting) else {
+                return Err("当前没有活动的远控会话".to_string());
+            };
+            let hv_guard = state.host_version.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((_, hv)) = hv_guard.as_ref().filter(|(s, _)| *s == active.id) else {
+                return Err(
+                    "尚未收到被控端版本信息（被控端可能为旧版本，不支持远程自动更新）".to_string(),
+                );
+            };
+            (active.id, hv.clone())
+        };
+
+        if !host_ver.is_owner_session {
+            return Err("安全限制：仅同账号本人自控会话允许远程更新被控端".to_string());
+        }
+        if !host_ver.update_capable {
+            return Err("当前被控端运行环境暂不支持自动安装更新".to_string());
+        }
+
+        let mirror_url = sync_prefs_from_disk_if_proxy(&state).update_mirror_url;
+        let cached = state
+            .latest_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let wanted = target_version
+            .as_deref()
+            .map(|s| s.trim().trim_start_matches(['v', 'V']))
+            .filter(|s| !s.is_empty());
+        let release = match cached {
+            Some(r) if wanted.map_or(true, |w| w.eq_ignore_ascii_case(&r.version)) => r,
+            _ => {
+                let fresh = rc_ui::updater_macos::fetch_latest_release(&mirror_url)?;
+                *state
+                    .latest_release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(fresh.clone());
+                fresh
+            }
+        };
+
+        if !rc_ui::updater::is_newer_version(&release.version, &host_ver.version) {
+            return Err(format!("被控端当前已是最新版本（v{}）", host_ver.version));
+        }
+
+        let Some(asset) =
+            rc_ui::updater::select_asset_for_target(&release, &host_ver.os, &host_ver.arch)
+        else {
+            return Err(format!(
+                "未找到适用于被控端架构（{}）的安装包",
+                host_ver.arch
+            ));
+        };
+        let Some(expected_sha256) = asset
+            .sha256
+            .clone()
+            .filter(|s| rc_ui::updater::is_valid_sha256_hex(s))
+        else {
+            return Err("目标 Release 缺少有效 SHA-256 校验摘要，已拒绝远程推送".to_string());
+        };
+
+        let req = rc_ui::updater::RemoteUpdateRequest {
+            target_version: release.version.clone(),
+            download_url: asset.download_url.clone(),
+            expected_sha256,
+            asset_name: asset.name.clone(),
+            mirror_url,
+            relay_fallback_allowed: true,
+        };
+
+        let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = slot.as_ref().filter(|a| !a.disconnecting && a.id == sid) else {
+            return Err("远控会话已断开或已切换，请重试".to_string());
+        };
+        active.handle.trigger_remote_update(req);
+        Ok(host_ver)
+    })
+    .await
+    .map_err(|e| format!("触发远程更新任务异常：{e}"))?
+}
+
+/// IPC 命令：取消当前活动会话中正在进行的远程被控端更新。
+#[tauri::command]
+pub fn cancel_remote_update(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
+    let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = slot.as_ref().filter(|a| !a.disconnecting) else {
+        return Ok(());
+    };
+    active.handle.cancel_remote_update();
+    Ok(())
 }
 
 /// 显示并前置 `"main"` 控制端主窗口（macOS 上同步取消应用隐藏并激活至最前）。
@@ -6591,6 +7101,8 @@ mod tests {
                 formatted_id: String::new(),
                 hostname: "Studio-Mac".to_string(),
                 os: "macos".to_string(),
+                app_version: "0.1.10".to_string(),
+                arch: "arm64".to_string(),
                 alias: "办公室 Mac".to_string(),
                 device_pubkey: String::new(),
                 allow_remote_assist: true,

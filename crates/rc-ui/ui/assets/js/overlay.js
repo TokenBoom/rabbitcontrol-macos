@@ -231,22 +231,34 @@
   }
 
   /* ── Modal 栈 ─────────────────────────────────────────────────── */
-  function pushModal(layer, onEscape, focusEl) {
+  function pushModal(layer, onEscape, focusEl, onCleanup) {
     layer.addEventListener("pointerdown", function (e) {
       /* 遮罩点击不关闭（§7.4 防误触）；仅吞掉点击避免穿透 */
       if (e.target === layer) e.preventDefault();
     });
     document.body.appendChild(layer);
-    modalStack.push({ el: layer, onEscape: onEscape || null });
+    modalStack.push({
+      el: layer,
+      onEscape: onEscape || null,
+      onCleanup: typeof onCleanup === "function" ? onCleanup : null
+    });
     if (focusEl) focusEl.focus();
     return layer;
   }
 
   function popModal(layer) {
+    var removed = null;
     for (var i = modalStack.length - 1; i >= 0; i--) {
       if (modalStack[i].el === layer) {
-        modalStack.splice(i, 1);
+        removed = modalStack.splice(i, 1)[0];
         break;
+      }
+    }
+    if (removed && typeof removed.onCleanup === "function") {
+      try {
+        removed.onCleanup();
+      } catch (err) {
+        /* ignore */
       }
     }
     if (layer.parentNode) layer.parentNode.removeChild(layer);
@@ -446,6 +458,7 @@
       "</div>" +
       '<div class="rc-about__footer">' +
       '<button type="button" class="rc-btn rc-btn--secondary" data-action="copy">复制版本信息</button>' +
+      '<button type="button" class="rc-btn rc-btn--secondary" data-action="check-update">检查更新</button>' +
       '<button type="button" class="rc-btn rc-btn--primary" data-action="close">关闭</button>' +
       "</div>" +
       "</div>";
@@ -477,6 +490,11 @@
         } else {
           toast("复制失败");
         }
+        return;
+      }
+      if (action === "check-update") {
+        popModal(layer);
+        openUpdateDialog();
         return;
       }
       if (action === "close") {
@@ -523,7 +541,7 @@
       { icon: "settings", label: "设置", act: function () { openSettings(); } },
       { icon: "info", label: "关于", act: function () { triggerAbout(); } },
       { sep: true },
-      { icon: "rotate-cw", label: "检查更新", act: function () { toast("当前已是最新版本"); } }
+      { icon: "rotate-cw", label: "检查更新", act: function () { openUpdateDialog(); } }
     ];
 
     el.innerHTML = items
@@ -1117,6 +1135,337 @@
     openLockConfirmModal(clientLockState);
   }
 
+  /* ── 语义版本号比较与本机检查更新弹窗（O2「检查更新」与关于弹窗复用）── */
+  function parseSemver(raw) {
+    var clean = String(raw || "").trim().replace(/^[vV]/, "").split("-")[0].split("+")[0];
+    var parts = clean.split(".");
+    if (parts.length < 2 || parts.length > 3) return null;
+    var nums = [];
+    for (var i = 0; i < 3; i++) {
+      var seg = parts[i] === undefined ? "0" : parts[i];
+      if (!/^\d+$/.test(seg)) return null;
+      nums.push(parseInt(seg, 10));
+    }
+    return nums;
+  }
+
+  function isNewerVersion(candidate, current) {
+    var a = parseSemver(candidate);
+    var b = parseSemver(current);
+    if (!a || !b) return false;
+    for (var i = 0; i < 3; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i];
+    }
+    return false;
+  }
+
+  function formatUpdateBytes(bytes) {
+    var n = Number(bytes || 0);
+    if (!isFinite(n) || n <= 0) return "0 B";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  function openUpdateDialog() {
+    if (clientLockState.locked) return;
+    if (document.querySelector(".rc-update")) return;
+    closePopover();
+
+    var Bridge = window.RCBridge;
+    var isTauri = Boolean(Bridge && Bridge.isTauri && typeof Bridge.checkForUpdates === "function");
+
+    var layer = document.createElement("div");
+    layer.className = "rc-layer";
+    var card = document.createElement("div");
+    card.className = "rc-update";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-labelledby", "rc-update-title");
+    card.tabIndex = -1;
+
+    var head = document.createElement("div");
+    head.className = "rc-update__head";
+    var titleEl = document.createElement("h2");
+    titleEl.className = "rc-update__title";
+    titleEl.id = "rc-update-title";
+    titleEl.textContent = "检查更新";
+    var badgeEl = document.createElement("span");
+    badgeEl.className = "rc-update__badge";
+    badgeEl.hidden = true;
+    head.appendChild(titleEl);
+    head.appendChild(badgeEl);
+
+    var summaryEl = document.createElement("p");
+    summaryEl.className = "rc-update__summary";
+    summaryEl.textContent = "正在连接更新服务器检查最新版本…";
+
+    var notesEl = document.createElement("pre");
+    notesEl.className = "rc-update__notes";
+    notesEl.hidden = true;
+
+    var progressWrap = document.createElement("div");
+    progressWrap.className = "rc-update__progress";
+    progressWrap.hidden = true;
+    var barTrack = document.createElement("div");
+    barTrack.className = "rc-update__bar-track";
+    var barFill = document.createElement("div");
+    barFill.className = "rc-update__bar-fill";
+    barTrack.appendChild(barFill);
+    var metaRow = document.createElement("div");
+    metaRow.className = "rc-update__meta";
+    var metaStageEl = document.createElement("span");
+    var metaBytesEl = document.createElement("span");
+    metaRow.appendChild(metaStageEl);
+    metaRow.appendChild(metaBytesEl);
+    progressWrap.appendChild(barTrack);
+    progressWrap.appendChild(metaRow);
+
+    var errorEl = document.createElement("div");
+    errorEl.className = "rc-update__error";
+    errorEl.hidden = true;
+
+    var footer = document.createElement("div");
+    footer.className = "rc-update__footer";
+    var secondaryBtn = document.createElement("button");
+    secondaryBtn.type = "button";
+    secondaryBtn.className = "rc-btn rc-btn--secondary";
+    secondaryBtn.textContent = "关闭";
+    var primaryBtn = document.createElement("button");
+    primaryBtn.type = "button";
+    primaryBtn.className = "rc-btn rc-btn--primary";
+    primaryBtn.hidden = true;
+    footer.appendChild(secondaryBtn);
+    footer.appendChild(primaryBtn);
+
+    card.appendChild(head);
+    card.appendChild(summaryEl);
+    card.appendChild(notesEl);
+    card.appendChild(progressWrap);
+    card.appendChild(errorEl);
+    card.appendChild(footer);
+    layer.appendChild(card);
+
+    var unlistenProgress = null;
+    var activeDownload = false;
+    var busyStage = false;
+    var closed = false;
+
+    function detachProgressListener() {
+      closed = true;
+      if (typeof unlistenProgress === "function") {
+        try {
+          unlistenProgress();
+        } catch (err) {
+          /* ignore */
+        }
+        unlistenProgress = null;
+      }
+    }
+
+    function cleanupAndClose() {
+      if (closed) return;
+      detachProgressListener();
+      popModal(layer);
+    }
+
+    function setErrorState(msg) {
+      activeDownload = false;
+      busyStage = false;
+      progressWrap.hidden = true;
+      errorEl.hidden = false;
+      errorEl.textContent = String(msg || "检查更新失败");
+      secondaryBtn.textContent = "关闭";
+      secondaryBtn.disabled = false;
+      secondaryBtn.onclick = cleanupAndClose;
+      primaryBtn.hidden = false;
+      primaryBtn.disabled = false;
+      primaryBtn.textContent = "重试";
+      primaryBtn.onclick = runCheck;
+    }
+
+    function applyCheckResult(res) {
+      if (closed || activeDownload || busyStage) return;
+      errorEl.hidden = true;
+      progressWrap.hidden = true;
+      if (!res) {
+        setErrorState("未收到有效的版本响应");
+        return;
+      }
+      var curVer = String(res.currentVersion || "");
+      var latestVer = String(res.latestVersion || "");
+      var hasUpd = Boolean(res.hasUpdate);
+      var rel = res.release || {};
+      var asset = res.selectedAsset || null;
+
+      if (!hasUpd) {
+        titleEl.textContent = "当前已是最新版本";
+        badgeEl.hidden = false;
+        badgeEl.textContent = "v" + curVer;
+        summaryEl.textContent =
+          "你正在使用 RabbitControl v" + curVer + "（" + String(res.arch || "") + "），无需更新。";
+        notesEl.hidden = true;
+        secondaryBtn.textContent = "重新检查";
+        secondaryBtn.onclick = runCheck;
+        primaryBtn.hidden = false;
+        primaryBtn.disabled = false;
+        primaryBtn.textContent = "关闭";
+        primaryBtn.onclick = cleanupAndClose;
+        return;
+      }
+
+      titleEl.textContent = "发现新版本";
+      badgeEl.hidden = false;
+      badgeEl.textContent = "v" + curVer + " → v" + latestVer;
+      var sizeHint = asset && asset.size ? "（安装包约 " + formatUpdateBytes(asset.size) + "）" : "";
+      summaryEl.textContent =
+        "检测到 RabbitControl v" + latestVer + sizeHint + "，下载并校验签名后将自动替换应用并重启。";
+      if (rel.notes && String(rel.notes).trim()) {
+        notesEl.hidden = false;
+        notesEl.textContent = String(rel.notes).trim();
+      } else {
+        notesEl.hidden = true;
+      }
+
+      secondaryBtn.textContent = "稍后再说";
+      secondaryBtn.onclick = cleanupAndClose;
+
+      if (!asset || !asset.sha256) {
+        primaryBtn.hidden = true;
+        errorEl.hidden = false;
+        errorEl.textContent =
+          "该版本暂未找到适用于当前架构（" + String(res.arch || "") + "）的已校验安装包。";
+        return;
+      }
+
+      primaryBtn.hidden = false;
+      primaryBtn.disabled = false;
+      primaryBtn.textContent = "立即下载并更新";
+      primaryBtn.onclick = function () {
+        if (!Bridge || typeof Bridge.startSelfUpdate !== "function") return;
+        activeDownload = true;
+        busyStage = true;
+        errorEl.hidden = true;
+        progressWrap.hidden = false;
+        barFill.style.width = "0%";
+        metaStageEl.textContent = "准备下载更新包…";
+        metaBytesEl.textContent = "";
+        primaryBtn.disabled = true;
+        primaryBtn.textContent = "更新中…";
+        secondaryBtn.textContent = "取消下载";
+        secondaryBtn.onclick = function () {
+          if (activeDownload && typeof Bridge.cancelSelfUpdate === "function") {
+            secondaryBtn.disabled = true;
+            Bridge.cancelSelfUpdate().catch(function () {});
+          } else {
+            cleanupAndClose();
+          }
+        };
+
+        Bridge.startSelfUpdate().catch(function (err) {
+          if (!closed) setErrorState(String(err || "启动更新失败"));
+        });
+      };
+    }
+
+    function runCheck() {
+      if (closed) return;
+      activeDownload = false;
+      busyStage = false;
+      titleEl.textContent = "检查更新";
+      badgeEl.hidden = true;
+      errorEl.hidden = true;
+      notesEl.hidden = true;
+      progressWrap.hidden = true;
+      summaryEl.textContent = "正在连接 GitHub Releases 检查最新版本…";
+      secondaryBtn.disabled = false;
+      secondaryBtn.textContent = "关闭";
+      secondaryBtn.onclick = cleanupAndClose;
+      primaryBtn.hidden = true;
+      primaryBtn.disabled = true;
+      primaryBtn.onclick = null;
+
+      if (!isTauri) {
+        titleEl.textContent = "当前已是最新版本";
+        summaryEl.textContent = "浏览器预览模式下暂不连接远端更新服务器。";
+        return;
+      }
+
+      Bridge.checkForUpdates()
+        .then(applyCheckResult)
+        .catch(function (err) {
+          if (!closed && !activeDownload && !busyStage) {
+            setErrorState(String(err || "检查更新失败"));
+          }
+        });
+    }
+
+    if (isTauri && typeof Bridge.onUpdaterProgress === "function") {
+      Bridge.onUpdaterProgress(function (p) {
+        if (closed || !p || !p.stage) return;
+        progressWrap.hidden = false;
+        var pct = Math.max(0, Math.min(100, Number(p.progressPct || 0)));
+        barFill.style.width = pct + "%";
+        metaStageEl.textContent = String(p.message || "处理中…");
+        if (p.totalBytes && Number(p.totalBytes) > 0) {
+          metaBytesEl.textContent =
+            formatUpdateBytes(p.downloadedBytes) + " / " + formatUpdateBytes(p.totalBytes) + " (" + pct + "%)";
+        } else if (pct > 0) {
+          metaBytesEl.textContent = pct + "%";
+        } else {
+          metaBytesEl.textContent = "";
+        }
+
+        if (p.stage === "downloading" || p.stage === "verifying") {
+          activeDownload = true;
+          busyStage = true;
+          errorEl.hidden = true;
+          primaryBtn.hidden = false;
+          primaryBtn.disabled = true;
+          primaryBtn.textContent = p.stage === "verifying" ? "校验中…" : "更新中…";
+          secondaryBtn.disabled = false;
+          secondaryBtn.textContent = "取消下载";
+          secondaryBtn.onclick = function () {
+            if (activeDownload && typeof Bridge.cancelSelfUpdate === "function") {
+              secondaryBtn.disabled = true;
+              Bridge.cancelSelfUpdate().catch(function () {});
+            } else {
+              cleanupAndClose();
+            }
+          };
+        } else if (p.stage === "installing" || p.stage === "restarting") {
+          activeDownload = false;
+          busyStage = true;
+          primaryBtn.hidden = false;
+          secondaryBtn.disabled = true;
+          primaryBtn.disabled = true;
+          primaryBtn.textContent = p.stage === "restarting" ? "正在重启…" : "正在安装…";
+        } else if (p.stage === "failed") {
+          setErrorState(p.error || p.message || "更新失败");
+        }
+      })
+        .then(function (fn) {
+          if (closed && typeof fn === "function") {
+            fn();
+          } else {
+            unlistenProgress = fn;
+          }
+        })
+        .catch(function () {});
+    }
+
+    pushModal(
+      layer,
+      function () {
+        if (busyStage || activeDownload) return;
+        cleanupAndClose();
+      },
+      card,
+      detachProgressListener
+    );
+    runCheck();
+  }
+
   /* ── 公开 API ─────────────────────────────────────────────────── */
   var api = {
     toast: toast,
@@ -1125,6 +1474,9 @@
     openO2: openO2,
     openO3: openO3,
     openAbout: openAbout,
+    openUpdateDialog: openUpdateDialog,
+    isNewerVersion: isNewerVersion,
+    formatUpdateBytes: formatUpdateBytes,
     triggerClientLock: triggerClientLock,
     applyClientLockStatus: renderClientLockScreen,
     closeAll: closeAll,

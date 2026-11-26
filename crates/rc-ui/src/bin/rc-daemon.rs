@@ -84,6 +84,7 @@ struct DaemonRuntime {
     auth: Arc<AuthSessionManager>,
     maintainer: Mutex<Option<AuthMaintainerHandle>>,
     auth_sync_lock: Mutex<()>,
+    install_lock: Mutex<()>,
     ipc_secret: String,
     stop_flag: Arc<AtomicBool>,
 }
@@ -214,6 +215,7 @@ fn main() {
         auth,
         maintainer: Mutex::new(None),
         auth_sync_lock: Mutex::new(()),
+        install_lock: Mutex::new(()),
         ipc_secret: ipc_secret.clone(),
         stop_flag: Arc::clone(&stop_flag),
     });
@@ -304,6 +306,30 @@ fn main() {
                 rt_ipc.stop_flag.store(true, Ordering::Release);
                 ServiceResponse::Ok
             }
+            ServiceRequest::InstallVerifiedUpdate {
+                dmg_path,
+                expected_sha256,
+                target_app_path,
+            } => {
+                let Ok(_guard) = rt_ipc.install_lock.try_lock() else {
+                    return ServiceResponse::Error {
+                        message: "已有更新安装任务正在执行，请稍候".to_string(),
+                    };
+                };
+                if rt_ipc.stop_flag.load(Ordering::Acquire) {
+                    return ServiceResponse::Error {
+                        message: "后台守护服务正在关闭，请稍后重试".to_string(),
+                    };
+                }
+                match rc_ui::updater_macos::install_verified_dmg_from_daemon(
+                    std::path::Path::new(&dmg_path),
+                    &expected_sha256,
+                    std::path::Path::new(&target_app_path),
+                ) {
+                    Ok(()) => ServiceResponse::Ok,
+                    Err(message) => ServiceResponse::Error { message },
+                }
+            }
             _ => ServiceResponse::Ok,
         },
     ) {
@@ -324,5 +350,8 @@ fn main() {
     }
 
     ipc_server.stop();
+    // 持有 install_lock 直到进程退出：先排空任何已进入执行中的 InstallVerifiedUpdate，
+    // 同时阻止在 stop_maintainer() 等待期间由迟到 IPC worker 启动新的安装。
+    let _install_drain = rt.install_lock.lock().unwrap_or_else(|e| e.into_inner());
     rt.stop_maintainer();
 }

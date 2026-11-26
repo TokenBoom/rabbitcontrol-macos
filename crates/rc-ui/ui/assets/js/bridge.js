@@ -261,6 +261,42 @@
     getAppInfo: function () {
       return invoke("get_app_info");
     },
+    checkForUpdates: function () {
+      return invoke("check_for_updates");
+    },
+    getCachedRelease: function () {
+      return invoke("get_cached_release");
+    },
+    startSelfUpdate: function () {
+      return invoke("start_self_update");
+    },
+    cancelSelfUpdate: function () {
+      return invoke("cancel_self_update");
+    },
+    getUpdateMirrorUrl: function () {
+      return invoke("get_update_mirror_url");
+    },
+    saveUpdateMirrorUrl: function (mirrorUrl) {
+      return invoke("save_update_mirror_url", { mirrorUrl: String(mirrorUrl || "") });
+    },
+    getSessionHostVersion: function () {
+      return invoke("get_session_host_version");
+    },
+    triggerRemoteUpdate: function (targetVersion) {
+      return invoke("trigger_remote_update", {
+        targetVersion: targetVersion ? String(targetVersion) : null
+      });
+    },
+    cancelRemoteUpdate: function () {
+      return invoke("cancel_remote_update");
+    },
+    onUpdaterProgress: function (cb) {
+      return listen("updater://progress", function (ev) {
+        if (typeof cb === "function") {
+          cb(ev && ev.payload !== undefined ? ev.payload : ev);
+        }
+      });
+    },
     saveStreamPrefs: function (patch) {
       return invoke("save_stream_prefs", { patch: patch || {} });
     },

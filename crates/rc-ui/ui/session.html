@@ -91,6 +91,9 @@
       <symbol id="i-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
         <rect x="16" y="16" width="6" height="6" rx="1" /><rect x="2" y="16" width="6" height="6" rx="1" /><rect x="9" y="2" width="6" height="6" rx="1" /><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" /><path d="M12 12V8" />
       </symbol>
+      <symbol id="i-arrow-up-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10" /><path d="m16 12-4-4-4 4" /><path d="M12 16V8" />
+      </symbol>
     </defs>
   </svg>
 
@@ -133,6 +136,12 @@
         <span id="session-timer" data-tauri-drag-region>00:00:00</span>
       </div>
       <span class="sn-bar__sep" aria-hidden="true" data-tauri-drag-region></span>
+      <!-- 被控端可升级图标（A3：仅本人自控会话且发现新版本时显示，点击弹出确认框） -->
+      <button type="button" class="sn-bar__btn sn-bar__update" id="btn-remote-update"
+              aria-label="被控端可升级" title="被控端可升级" hidden>
+        <svg class="sn-ico" width="18" height="18" aria-hidden="true"><use href="#i-arrow-up-circle" /></svg>
+        <span class="sn-bar__update-dot" aria-hidden="true"></span>
+      </button>
       <!-- 右侧「控制中心」ButtonGhost → S3 -->
       <button type="button" class="sn-bar__ctrl" id="btn-control-center"
               aria-haspopup="menu" aria-expanded="false">
@@ -586,12 +595,17 @@
     </button>
   </section>
 
-  <!-- ── S3 更多子菜单（显示网络状态 HUD 开关） ── -->
+  <!-- ── S3 更多子菜单（显示网络状态 HUD 开关 + 远程更新被控端） ── -->
   <section class="sn-popover sn-submenu" id="more-menu" role="menu"
            aria-label="更多" hidden>
     <button type="button" class="sn-submenu__item" role="menuitemcheckbox" id="opt-show-hud" aria-checked="true">
       <span class="sn-check"><svg class="sn-ico" width="14" height="14" aria-hidden="true"><use href="#i-check" /></svg></span>
       <span>显示网络状态</span>
+    </button>
+    <div class="sn-menu__sep" id="menu-remote-update-sep" role="separator" aria-hidden="true" hidden></div>
+    <button type="button" class="sn-submenu__item" role="menuitem" id="btn-menu-remote-update" hidden>
+      <svg class="sn-ico" width="16" height="16" aria-hidden="true"><use href="#i-arrow-up-circle" /></svg>
+      <span id="menu-remote-update-label">升级被控端</span>
     </button>
   </section>
 
@@ -692,6 +706,41 @@
         <span class="sn-modal__spacer"></span>
         <button type="button" class="sn-btn-ghost" id="btn-shortcuts-cancel">取消</button>
         <button type="button" class="sn-btn-primary" id="btn-shortcuts-save">保存配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 远程升级被控端确认与进度弹窗（A3：必须经机主点击确认后才执行） ── -->
+  <div class="sn-modal-backdrop" id="remote-update-modal-backdrop" hidden>
+    <div class="sn-modal sn-update-modal" role="dialog" aria-modal="true" aria-labelledby="remote-update-modal-title">
+      <div class="sn-modal__head">
+        <h2 class="sn-modal__title" id="remote-update-modal-title">升级被控端</h2>
+        <button type="button" class="sn-modal__close" id="btn-remote-update-close" aria-label="关闭">×</button>
+      </div>
+      <div class="sn-modal__body">
+        <div class="sn-update-ver-row">
+          <span class="sn-update-ver-pill" id="remote-update-ver-pill">v0.0.0 → v0.0.0</span>
+          <span class="sn-update-arch" id="remote-update-arch"></span>
+        </div>
+        <p class="sn-update-desc" id="remote-update-desc">
+          升级期间被控端将下载并校验官方签名包，安装完成后会自动重启并尝试恢复当前远控连接。若被控端直连下载失败，将自动由本机中转推送安装包。
+        </p>
+        <pre class="sn-update-notes" id="remote-update-notes" hidden></pre>
+        <div class="sn-update-progress" id="remote-update-progress" hidden>
+          <div class="sn-update-bar-track">
+            <div class="sn-update-bar-fill" id="remote-update-bar-fill"></div>
+          </div>
+          <div class="sn-update-meta">
+            <span id="remote-update-stage">准备升级…</span>
+            <span id="remote-update-bytes"></span>
+          </div>
+        </div>
+        <div class="sn-update-error" id="remote-update-error" hidden></div>
+      </div>
+      <div class="sn-modal__foot">
+        <button type="button" class="sn-btn-ghost" id="btn-remote-update-cancel">取消</button>
+        <span class="sn-modal__spacer"></span>
+        <button type="button" class="sn-btn-primary" id="btn-remote-update-confirm">确认升级</button>
       </div>
     </div>
   </div>
