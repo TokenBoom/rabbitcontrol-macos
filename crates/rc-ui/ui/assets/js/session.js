@@ -247,7 +247,19 @@
       targetVersion: '',
       lastError: ''
     };
-    var relayEl = document.getElementById('opt-relay');
+    var connModeSegs = Array.prototype.slice.call(
+      document.querySelectorAll('#conn-mode-seg, #stage-conn-mode-seg')
+    );
+    var stageOverlayEl = document.getElementById('stage-overlay');
+    var stageSpinnerEl = document.getElementById('stage-spinner');
+    var stageTitleEl = document.getElementById('stage-title');
+    var stageDescEl = document.getElementById('stage-desc');
+    var stageReconnectingActionsEl = document.getElementById('stage-reconnecting-actions');
+    var stageEndedPanelEl = document.getElementById('stage-ended-panel');
+    var btnStageRetryNow = document.getElementById('btn-stage-retry-now');
+    var btnStageDisconnect = document.getElementById('btn-stage-disconnect');
+    var btnStageReconnect = document.getElementById('btn-stage-reconnect');
+    var btnStageClose = document.getElementById('btn-stage-close');
     var clipboardItem = document.getElementById('menu-clipboard');
     var clipboardStateEl = document.getElementById('menu-clipboard-state');
     var clipboardEnabled = true;
@@ -391,10 +403,12 @@
     /* ── 计时器 + HUD 首行（同一注入时钟，§6 S1 / §6 S4）──────────── */
     var Bridge = window.RCBridge;
     var IS_TAURI = Boolean(Bridge && Bridge.isTauri);
-    var stageHintEl = stage.querySelector('.sn-stage__hint');
     var hudRows = hudEl ? Array.prototype.slice.call(hudEl.querySelectorAll('span')) : [];
     var realSessionActive = false;
-    var relaySwitching = false;
+    var currentConnectionMode = 'auto';
+    var hasActiveSessionConnectionMode = false;
+    var sessionLifecycleState = 'idle'; /* idle | connecting | active | reconnecting | ended */
+    var hasHardwareVideo = false;
     var preferredResolution = null;
     var autoAppliedSavedRes = false;
     var hasDisplayConfig = false;
@@ -402,6 +416,72 @@
     var prevDisplayWidth = 0;
     var prevDisplayHeight = 0;
     var seenNegotiated = false;
+    var seenAnyConnected = false;
+
+    function normalizeConnectionMode(raw) {
+      var s = String(raw || '').trim().toLowerCase();
+      if (s === 'p2p_only' || s === 'p2p-only' || s === 'p2p') return 'p2p_only';
+      if (s === 'tcp_relay' || s === 'tcp-relay' || s === 'relay') return 'tcp_relay';
+      return 'auto';
+    }
+
+    function formatConnectionModeLabel(mode) {
+      var m = normalizeConnectionMode(mode);
+      if (m === 'p2p_only') return '仅 P2P';
+      if (m === 'tcp_relay') return 'TCP 中继';
+      return '自动';
+    }
+
+    function syncConnectionModeUi(mode) {
+      currentConnectionMode = normalizeConnectionMode(mode);
+      connModeSegs.forEach(function (seg) {
+        if (!seg) return;
+        Array.prototype.forEach.call(seg.querySelectorAll('[data-conn-mode]'), function (btn) {
+          var active = btn.getAttribute('data-conn-mode') === currentConnectionMode;
+          btn.classList.toggle('is-active', active);
+          btn.setAttribute('aria-checked', active ? 'true' : 'false');
+          btn.disabled = false;
+        });
+      });
+    }
+
+    function setHasVideo(active) {
+      var on = Boolean(active);
+      document.body.classList.toggle('has-video', on);
+      stage.classList.toggle('has-video', on);
+    }
+
+    function showStageOverlay(stateKind, title, desc) {
+      if (!stageOverlayEl) return;
+      var kind = stateKind || 'connecting';
+      stageOverlayEl.setAttribute('data-state', kind);
+      stageOverlayEl.hidden = false;
+      if (stageSpinnerEl) {
+        stageSpinnerEl.hidden = !(kind === 'connecting' || kind === 'reconnecting');
+      }
+      if (stageTitleEl) {
+        stageTitleEl.textContent = title || '';
+      }
+      if (stageDescEl) {
+        var d = desc ? String(desc).trim() : '';
+        stageDescEl.textContent = d;
+        stageDescEl.hidden = !d;
+      }
+      if (stageReconnectingActionsEl) {
+        stageReconnectingActionsEl.hidden = kind !== 'reconnecting';
+      }
+      if (stageEndedPanelEl) {
+        stageEndedPanelEl.hidden = kind !== 'ended';
+      }
+      if (kind === 'ended') {
+        syncConnectionModeUi(currentConnectionMode);
+      }
+    }
+
+    function hideStageOverlay() {
+      if (!stageOverlayEl) return;
+      stageOverlayEl.hidden = true;
+    }
 
     function formatTransportBadge(raw) {
       var text = String(raw || '').trim();
@@ -436,14 +516,11 @@
       }
     }
 
-    function syncRelaySwitchUi(transport) {
+    function syncTransportUi(transport) {
       if (typeof transport === 'string' && transport) {
         linkSecurityState.transport = transport;
         syncLinkSecurityUi();
       }
-      if (relaySwitching || !relayEl) return;
-      if (typeof transport !== 'string' || !transport) return;
-      relayEl.checked = transport === 'TCP Relay';
     }
 
     function applyHudVisibility(show, persist) {
@@ -1320,6 +1397,13 @@
           if (typeof prefs.mouseMode === 'string' && prefs.mouseMode) {
             peripheralsState.mouseMode = prefs.mouseMode;
           }
+          if (
+            !hasActiveSessionConnectionMode &&
+            typeof prefs.connectionMode === 'string' &&
+            prefs.connectionMode
+          ) {
+            syncConnectionModeUi(prefs.connectionMode);
+          }
           prefsLoaded = true;
           syncPrivacyAndHostAudioUi();
           syncPeripheralsUi();
@@ -1350,25 +1434,35 @@
         .catch(function () {});
     }
     if (IS_TAURI && typeof Bridge.getActiveSessionInfo === 'function') {
+      var applyActiveSessionMeta = function (info) {
+        if (!info || typeof info !== 'object') return;
+        if (!info.active) return;
+        if (typeof info.connectionMode === 'string' && info.connectionMode) {
+          hasActiveSessionConnectionMode = true;
+          syncConnectionModeUi(info.connectionMode);
+        }
+        hasActiveSessionSecurity = true;
+        if (typeof info.mtlsActive === 'boolean' && info.connected) {
+          linkSecurityState.encryptConnection = info.mtlsActive;
+        } else if (typeof info.encryptConnection === 'boolean') {
+          linkSecurityState.encryptConnection = info.encryptConnection;
+        }
+        if (info.peerCertFingerprint) {
+          linkSecurityState.peerFingerprint = String(info.peerCertFingerprint);
+        }
+        if (info.transport) {
+          linkSecurityState.transport = info.transport;
+        }
+        syncLinkSecurityUi();
+      };
       Bridge.getActiveSessionInfo()
-        .then(function (info) {
-          if (!info || !info.active) return;
-          hasActiveSessionSecurity = true;
-          if (typeof info.mtlsActive === 'boolean' && info.connected) {
-            linkSecurityState.encryptConnection = info.mtlsActive;
-          } else if (typeof info.encryptConnection === 'boolean') {
-            linkSecurityState.encryptConnection = info.encryptConnection;
-          }
-          if (info.peerCertFingerprint) {
-            linkSecurityState.peerFingerprint = String(info.peerCertFingerprint);
-          }
-          if (info.transport) {
-            linkSecurityState.transport = info.transport;
-          }
-          syncLinkSecurityUi();
-        })
+        .then(applyActiveSessionMeta)
         .catch(function () {});
+      if (typeof Bridge.onActiveSessionState === 'function') {
+        Bridge.onActiveSessionState(applyActiveSessionMeta);
+      }
     }
+    syncConnectionModeUi(currentConnectionMode);
     syncLinkSecurityUi();
 
     /* ════════════════════════════════════════════════════════════
@@ -3196,46 +3290,136 @@
           toast('画质将在下次连接生效');
         });
       });
+    }
 
-      /* 安全中转 Switch 为独立开关（默认关），不属单选组 */
-      if (relayEl) {
-        relayEl.addEventListener('change', function () {
-          if (!IS_TAURI) {
-            toast(relayEl.checked ? '已开启安全中转连接（预览）' : '已关闭安全中转连接（预览）');
-            relayEl.blur();
-            return;
-          }
-          var desired = Boolean(relayEl.checked);
-          if (typeof Bridge.setSessionRelayMode !== 'function') {
-            relayEl.checked = !desired;
-            toast('当前版本不支持切换安全中转');
-            relayEl.blur();
-            return;
-          }
-          relaySwitching = true;
-          relayEl.disabled = true;
-          toast(desired ? '正在切换至安全中转连接…' : '正在切换至直连模式…');
-          function finishRelaySwitch() {
-            relaySwitching = false;
-            relayEl.disabled = false;
-            relayEl.blur();
-          }
-          Bridge.setSessionRelayMode(desired)
-            .then(function (label) {
-              var modeLabel = label || (desired ? 'TCP Relay' : '直连');
-              if (hudRows.length >= 2 && label) {
-                hudRows[1].textContent = String(label);
-              }
-              toast('已切换传输模式：' + modeLabel);
-              finishRelaySwitch();
-            })
-            .catch(function (err) {
-              relayEl.checked = !desired;
-              toast(String(err || '切换安全中转失败'));
-              finishRelaySwitch();
-            });
-        });
+    /* ── 三档连接模式切换（控制中心 & 画面失败常驻面板共用，任何状态始终可点）── */
+    function switchConnectionMode(rawMode) {
+      var nextMode = normalizeConnectionMode(rawMode);
+      var modeLabel = formatConnectionModeLabel(nextMode);
+      hasActiveSessionConnectionMode = true;
+      syncConnectionModeUi(nextMode);
+      closePopover();
+      if (!IS_TAURI) {
+        toast('已切换连接模式：' + modeLabel + '（预览）');
+        return;
       }
+      if (typeof Bridge.setSessionConnectionMode !== 'function') {
+        toast('当前版本不支持切换连接模式');
+        return;
+      }
+      sessionSwitchingPending = false;
+      sessionSwitchAttempts = 0;
+      cancelSessionSwitchTimer();
+      sessionLifecycleState = 'connecting';
+      hasHardwareVideo = false;
+      setHasVideo(false);
+      realSessionActive = false;
+      showStageOverlay('connecting', '正在按「' + modeLabel + '」模式连接…', '持久化保存，切换后立即按新模式连接。');
+      toast('正在按「' + modeLabel + '」模式连接…');
+      Bridge.setSessionConnectionMode(nextMode)
+        .then(function (label) {
+          if (hudRows.length >= 2 && label) {
+            hudRows[1].textContent = String(label);
+          }
+        })
+        .catch(function (err) {
+          var errMsg = String(err || '切换连接模式失败');
+          sessionLifecycleState = 'ended';
+          hasHardwareVideo = false;
+          setHasVideo(false);
+          realSessionActive = false;
+          showStageOverlay('ended', '连接失败', errMsg);
+          toast(errMsg);
+          if (typeof Bridge.getAppPrefs === 'function') {
+            Bridge.getAppPrefs()
+              .then(function (prefs) {
+                if (
+                  sessionLifecycleState === 'ended' &&
+                  prefs &&
+                  typeof prefs.connectionMode === 'string' &&
+                  prefs.connectionMode
+                ) {
+                  syncConnectionModeUi(prefs.connectionMode);
+                }
+              })
+              .catch(function () {});
+          }
+        });
+    }
+
+    function triggerStageReconnectNow() {
+      if (!IS_TAURI) {
+        toast('正在重新连接…（预览）');
+        return;
+      }
+      sessionSwitchingPending = false;
+      sessionSwitchAttempts = 0;
+      cancelSessionSwitchTimer();
+      var modeLabel = formatConnectionModeLabel(currentConnectionMode);
+      sessionLifecycleState = 'connecting';
+      hasHardwareVideo = false;
+      setHasVideo(false);
+      realSessionActive = false;
+      showStageOverlay('connecting', '正在按「' + modeLabel + '」模式重新连接…', '');
+      var fn =
+        typeof Bridge.triggerReconnectNow === 'function'
+          ? Bridge.triggerReconnectNow
+          : typeof Bridge.reconnectLastSession === 'function'
+            ? Bridge.reconnectLastSession
+            : null;
+      if (!fn) {
+        showStageOverlay('ended', '连接失败', '当前版本暂不支持手动重连');
+        return;
+      }
+      fn().catch(function (err) {
+        var errMsg = String(err || '重新连接失败');
+        sessionLifecycleState = 'ended';
+        showStageOverlay('ended', '连接失败', errMsg);
+        toast(errMsg);
+      });
+    }
+
+    connModeSegs.forEach(function (seg) {
+      if (!seg) return;
+      Array.prototype.forEach.call(seg.querySelectorAll('[data-conn-mode]'), function (btn) {
+        btn.addEventListener('click', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var targetMode = btn.getAttribute('data-conn-mode');
+          if (targetMode) {
+            switchConnectionMode(targetMode);
+          }
+        });
+      });
+    });
+
+    if (btnStageRetryNow) {
+      btnStageRetryNow.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        triggerStageReconnectNow();
+      });
+    }
+    if (btnStageDisconnect) {
+      btnStageDisconnect.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        exitSession();
+      });
+    }
+    if (btnStageReconnect) {
+      btnStageReconnect.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        triggerStageReconnectNow();
+      });
+    }
+    if (btnStageClose) {
+      btnStageClose.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeSessionWindow(false);
+      });
     }
 
     /* ── 全屏（§6 S3：使用 Tauri 原生 NSWindow 全屏，保留 sibling CAMetalLayer） ── */
@@ -3487,76 +3671,65 @@
       /* 订阅 Rust 侧 session://update 事件流（T21 U5 / §6 / U-M7 / U-M8） */
       var CONNECT_PHASE_TEXT = {
         endpoint_creating: '正在初始化连接…',
-        connecting: '正在连接目标设备…',
+        resolving_route: '正在协商连接路由…',
+        signaling: '正在协商连接路由…',
+        probing: '正在探测直连/中继通道…',
+        connecting: '正在探测直连/中继通道…',
         awaiting_welcome: '正在验证身份与协商参数…',
-        first_frame_pending: '已连接，正在等待远端画面…'
+        first_frame_pending: '已连接，等待远端画面…'
       };
-      var endedCloseTimer = 0;
-      var sessionLifecycleState = 'idle'; /* idle | connecting | active | ended */
-      var hasHardwareVideo = false;
       var hostScreenLocked = false;
       var hostCaptureSuspended = false;
       var hostScreenStateReceivedWhilePending = false;
       var degradedVideoNotice = false;
       function syncStageHintForHostScreenState() {
-        if (!stageHintEl) return;
+        if (!stageOverlayEl) return;
         if (
           sessionSwitchingPending ||
           sessionLifecycleState === 'connecting' ||
+          sessionLifecycleState === 'reconnecting' ||
           sessionLifecycleState === 'ended'
         ) {
           return;
         }
         if (sessionLifecycleState !== 'active') return;
         if (hostScreenLocked) {
-          stageHintEl.hidden = false;
-          stageHintEl.textContent = '被控端已锁屏，解锁后将自动恢复画面';
+          showStageOverlay('notice', '被控端已锁屏，解锁后将自动恢复画面', '');
           return;
         }
         if (hostCaptureSuspended) {
-          stageHintEl.hidden = false;
-          stageHintEl.textContent = '正在唤醒被控端显示器并恢复画面…';
+          showStageOverlay('notice', '正在唤醒被控端显示器并恢复画面…', '');
           return;
         }
         if (degradedVideoNotice) {
-          stageHintEl.hidden = false;
-          stageHintEl.textContent = '硬件视频渲染不可用（当前为降级模式）';
+          showStageOverlay('notice', '硬件视频渲染不可用（当前为降级模式）', '');
           return;
         }
-        stageHintEl.hidden = true;
-      }
-      function setHasVideo(active) {
-        var on = Boolean(active);
-        document.body.classList.toggle('has-video', on);
-        stage.classList.toggle('has-video', on);
-      }
-      function cancelEndedCloseTimer() {
-        if (endedCloseTimer) {
-          window.clearTimeout(endedCloseTimer);
-          endedCloseTimer = 0;
-        }
+        hideStageOverlay();
       }
       function scheduleSessionSwitchRetry() {
         if (sessionSwitchAttempts >= SESSION_SWITCH_DELAYS.length) {
           sessionSwitchingPending = false;
-          if (stageHintEl) {
-            stageHintEl.hidden = false;
-            stageHintEl.textContent = '自动重连超时，远端桌面切换未完成';
-          }
-          cancelEndedCloseTimer();
-          endedCloseTimer = window.setTimeout(function () {
-            endedCloseTimer = 0;
-            closeSessionWindow();
-          }, 2500);
+          sessionLifecycleState = 'ended';
+          hasHardwareVideo = false;
+          setHasVideo(false);
+          realSessionActive = false;
+          showStageOverlay(
+            'ended',
+            '自动重连超时',
+            '远端桌面切换未完成，可点击重新连接或切换连接模式'
+          );
           return;
         }
         var delay = SESSION_SWITCH_DELAYS[sessionSwitchAttempts];
         sessionSwitchAttempts += 1;
         var attemptLabel = sessionSwitchAttempts + '/' + SESSION_SWITCH_DELAYS.length;
-        if (stageHintEl) {
-          stageHintEl.hidden = false;
-          stageHintEl.textContent = '远端正在切换系统桌面，自动重连中… (' + attemptLabel + ')';
-        }
+        sessionLifecycleState = 'reconnecting';
+        showStageOverlay(
+          'reconnecting',
+          '远端正在切换系统桌面，自动重连中 (' + attemptLabel + ')…',
+          ''
+        );
         cancelSessionSwitchTimer();
         sessionSwitchTimer = window.setTimeout(function () {
           sessionSwitchTimer = 0;
@@ -3574,9 +3747,6 @@
       }
       function isUserDisconnectReason(reason) {
         return reason === '用户主动断开' || reason === '已主动断开远控会话';
-      }
-      function isNormalEndReason(reason) {
-        return isUserDisconnectReason(reason) || reason === '会话已结束';
       }
       function resetSessionControlsForNewSession(preserveHostScreenState) {
         remoteAudioMuted = false;
@@ -3606,11 +3776,7 @@
         pendingUserCodecTarget = null;
         prevDisplayWidth = 0;
         prevDisplayHeight = 0;
-        if (!relaySwitching && relayEl) {
-          relayEl.checked = false;
-          relayEl.disabled = false;
-        }
-        relaySwitching = false;
+        syncConnectionModeUi(currentConnectionMode);
         streamState.width = 0;
         streamState.height = 0;
         streamState.nativeWidth = 0;
@@ -3635,6 +3801,35 @@
         syncRemoteUpdateUi();
       }
 
+      function applyMediaStreamActive(data) {
+        var backendStr = typeof data.backend === 'string' ? data.backend : '';
+        hasHardwareVideo = backendStr.indexOf('metal') !== -1;
+        setHasVideo(hasHardwareVideo);
+        degradedVideoNotice = !hasHardwareVideo && backendStr.indexOf('降级') !== -1;
+        syncStageHintForHostScreenState();
+        var negW = Number(data.width);
+        var negH = Number(data.height);
+        var negFps = Number(data.fps);
+        if (isFinite(negW) && negW > 0) streamState.width = negW;
+        if (isFinite(negH) && negH > 0) streamState.height = negH;
+        if (isFinite(negFps) && negFps > 0) {
+          streamState.fps = negFps;
+          syncFpsMenuUi(negFps);
+        }
+        if (!streamState.hasServerPresets && streamState.width > 0 && streamState.height > 0) {
+          streamState.nativeWidth = streamState.nativeWidth || streamState.width;
+          streamState.nativeHeight = streamState.nativeHeight || streamState.height;
+          streamState.presets = buildFallbackPresets(streamState.width, streamState.height);
+        }
+        renderAllResolutionLists();
+        if (hudRows.length >= 8 && data.width && data.height) {
+          hudRows[7].textContent = formatHudResolution(data.width + 'x' + data.height);
+        }
+        applySavedSessionPrefsIfReady();
+        requestSessionDisplaysOnce();
+        reportStageRect();
+      }
+
       function handleSessionUpdate(upd) {
         if (!upd || !upd.kind) return;
         var data = upd.data || {};
@@ -3651,22 +3846,56 @@
           seenNegotiated = false;
           hasHardwareVideo = false;
           setHasVideo(false);
-          cancelEndedCloseTimer();
           stopLocalTicker();
           realSessionActive = true;
           if (typeof data.watch_only === 'boolean') {
             setWatchMode(data.watch_only);
           }
-          if (stageHintEl) {
-            stageHintEl.hidden = false;
-            stageHintEl.textContent =
-              (data.phase && CONNECT_PHASE_TEXT[data.phase]) || '正在连接远端画面…';
-          }
+          var phaseText =
+            (data.phase && CONNECT_PHASE_TEXT[data.phase]) || '正在协商连接路由…';
+          showStageOverlay('connecting', phaseText, '');
           reportStageRect();
           return;
         }
+        if (upd.kind === 'reconnecting') {
+          stopLocalTicker();
+          sessionLifecycleState = 'reconnecting';
+          seenNegotiated = false;
+          hasHardwareVideo = false;
+          setHasVideo(false);
+          realSessionActive = false;
+          var attempt = Number(data.attempt) || 1;
+          var maxAttempts = Number(data.max_attempts || data.maxAttempts) || 8;
+          var recReason = data.reason ? String(data.reason) : '';
+          showStageOverlay(
+            'reconnecting',
+            '网络中断，正在自动重连 (' + attempt + '/' + maxAttempts + ')…',
+            recReason || '正在等待网络恢复并重新协商路由…'
+          );
+          return;
+        }
+        if (upd.kind === 'media_state') {
+          if (data.paused === true) {
+            hasHardwareVideo = false;
+            setHasVideo(false);
+          }
+          return;
+        }
+        if (upd.kind === 'media_resumed') {
+          hostScreenStateReceivedWhilePending = false;
+          sessionLifecycleState = 'active';
+          sessionSwitchingPending = false;
+          sessionSwitchAttempts = 0;
+          cancelSessionSwitchTimer();
+          seenNegotiated = true;
+          seenAnyConnected = true;
+          stopLocalTicker();
+          realSessionActive = true;
+          applyMediaStreamActive(data);
+          return;
+        }
         if (upd.kind === 'negotiated') {
-          if (sessionLifecycleState === 'ended') {
+          if (sessionLifecycleState === 'ended' || sessionLifecycleState === 'reconnecting') {
             resetSessionControlsForNewSession(hostScreenStateReceivedWhilePending);
           }
           hostScreenStateReceivedWhilePending = false;
@@ -3698,25 +3927,11 @@
           }
           syncRemoteUpdateUi();
           seenNegotiated = true;
-          cancelEndedCloseTimer();
+          seenAnyConnected = true;
           stopLocalTicker();
           realSessionActive = true;
           if (typeof data.watch_only === 'boolean') {
             setWatchMode(data.watch_only);
-          }
-          var backendStr = typeof data.backend === 'string' ? data.backend : '';
-          hasHardwareVideo = backendStr.indexOf('metal') !== -1;
-          setHasVideo(hasHardwareVideo);
-          degradedVideoNotice = !hasHardwareVideo && backendStr.indexOf('降级') !== -1;
-          syncStageHintForHostScreenState();
-          var negW = Number(data.width);
-          var negH = Number(data.height);
-          var negFps = Number(data.fps);
-          if (isFinite(negW) && negW > 0) streamState.width = negW;
-          if (isFinite(negH) && negH > 0) streamState.height = negH;
-          if (isFinite(negFps) && negFps > 0) {
-            streamState.fps = negFps;
-            syncFpsMenuUi(negFps);
           }
           hasActiveSessionSecurity = true;
           if (typeof data.mtls_active === 'boolean') {
@@ -3725,19 +3940,8 @@
           linkSecurityState.peerFingerprint = data.peer_cert_fingerprint
             ? String(data.peer_cert_fingerprint)
             : '';
-          syncRelaySwitchUi(data.transport);
-          if (!streamState.hasServerPresets && streamState.width > 0 && streamState.height > 0) {
-            streamState.nativeWidth = streamState.nativeWidth || streamState.width;
-            streamState.nativeHeight = streamState.nativeHeight || streamState.height;
-            streamState.presets = buildFallbackPresets(streamState.width, streamState.height);
-          }
-          renderAllResolutionLists();
-          if (hudRows.length >= 8 && data.width && data.height) {
-            hudRows[7].textContent = formatHudResolution(data.width + 'x' + data.height);
-          }
-          applySavedSessionPrefsIfReady();
-          requestSessionDisplaysOnce();
-          reportStageRect();
+          syncTransportUi(data.transport);
+          applyMediaStreamActive(data);
           return;
         }
         if (upd.kind === 'privacy_state') {
@@ -3845,7 +4049,6 @@
         if (upd.kind === 'display_config') {
           hostScreenStateReceivedWhilePending = false;
           sessionLifecycleState = 'active';
-          cancelEndedCloseTimer();
           stopLocalTicker();
           realSessionActive = true;
           if (!seenNegotiated) {
@@ -3947,7 +4150,6 @@
         if (upd.kind === 'hud') {
           hostScreenStateReceivedWhilePending = false;
           sessionLifecycleState = 'active';
-          cancelEndedCloseTimer();
           stopLocalTicker();
           realSessionActive = true;
           if (!seenNegotiated) {
@@ -3975,7 +4177,7 @@
               renderAllResolutionLists();
             }
           }
-          syncRelaySwitchUi(data.transport);
+          syncTransportUi(data.transport);
           applySavedSessionPrefsIfReady();
           requestSessionDisplaysOnce();
           applyHudSnapshot(data);
@@ -3983,14 +4185,21 @@
         }
         if (upd.kind === 'session_switching') {
           sessionSwitchingPending = true;
-          cancelEndedCloseTimer();
-          if (stageHintEl) {
-            stageHintEl.hidden = false;
-            stageHintEl.textContent = data.reason || '远端正在切换系统桌面，自动重连中…';
-          }
+          sessionLifecycleState = 'reconnecting';
+          showStageOverlay(
+            'reconnecting',
+            data.reason || '远端正在切换系统桌面，自动重连中…',
+            ''
+          );
           return;
         }
         if (upd.kind === 'ended') {
+          var reason = data.reason ? String(data.reason) : '连接已断开';
+          var prevEndedSameReason =
+            sessionLifecycleState === 'ended' &&
+            stageDescEl &&
+            stageDescEl.textContent === reason;
+          stopLocalTicker();
           sessionLifecycleState = 'ended';
           seenNegotiated = false;
           hasHardwareVideo = false;
@@ -4000,15 +4209,14 @@
           degradedVideoNotice = false;
           setHasVideo(false);
           realSessionActive = false;
-          if (relayEl) {
-            relayEl.disabled = true;
-          }
-          var reason = data.reason || '会话已结束';
           if (isUserDisconnectReason(reason)) {
             sessionSwitchingPending = false;
             sessionSwitchAttempts = 0;
             cancelSessionSwitchTimer();
-          } else if (
+            closeSessionWindow();
+            return;
+          }
+          if (
             (sessionSwitchingPending ||
               (remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting') ||
               (typeof reason === 'string' && reason.indexOf('正在切换系统桌面') !== -1)) &&
@@ -4023,35 +4231,37 @@
             scheduleSessionSwitchRetry();
             return;
           }
-          toast(reason);
-          if (isNormalEndReason(reason)) {
-            closeSessionWindow();
-          } else {
-            /* U-M8：异常结束时在 stage 展示原因并延迟关闭，避免窗口秒闪导致用户看不到失败原因 */
-            if (stageHintEl) {
-              stageHintEl.hidden = false;
-              stageHintEl.textContent = reason;
-            }
-            cancelEndedCloseTimer();
-            endedCloseTimer = window.setTimeout(function () {
-              endedCloseTimer = 0;
-              if (sessionLifecycleState === 'ended') {
-                closeSessionWindow();
-              }
-            }, 2500);
+          /* 红线：任何连接失败 / 超时 / 重连耗尽 / 对端断开绝不自动关闭窗口，常驻展示失败交互面板 */
+          if (!prevEndedSameReason) {
+            toast(reason);
           }
+          showStageOverlay(
+            'ended',
+            seenAnyConnected ? '远控连接已断开' : '连接失败',
+            reason
+          );
         }
       }
 
-      Bridge.onSessionUpdate(handleSessionUpdate);
-
-      /* Review M8：首帧主动拉取最近一次会话快照，消除窗口加载与事件推送之间的竞态窗口 */
-      if (typeof Bridge.sessionSnapshot === 'function') {
+      function fetchInitialSessionSnapshot() {
+        if (typeof Bridge.sessionSnapshot !== 'function') return;
         Bridge.sessionSnapshot()
           .then(function (snap) {
-            if (snap) handleSessionUpdate(snap);
+            if (!snap || !snap.kind) return;
+            /* 若监听已先收到更晚的活跃/终态事件，勿用过期的 connecting 快照回退覆盖 */
+            if (snap.kind === 'connecting' && sessionLifecycleState !== 'idle') return;
+            handleSessionUpdate(snap);
           })
           .catch(function () {});
+      }
+
+      /* Review M8 / #1：先完成事件监听注册，再拉取会话快照（含后端 last_terminal_error 补发），
+       * 消除 listen 异步注册与 sessionSnapshot 之间的竞态窗口 */
+      var sessionUpdateListenPromise = Bridge.onSessionUpdate(handleSessionUpdate);
+      if (sessionUpdateListenPromise && typeof sessionUpdateListenPromise.then === 'function') {
+        sessionUpdateListenPromise.then(fetchInitialSessionSnapshot, fetchInitialSessionSnapshot);
+      } else {
+        fetchInitialSessionSnapshot();
       }
       if (typeof Bridge.getSessionHostVersion === 'function') {
         Bridge.getSessionHostVersion()
@@ -4094,6 +4304,7 @@
       function isStageInputTarget(target) {
         if (!target) return false;
         if (hudWrap && hudWrap.contains(target)) return false;
+        if (stageOverlayEl && !stageOverlayEl.hidden && stageOverlayEl.contains(target)) return false;
         if (open || isAnySessionModalOpen()) return false;
         return true;
       }

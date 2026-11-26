@@ -94,6 +94,11 @@
     active: !IS_TAURI,
     connected: !IS_TAURI,
     watchOnly: false,
+    phase: !IS_TAURI ? 'connected' : '',
+    reconnectingAttempt: 0,
+    reconnectingMax: 8,
+    reconnectingReason: '',
+    endedReason: '',
     deviceName: ''
   };
   var queue = IS_TAURI ? [] : MOCK_QUEUE.slice();
@@ -389,7 +394,25 @@
 
     var contentHtml;
     if (pane.error) {
-      contentHtml = '<div class="tr-empty">' + escapeHtml(pane.error) + '</div>';
+      if (pane.side === 'remote' && IS_TAURI && !isRemoteReady() && !remoteSession.watchOnly) {
+        if (remoteSession.phase === 'reconnecting') {
+          contentHtml =
+            '<div class="tr-empty" style="flex-direction:column;gap:10px;padding:16px;text-align:center;">' +
+            '<span>' + escapeHtml(pane.error) + '</span>' +
+            '<button type="button" class="btn btn--primary" data-action="reconnect-now" style="height:30px;padding:0 14px;font-size:var(--size-secondary);">立即重试</button>' +
+            '</div>';
+        } else if (!remoteSession.active) {
+          contentHtml =
+            '<div class="tr-empty" style="flex-direction:column;gap:10px;padding:16px;text-align:center;">' +
+            '<span>' + escapeHtml(pane.error) + '</span>' +
+            '<button type="button" class="btn btn--primary" data-action="reconnect-now" style="height:30px;padding:0 14px;font-size:var(--size-secondary);">重新连接</button>' +
+            '</div>';
+        } else {
+          contentHtml = '<div class="tr-empty">' + escapeHtml(pane.error) + '</div>';
+        }
+      } else {
+        contentHtml = '<div class="tr-empty">' + escapeHtml(pane.error) + '</div>';
+      }
     } else if (pane.loading && !files.length) {
       contentHtml = '<div class="tr-empty">正在读取目录…</div>';
     } else if (!files.length) {
@@ -684,9 +707,15 @@
       pane.loading = false;
       pane.error = remoteSession.watchOnly
         ? '当前为只读观看模式，无法使用文件传输'
-        : remoteSession.active
-          ? '正在建立远控连接…'
-          : '请先建立远控会话';
+        : remoteSession.phase === 'reconnecting'
+          ? '连接中断，正在自动重连 (' +
+            (remoteSession.reconnectingAttempt || 1) +
+            '/' +
+            (remoteSession.reconnectingMax || 8) +
+            ')…'
+          : remoteSession.active
+            ? '正在建立安全连接…'
+            : remoteSession.endedReason || '请先建立远控会话';
       renderPane(pane);
       return;
     }
@@ -836,32 +865,79 @@
     syncSendState();
   }
 
+  function triggerSessionReconnect() {
+    if (!IS_TAURI) return;
+    var fn =
+      typeof Bridge.triggerReconnectNow === 'function'
+        ? Bridge.triggerReconnectNow
+        : typeof Bridge.reconnectLastSession === 'function'
+          ? Bridge.reconnectLastSession
+          : null;
+    if (!fn) {
+      toast('当前版本暂不支持自动重连，请从主窗口重新连接');
+      return;
+    }
+    remoteSession.active = true;
+    remoteSession.connected = false;
+    remoteSession.phase = 'connecting';
+    remoteSession.endedReason = '';
+    resetRemotePaneDisconnected('正在建立安全连接…', false);
+    toast('正在重新连接…');
+    fn().catch(function (err) {
+      var msg = errMessage(err);
+      remoteSession.active = false;
+      remoteSession.connected = false;
+      remoteSession.phase = 'ended';
+      remoteSession.endedReason = msg;
+      resetRemotePaneDisconnected(msg, false);
+      toast(msg);
+    });
+  }
+
   function applyActiveSessionInfo(raw) {
     var s = raw && typeof raw === 'object' ? raw : {};
     var nextActive = Boolean(s.active);
     var nextConnected = Boolean(s.connected);
     var nextWatch = Boolean(s.watchOnly !== undefined ? s.watchOnly : s.watch_only);
+    var rawPhase = s.phase ? String(s.phase) : '';
+    var nextPhase = rawPhase || (nextConnected ? 'connected' : nextActive ? 'connecting' : '');
     var nextName = String(
       s.deviceName || s.device_name || s.target || ''
     );
     remoteSession.active = nextActive;
     remoteSession.connected = nextConnected;
     remoteSession.watchOnly = nextWatch;
-    remoteSession.deviceName = nextName;
-    setHeaderDeviceName('tr-remote-name', nextName || '未连接远端');
+    remoteSession.phase = nextPhase;
+    if (nextName) remoteSession.deviceName = nextName;
+    setHeaderDeviceName(
+      'tr-remote-name',
+      nextActive ? (nextName || remoteSession.deviceName || '远程设备') : '未连接远端'
+    );
 
     if (!nextActive) {
-      resetRemotePaneDisconnected('请先建立远控会话', true);
+      resetRemotePaneDisconnected(remoteSession.endedReason || '请先建立远控会话', true);
       return;
     }
     if (nextWatch) {
       resetRemotePaneDisconnected('当前为只读观看模式，无法使用文件传输', false);
       return;
     }
-    if (!nextConnected) {
-      resetRemotePaneDisconnected('正在建立远控连接…', false);
+    if (nextPhase === 'reconnecting') {
+      resetRemotePaneDisconnected(
+        '连接中断，正在自动重连 (' +
+          (remoteSession.reconnectingAttempt || 1) +
+          '/' +
+          (remoteSession.reconnectingMax || 8) +
+          ')…',
+        false
+      );
       return;
     }
+    if (!nextConnected) {
+      resetRemotePaneDisconnected('正在建立安全连接…', false);
+      return;
+    }
+    remoteSession.endedReason = '';
     syncSendState();
     if (!panes.remote.dir && !panes.remote.loading) {
       loadRemoteDir(null, false);
@@ -943,19 +1019,54 @@
 
   function handleSessionUpdate(upd) {
     if (!upd || !upd.kind) return;
+    var data = upd.data || {};
+    if (upd.kind === 'connecting') {
+      remoteSession.active = true;
+      remoteSession.connected = false;
+      remoteSession.phase = 'connecting';
+      remoteSession.endedReason = '';
+      var connName = data.device_name || data.device || remoteSession.deviceName;
+      if (connName) {
+        remoteSession.deviceName = String(connName);
+        setHeaderDeviceName('tr-remote-name', String(connName));
+      }
+      resetRemotePaneDisconnected('正在建立安全连接…', false);
+      return;
+    }
+    if (upd.kind === 'reconnecting') {
+      remoteSession.active = true;
+      remoteSession.connected = false;
+      remoteSession.phase = 'reconnecting';
+      remoteSession.reconnectingAttempt = Number(data.attempt) || 1;
+      remoteSession.reconnectingMax = Number(data.max_attempts || data.maxAttempts) || 8;
+      remoteSession.reconnectingReason = data.reason ? String(data.reason) : '';
+      var recText =
+        '连接中断，正在自动重连 (' +
+        remoteSession.reconnectingAttempt +
+        '/' +
+        remoteSession.reconnectingMax +
+        ')…' +
+        (remoteSession.reconnectingReason ? '（' + remoteSession.reconnectingReason + '）' : '');
+      resetRemotePaneDisconnected(recText, false);
+      return;
+    }
     if (upd.kind === 'ended') {
+      var reason = data.reason ? String(data.reason) : '远控会话已断开';
       remoteSession.active = false;
       remoteSession.connected = false;
       remoteSession.watchOnly = false;
+      remoteSession.phase = 'ended';
+      remoteSession.endedReason = reason;
       setHeaderDeviceName('tr-remote-name', '未连接远端');
-      resetRemotePaneDisconnected('请先建立远控会话', true);
+      resetRemotePaneDisconnected(reason, true);
       return;
     }
     if (upd.kind === 'negotiated') {
-      var data = upd.data || {};
       var dName = data.device_name || data.device || remoteSession.deviceName;
       remoteSession.active = true;
       remoteSession.connected = true;
+      remoteSession.phase = 'connected';
+      remoteSession.endedReason = '';
       if (typeof data.watch_only === 'boolean') {
         remoteSession.watchOnly = data.watch_only;
       }
@@ -1145,6 +1256,10 @@
               function () {}
             );
           }
+          return;
+        }
+        if (action === 'reconnect-now') {
+          triggerSessionReconnect();
           return;
         }
       }

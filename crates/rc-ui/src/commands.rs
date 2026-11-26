@@ -12,14 +12,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rc_input::{InputEvent, MouseButton};
 use rc_session::auth::{OwnerTicketSigner, OwnerTicketVerifier};
 use rc_tools::{fonts::TerminalFontInfo, FileEntry, PortMapRuleSnapshot, TransferItem};
 use rc_ui::app_prefs::{
-    self, AppPrefs, DeviceSnapshotView, SavedPortMapRule, SecurityPrefsPatch, StreamPrefsPatch,
-    TerminalPrefsPatch,
+    self, AppPrefs, ConnectionMode, DeviceSnapshotView, SavedPortMapRule, SecurityPrefsPatch,
+    StreamPrefsPatch, TerminalPrefsPatch,
 };
 use rc_ui::auth_client::{
     AuthClientError, AuthHttpClient, AuthSessionManager, BindDeviceRequest, MyDeviceInfo,
@@ -39,6 +39,7 @@ use rc_ui::session_bridge::{
     SessionCommand, SessionHandle, SessionUpdate, ToolClientHandle, UiSessionConfig,
 };
 use rc_ui::signal_client::{self, SignalClientHandle, SignalClientOptions};
+use rc_ui::upnp::UpnpStatus;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -100,6 +101,9 @@ pub struct OpenSessionRequest {
     /// 是否强制通过 TCP 中继连接（忽略 P2P 直连）。
     #[serde(default)]
     pub force_relay: bool,
+    /// 连接路由模式（`"auto"` / `"p2p_only"` / `"tcp_relay"`；未传时读取持久化偏好）。
+    #[serde(default)]
+    pub connection_mode: Option<String>,
     /// 后台静默工具会话模式（`true` 时仅建立底层传输会话，不弹出 S1 远程桌面窗口，供 W2/W3/W4 工具按需静默建连）。
     #[serde(default)]
     pub headless: bool,
@@ -367,11 +371,10 @@ pub(crate) fn teardown_session(app: &AppHandle, mut old: ActiveSession) {
     }
 }
 
-/// 同步等待旧会话发完 `Bye(Normal)` / 断开并摘除 Metal 图层（有界超时），
-/// 避免在切换传输模式或加密模式时旧连接尚未退场就向服务端申请新中继凭据，导致被控端错过新配对。
+/// 同步等待旧会话发完 `Bye(Normal)` / 断开并摘除 Metal 图层（有界超时 300ms），
+/// 避免在切换传输模式或加密模式时旧连接尚未退场就向服务端申请新中继凭据，同时绝不阻塞新连接启动。
 async fn teardown_session_and_wait(app: &AppHandle, mut old: ActiveSession) {
     stop_shortcut_tap_runtime(&app.state::<AppState>());
-    old.handle.send(SessionCommand::Disconnect);
     let app_bg = app.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         if let Some(lease) = old.layer_state.take_lease() {
@@ -387,7 +390,7 @@ async fn teardown_session_and_wait(app: &AppHandle, mut old: ActiveSession) {
             };
             drop(returned_lease);
         }
-        drop(old);
+        old.handle.detach_and_abort(Duration::from_millis(300));
     })
     .await;
 }
@@ -407,8 +410,11 @@ pub(crate) fn disconnect_active_session_with_lock(
             .lock_on_exit;
         let should_lock = lock_override.unwrap_or(lock_pref);
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
-        // H9：递增会话打开代次，使任何在途的 `open_session` (`request_connect`) 醒来后自动作废。
+        // H9：递增会话打开代次，使任何在途的 `open_session` / 自动重连任务醒来后自动作废。
         let new_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        state.connecting_epoch.store(0, Ordering::Release);
+        state.clear_terminal_error();
+        cancel_auto_reconnect(&state);
         state::clear_session_snapshot_locked(&state.last_session_update);
         *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
         (slot.take(), should_lock, new_epoch)
@@ -423,6 +429,7 @@ pub(crate) fn disconnect_active_session_with_lock(
             "session://update",
             &SessionUpdate::Ended {
                 reason: "已主动断开远控会话".to_string(),
+                recoverable: false,
             },
         );
         teardown_session(app, session);
@@ -515,23 +522,64 @@ fn resolve_session_target_meta(
     (device_key, device_name, relay_target_id)
 }
 
+/// 单次信令连接请求超时（收紧至 5 秒，降低切网或节点离线时的等待感）。
+const SIGNAL_REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 当信令通道正处于 `Connecting`（例如刚切网恢复瞬间）时，最多短等 4 秒待信令就绪再发起请求。
+const SIGNAL_CONNECTING_WAIT_CAP: Duration = Duration::from_secs(4);
+
 async fn resolve_endpoint_and_grant(
     state: &AppState,
     target: ConnectTarget,
     force_relay: bool,
+    expected_epoch: Option<u64>,
 ) -> Result<(SocketAddr, Option<rc_ui::signal_client::ConnectGrant>), String> {
     match target {
         ConnectTarget::Direct(addr) => Ok((addr, None)),
         ConnectTarget::DeviceId(target_id) => {
             if state.is_service_proxy() {
+                let wait_deadline = Instant::now() + SIGNAL_CONNECTING_WAIT_CAP;
+                loop {
+                    if expected_epoch
+                        .is_some_and(|ep| state.session_open_epoch.load(Ordering::Acquire) != ep)
+                    {
+                        return Err("连接请求已取消".to_string());
+                    }
+                    let srv_state = tauri::async_runtime::spawn_blocking(|| {
+                        match call_agent_ipc(
+                            ServiceRequest::GetServerStatus,
+                            Duration::from_millis(350),
+                        ) {
+                            Ok(ServiceResponse::ServerStatus(s)) => Some(s.state),
+                            _ => None,
+                        }
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if srv_state != Some(ServerConnectionState::Connecting)
+                        || Instant::now() >= wait_deadline
+                    {
+                        break;
+                    }
+                    let _ = tauri::async_runtime::spawn_blocking(|| {
+                        std::thread::sleep(Duration::from_millis(150));
+                    })
+                    .await;
+                }
+                if expected_epoch
+                    .is_some_and(|ep| state.session_open_epoch.load(Ordering::Acquire) != ep)
+                {
+                    return Err("连接请求已取消".to_string());
+                }
+                let timeout_ms = SIGNAL_REQUEST_CONNECT_TIMEOUT.as_millis() as u64;
                 let grant = tauri::async_runtime::spawn_blocking(move || {
                     match call_agent_ipc(
                         ServiceRequest::RequestConnect {
                             target_id,
-                            timeout_ms: 10_000,
+                            timeout_ms,
                             force_relay,
                         },
-                        Duration::from_secs(12),
+                        SIGNAL_REQUEST_CONNECT_TIMEOUT + Duration::from_secs(2),
                     )? {
                         ServiceResponse::ConnectGrant(grant) => Ok(*grant),
                         ServiceResponse::Error { message } => Err(message),
@@ -549,14 +597,35 @@ async fn resolve_endpoint_and_grant(
             let Some(client) = client else {
                 return Err("请先在「设置 → 网络」配置并连接服务器".to_string());
             };
+            if client.status().state == ServerConnectionState::Connecting {
+                let wait_deadline = Instant::now() + SIGNAL_CONNECTING_WAIT_CAP;
+                while client.status().state == ServerConnectionState::Connecting
+                    && Instant::now() < wait_deadline
+                {
+                    if expected_epoch
+                        .is_some_and(|ep| state.session_open_epoch.load(Ordering::Acquire) != ep)
+                    {
+                        return Err("连接请求已取消".to_string());
+                    }
+                    let _ = tauri::async_runtime::spawn_blocking(|| {
+                        std::thread::sleep(Duration::from_millis(100));
+                    })
+                    .await;
+                }
+            }
+            if expected_epoch
+                .is_some_and(|ep| state.session_open_epoch.load(Ordering::Acquire) != ep)
+            {
+                return Err("连接请求已取消".to_string());
+            }
             if client.status().state != ServerConnectionState::Connected {
                 return Err("请先在「设置 → 网络」配置并连接服务器".to_string());
             }
             let grant = tauri::async_runtime::spawn_blocking(move || {
                 if force_relay {
-                    client.request_relay(&target_id, Duration::from_secs(10))
+                    client.request_relay(&target_id, SIGNAL_REQUEST_CONNECT_TIMEOUT)
                 } else {
-                    client.request_connect(&target_id, Duration::from_secs(10))
+                    client.request_connect(&target_id, SIGNAL_REQUEST_CONNECT_TIMEOUT)
                 }
             })
             .await
@@ -566,7 +635,7 @@ async fn resolve_endpoint_and_grant(
     }
 }
 
-fn preallocate_metal_layer_for_session(
+pub(crate) fn preallocate_metal_layer_for_session(
     app: &AppHandle,
     prefer_hardware: bool,
 ) -> Option<metal_attach::MainThreadMetalLayer> {
@@ -597,6 +666,7 @@ fn activate_session_with_cfg(
 
     let preallocated_layer = match preallocated_override {
         Some(layer) => layer,
+        None if meta.tools_only => None,
         None => {
             window::ensure_session_window(app, state, watch_only)?;
             window::set_session_window_title(app, &meta.device_name);
@@ -628,6 +698,8 @@ fn activate_session_with_cfg(
         active.set_meta(meta);
         let info = active.info();
         *slot = Some(active);
+        state.clear_connecting_epoch(my_epoch);
+        state.clear_terminal_error();
         (old, info)
     };
 
@@ -718,7 +790,9 @@ fn build_signal_client_options(state: &AppState) -> SignalClientOptions {
             .map_err(format_auth_error)
     });
     let device_pubkey = Some(state.auth.cert_manager().device_pubkey_hex());
-    let allow_remote_assist = sync_prefs_from_disk_if_proxy(state).allow_remote_assist;
+    let prefs_snap = sync_prefs_from_disk_if_proxy(state);
+    let allow_remote_assist = prefs_snap.allow_remote_assist;
+    let upnp_enabled = prefs_snap.upnp_enabled;
     let allow_remote_control = state
         .host
         .lock()
@@ -731,6 +805,7 @@ fn build_signal_client_options(state: &AppState) -> SignalClientOptions {
         allow_remote_assist,
         allow_remote_control: Some(allow_remote_control),
         dynamic_lan_discovery: true,
+        upnp_enabled,
     }
 }
 
@@ -869,7 +944,179 @@ fn prepare_session_security(
     })
 }
 
-/// IPC 命令：打开远控会话（校验输入后立即弹出 S1 会话窗口并预分配 Metal 图层，同时异步拉取信令凭据与安全配置，减少首屏等待）。
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_connection_mode(
+    force_relay: bool,
+    requested: Option<&str>,
+    persisted: ConnectionMode,
+) -> ConnectionMode {
+    if force_relay {
+        return ConnectionMode::TcpRelay;
+    }
+    requested
+        .and_then(ConnectionMode::parse_lossy)
+        .unwrap_or(persisted)
+}
+
+/// 解析本次会话实际使用的连接路由模式：
+/// - 若本次请求显式传了 `force_relay: true` 或有效的 `connection_mode`，优先采用本次显式模式；
+/// - 否则使用全局持久化偏好 `persisted`，但若目标为纯 IP 直连（`ConnectTarget::Direct` 且无
+///   `relay_target_id`）且全局偏好为 `TcpRelay`，本次自动回退为 `ConnectionMode::Auto`（允许直连，
+///   不锁死纯 IP 且不覆盖全局偏好）。
+fn resolve_connection_mode_for_target(
+    force_relay: bool,
+    requested: Option<&str>,
+    persisted: ConnectionMode,
+    parsed: &ConnectTarget,
+    relay_target_id: Option<&str>,
+) -> ConnectionMode {
+    let explicit_mode = if force_relay {
+        Some(ConnectionMode::TcpRelay)
+    } else {
+        requested.and_then(ConnectionMode::parse_lossy)
+    };
+    match explicit_mode {
+        Some(mode) => mode,
+        None => {
+            if persisted == ConnectionMode::TcpRelay
+                && matches!(parsed, ConnectTarget::Direct(_))
+                && relay_target_id.is_none()
+            {
+                ConnectionMode::Auto
+            } else {
+                persisted
+            }
+        }
+    }
+}
+
+fn connection_mode_label(mode: ConnectionMode) -> &'static str {
+    match mode {
+        ConnectionMode::Auto => "自动模式",
+        ConnectionMode::P2pOnly => "仅 P2P",
+        ConnectionMode::TcpRelay => "TCP Relay",
+    }
+}
+
+fn effective_target_for_mode(
+    parsed: ConnectTarget,
+    relay_target_id: Option<&str>,
+    mode: ConnectionMode,
+) -> Result<ConnectTarget, String> {
+    if mode == ConnectionMode::TcpRelay {
+        match (&parsed, relay_target_id) {
+            (ConnectTarget::DeviceId(_), _) => Ok(parsed),
+            (ConnectTarget::Direct(_), Some(id)) => Ok(ConnectTarget::DeviceId(id.to_string())),
+            (ConnectTarget::Direct(_), None) => Err(
+                "直连地址未绑定 9 位设备码，无法强制开启 TCP 中继；请使用对方 9 位设备码连接"
+                    .to_string(),
+            ),
+        }
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn is_same_session_target(
+    active_meta: &ActiveSessionMeta,
+    raw_target: &str,
+    parsed: &ConnectTarget,
+    device_key: &str,
+    relay_target_id: Option<&str>,
+) -> bool {
+    let active_key = active_meta.device_key.trim();
+    let next_key = device_key.trim();
+    if !active_key.is_empty() && !next_key.is_empty() && active_key == next_key {
+        return true;
+    }
+    let active_did = active_meta
+        .relay_target_id
+        .as_deref()
+        .map(normalize_device_id_for_match)
+        .filter(|s| !s.is_empty())
+        .or_else(|| match model::parse_connect_input(&active_meta.target) {
+            Ok(ConnectTarget::DeviceId(id)) => Some(normalize_device_id_for_match(&id)),
+            _ => None,
+        });
+    let next_did = relay_target_id
+        .map(normalize_device_id_for_match)
+        .filter(|s| !s.is_empty())
+        .or_else(|| match parsed {
+            ConnectTarget::DeviceId(id) => Some(normalize_device_id_for_match(id)),
+            ConnectTarget::Direct(_) => None,
+        });
+    if let (Some(a), Some(b)) = (active_did.as_deref(), next_did.as_deref()) {
+        if a == b {
+            return true;
+        }
+    }
+    let active_target = active_meta.target.trim();
+    let next_target = raw_target.trim();
+    if !active_target.is_empty() && !next_target.is_empty() {
+        if active_target == next_target {
+            return true;
+        }
+        if let Ok(active_parsed) = model::parse_connect_input(active_target) {
+            if active_parsed == *parsed {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn can_reuse_headless_session<H>(
+    active: &ActiveSession<H>,
+    raw_target: &str,
+    parsed: &ConnectTarget,
+    device_key: &str,
+    relay_target_id: Option<&str>,
+) -> bool {
+    !active.disconnecting
+        && !active.watch_only
+        && is_same_session_target(
+            &active.meta,
+            raw_target,
+            parsed,
+            device_key,
+            relay_target_id,
+        )
+}
+
+fn save_last_session_params(state: &AppState, watch_only: bool, meta: ActiveSessionMeta) {
+    *state
+        .last_session_params
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((watch_only, meta));
+}
+
+/// 信令/安全协商期 RAII 守卫：在异常早退、取消或完成后通过 CAS 仅清零自身代次的 `connecting_epoch`。
+struct ConnectingEpochGuard<'a> {
+    state: &'a AppState,
+    epoch: u64,
+}
+
+impl<'a> ConnectingEpochGuard<'a> {
+    fn begin(state: &'a AppState, epoch: u64) -> Self {
+        state.connecting_epoch.store(epoch, Ordering::Release);
+        Self { state, epoch }
+    }
+}
+
+impl Drop for ConnectingEpochGuard<'_> {
+    fn drop(&mut self) {
+        self.state.clear_connecting_epoch(self.epoch);
+    }
+}
+
+fn cancel_auto_reconnect(state: &AppState) {
+    // 仅重置重试计数并唤醒睡眠，让已过期的旧任务根据调用方递增的 `session_open_epoch` 自行退出并 CAS 释放自身令牌，
+    // 绝不强行 `store(0)` 覆盖可能并发启动的后代重连任务令牌。
+    state.auto_reconnect_attempts.store(0, Ordering::Release);
+    state.wake_auto_reconnect();
+}
+
+/// IPC 命令：打开远控会话（支持纯工具同目标免拆复用、纯工具原地热升级桌面、三档连接模式与失败常驻绝不关窗）。
 #[tauri::command]
 pub async fn open_session(
     cfg: OpenSessionRequest,
@@ -883,24 +1130,238 @@ pub async fn open_session(
     let (device_key, device_name, relay_target_id) =
         resolve_session_target_meta(&state, &cfg.target, &parsed, cfg.device_name.as_deref());
 
-    let effective_target = if cfg.force_relay {
-        match (&parsed, &relay_target_id) {
-            (ConnectTarget::DeviceId(_), _) => parsed,
-            (ConnectTarget::Direct(_), Some(id)) => ConnectTarget::DeviceId(id.clone()),
-            (ConnectTarget::Direct(_), None) => {
-                return Err(
-                    "直连地址未绑定 9 位设备码，无法强制开启安全中转；请使用对方 9 位设备码连接"
-                        .to_string(),
-                );
+    // 在拆旧会话前优先判定同目标复用或纯工具原地热升级，避免工具秒开窗竞态或重复建连。
+    enum ReuseDecision {
+        None,
+        ReuseHeadless,
+        WakeReconnectingHeadless,
+        UpgradeToDesktop {
+            sid: u64,
+            device_name: String,
+            prefer_hardware: bool,
+            video_size: Option<(u32, u32)>,
+        },
+    }
+
+    let reuse = {
+        let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = slot.as_ref() {
+            if cfg.headless
+                && can_reuse_headless_session(
+                    active,
+                    &cfg.target,
+                    &parsed,
+                    &device_key,
+                    relay_target_id.as_deref(),
+                )
+            {
+                ReuseDecision::ReuseHeadless
+            } else if !cfg.headless
+                && !active.disconnecting
+                && !active.meta.media_active
+                && is_same_session_target(
+                    &active.meta,
+                    &cfg.target,
+                    &parsed,
+                    &device_key,
+                    relay_target_id.as_deref(),
+                )
+            {
+                ReuseDecision::UpgradeToDesktop {
+                    sid: active.id,
+                    device_name: if !active.meta.device_name.is_empty() {
+                        active.meta.device_name.clone()
+                    } else {
+                        device_name.clone()
+                    },
+                    prefer_hardware: active.meta.prefer_hardware,
+                    video_size: active.video_size,
+                }
+            } else {
+                ReuseDecision::None
             }
+        } else if cfg.headless && state.is_auto_reconnect_active() {
+            let matches_reconnecting = state
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|(watch_only, meta)| {
+                    !*watch_only
+                        && is_same_session_target(
+                            meta,
+                            &cfg.target,
+                            &parsed,
+                            &device_key,
+                            relay_target_id.as_deref(),
+                        )
+                });
+            if matches_reconnecting {
+                ReuseDecision::WakeReconnectingHeadless
+            } else {
+                ReuseDecision::None
+            }
+        } else if cfg.headless && state.is_connecting_current_epoch() {
+            let matches_connecting = state
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|(watch_only, meta)| {
+                    !*watch_only
+                        && is_same_session_target(
+                            meta,
+                            &cfg.target,
+                            &parsed,
+                            &device_key,
+                            relay_target_id.as_deref(),
+                        )
+                });
+            if matches_connecting {
+                ReuseDecision::ReuseHeadless
+            } else {
+                ReuseDecision::None
+            }
+        } else {
+            ReuseDecision::None
         }
-    } else {
-        parsed
     };
 
-    // H9：在打开窗口与 `request_connect` 之前递增代次；若在途期间出现新的 `open_session` 或 S1 关窗，
-    // 返回后自动丢弃过期凭据且不启动会话。
+    match reuse {
+        ReuseDecision::ReuseHeadless => return Ok(()),
+        ReuseDecision::WakeReconnectingHeadless => {
+            state.wake_auto_reconnect();
+            return Ok(());
+        }
+        ReuseDecision::UpgradeToDesktop {
+            sid,
+            device_name: upgrade_name,
+            prefer_hardware,
+            video_size,
+        } => {
+            window::ensure_session_window(&app, &state, cfg.watch_only)?;
+            window::set_session_window_title(&app, &upgrade_name);
+            if let Some((vw, vh)) = video_size {
+                if vw > 0 && vh > 0 {
+                    let _ = window::fit_session_window_to_video(&app, vw, vh, false);
+                }
+            }
+            let preallocated = preallocate_metal_layer_for_session(&app, prefer_hardware)
+                .map(metal_attach::MainThreadMetalLayer::into_render_surface);
+            let upgrade_result = {
+                let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(active) = slot
+                    .as_mut()
+                    .filter(|a| a.id == sid && !a.disconnecting && !a.meta.media_active)
+                {
+                    if active.watch_only != cfg.watch_only {
+                        active.watch_only = cfg.watch_only;
+                        active.handle.set_watch_only(cfg.watch_only);
+                    }
+                    let tools_to_detach = cfg.watch_only.then(|| active.handle.tools());
+                    active.handle.upgrade_to_desktop(preallocated);
+                    if active.meta.audio_enabled {
+                        active
+                            .handle
+                            .send(SessionCommand::SetAudioMuted { muted: false });
+                    }
+                    active.handle.send_display_ctrl(
+                        rc_client_core::display_ctrl::DisplayControlMsg::ListDisplays,
+                    );
+                    active.meta.media_active = true;
+                    active.meta.tools_only = false;
+                    save_last_session_params(&state, active.watch_only, active.meta.clone());
+                    let fallback = Frame {
+                        x: 0.0,
+                        y: 0.0,
+                        width: f64::from(active.meta.width.max(1)),
+                        height: f64::from(active.meta.height.max(1)),
+                    };
+                    let attach_req = active
+                        .handle
+                        .layer_lease()
+                        .and_then(|lease| active.begin_attach(lease, fallback));
+                    Some((active.info(), attach_req, tools_to_detach))
+                } else {
+                    None
+                }
+            };
+            if let Some((info, attach_req, tools_to_detach)) = upgrade_result {
+                if let Some(tools) = tools_to_detach {
+                    let _ = tools.detach_all_terminals();
+                }
+                let _ = app.emit("session://active-state", &info);
+                if let Some((attach_sid, lease, frame)) = attach_req {
+                    crate::attach_layer_on_main_thread(&app, attach_sid, lease, frame);
+                }
+                let _ = sync_shortcut_tap_runtime(&app, &state);
+                return Ok(());
+            }
+            // 若并发期间该纯工具会话恰好断开或已被替换，落回正常建连路径。
+        }
+        ReuseDecision::None => {}
+    }
+
+    let prefs_snap = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let connection_mode = resolve_connection_mode_for_target(
+        cfg.force_relay,
+        cfg.connection_mode.as_deref(),
+        prefs_snap.connection_mode,
+        &parsed,
+        relay_target_id.as_deref(),
+    );
+    let force_relay = connection_mode == ConnectionMode::TcpRelay;
+    let effective_target =
+        effective_target_for_mode(parsed, relay_target_id.as_deref(), connection_mode)?;
+
+    let (req_width, req_height) = match (cfg.width, cfg.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT),
+    };
+    let req_fps = cfg.fps.unwrap_or(prefs_snap.fps).max(1);
+    let req_bitrate_bps = cfg.bitrate_bps.unwrap_or(prefs_snap.bitrate_bps).max(1);
+    let password = cfg.password.filter(|p| !p.is_empty());
+    let encrypt_connection = cfg
+        .encrypt_connection
+        .unwrap_or(prefs_snap.default_encrypt_connection);
+
+    let mut meta = ActiveSessionMeta {
+        target: cfg.target.trim().to_string(),
+        device_key,
+        device_name: device_name.clone(),
+        relay_target_id: relay_target_id.clone(),
+        password: password.clone(),
+        width: req_width,
+        height: req_height,
+        fps: req_fps,
+        bitrate_bps: req_bitrate_bps,
+        prefer_hardware: cfg.prefer_hardware,
+        clipboard_enabled: cfg.clipboard_enabled,
+        audio_enabled: cfg.audio_enabled,
+        force_relay,
+        connection_mode,
+        media_active: !cfg.headless,
+        phase: "connecting".to_string(),
+        tools_only: cfg.headless,
+        encrypt_connection,
+        mtls_active: false,
+        peer_cert_fingerprint: None,
+        connected: false,
+        transport: None,
+    };
+
+    // H9：在打开窗口与 `request_connect` 之前递增代次并取消任何在途自动重连；
+    // 同时立即落盘 `last_session_params` 并置位 `connecting_epoch`，确保秒开工具窗与晚加载 S1 都能读到协商态，
+    // 且即便后续信令或安全准备失败，用户在失败面板切换模式/立即重试仍能拿到目标。
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    cancel_auto_reconnect(&state);
+    state.clear_terminal_error();
+    save_last_session_params(&state, cfg.watch_only, meta.clone());
+    let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
 
     // 先回收旧会话并推送初始 Connecting 状态，再立即创建/展示 S1 窗口，使控制界面秒开。
     let previous = {
@@ -916,7 +1377,7 @@ pub async fn open_session(
         teardown_session_and_wait(&app, old).await;
     }
 
-    if !cfg.headless {
+    let preallocated_layer = if !cfg.headless {
         window::ensure_session_window(&app, &state, cfg.watch_only)?;
         window::set_session_window_title(&app, &device_name);
         let _ = app.emit(
@@ -926,21 +1387,33 @@ pub async fn open_session(
                 watch_only: cfg.watch_only,
             },
         );
-    }
-    let preallocated_layer = preallocate_metal_layer_for_session(&app, cfg.prefer_hardware);
+        preallocate_metal_layer_for_session(&app, cfg.prefer_hardware)
+    } else {
+        None
+    };
+
+    // 推送初始 connecting 快照，供秒开工具窗或主窗展示「正在建立安全连接…」。
+    let connecting_info = ActiveSessionInfo::connecting_from_meta(cfg.watch_only, &meta);
+    let _ = app.emit("session://active-state", &connecting_info);
 
     let (connect_addr, relay_grant) =
-        match resolve_endpoint_and_grant(&state, effective_target, cfg.force_relay).await {
+        match resolve_endpoint_and_grant(&state, effective_target, force_relay, Some(my_epoch))
+            .await
+        {
             Ok(res) => res,
             Err(err) => {
+                state.clear_connecting_epoch(my_epoch);
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                    state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                    let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                    // 铁律：连接失败绝不自动关闭或销毁 S1 远控窗口，仅推送不可恢复终态由界面常驻展示错误。
                     let _ = app.emit(
                         "session://update",
                         &SessionUpdate::Ended {
                             reason: err.clone(),
+                            recoverable: false,
                         },
                     );
-                    window::destroy_session_window_if_epoch(&app, my_epoch);
                 }
                 return Err(err);
             }
@@ -951,26 +1424,10 @@ pub async fn open_session(
         return Ok(());
     }
 
-    let prefs_snap = state
-        .prefs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let (req_width, req_height) = match (cfg.width, cfg.height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
-        _ => (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT),
-    };
-    let req_fps = cfg.fps.unwrap_or(prefs_snap.fps).max(1);
-    let req_bitrate_bps = cfg.bitrate_bps.unwrap_or(prefs_snap.bitrate_bps).max(1);
-    let password = cfg.password.filter(|p| !p.is_empty());
-    let encrypt_connection = cfg
-        .encrypt_connection
-        .unwrap_or(prefs_snap.default_encrypt_connection);
-    let force_relay = cfg.force_relay;
     let relay_target_for_sec = relay_target_id.clone();
     let grant_for_sec = relay_grant.clone();
     let app_sec = app.clone();
-    let security = match tauri::async_runtime::spawn_blocking(move || {
+    let sec_res = tauri::async_runtime::spawn_blocking(move || {
         let st_sec = app_sec.state::<AppState>();
         prepare_session_security(
             &st_sec,
@@ -981,26 +1438,39 @@ pub async fn open_session(
         )
     })
     .await
-    .map_err(|e| format!("准备会话安全配置异常：{e}"))?
-    {
+    .map_err(|e| format!("准备会话安全配置异常：{e}"))
+    .and_then(|res| res);
+    let security = match sec_res {
         Ok(sec) => sec,
         Err(err) => {
+            state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                // 铁律：安全配置失败同样绝不自动销毁 S1 远控窗口。
                 let _ = app.emit(
                     "session://update",
                     &SessionUpdate::Ended {
                         reason: err.clone(),
+                        recoverable: false,
                     },
                 );
-                window::destroy_session_window_if_epoch(&app, my_epoch);
             }
             return Err(err);
         }
     };
 
+    let upgraded_to_desktop_while_connecting =
+        cfg.headless && app.get_webview_window("session").is_some();
+    let effective_headless = cfg.headless && !upgraded_to_desktop_while_connecting;
+    if upgraded_to_desktop_while_connecting {
+        meta.tools_only = false;
+        meta.media_active = true;
+    }
+
     let ui_cfg = UiSessionConfig {
         connect_addr,
-        password: password.clone(),
+        password,
         watch_only: cfg.watch_only,
         width: req_width,
         height: req_height,
@@ -1008,13 +1478,15 @@ pub async fn open_session(
         bitrate_bps: req_bitrate_bps,
         prefer_hardware: cfg.prefer_hardware,
         clipboard_enabled: cfg.clipboard_enabled,
-        audio_enabled: if cfg.headless {
+        audio_enabled: if effective_headless {
             false
         } else {
             cfg.audio_enabled
         },
         relay_grant,
-        force_relay: cfg.force_relay,
+        force_relay,
+        connection_mode,
+        tools_only: effective_headless,
         encrypt_connection,
         mtls_config: security.mtls_config,
         owner_grant: security.owner_grant,
@@ -1022,25 +1494,10 @@ pub async fn open_session(
         lan_direct_addr: security.lan_direct_addr,
     };
 
-    let meta = ActiveSessionMeta {
-        target: cfg.target.trim().to_string(),
-        device_key,
-        device_name,
-        relay_target_id,
-        password,
-        width: req_width,
-        height: req_height,
-        fps: req_fps,
-        bitrate_bps: req_bitrate_bps,
-        prefer_hardware: cfg.prefer_hardware,
-        clipboard_enabled: cfg.clipboard_enabled,
-        audio_enabled: cfg.audio_enabled,
-        force_relay: cfg.force_relay,
-        encrypt_connection,
-        mtls_active: false,
-        peer_cert_fingerprint: None,
-        connected: false,
-        transport: None,
+    let preallocated_override = if upgraded_to_desktop_while_connecting {
+        None
+    } else {
+        Some(preallocated_layer)
     };
 
     activate_session_with_cfg(
@@ -1050,28 +1507,40 @@ pub async fn open_session(
         ui_cfg,
         cfg.watch_only,
         meta,
-        Some(preallocated_layer),
+        preallocated_override,
     )
 }
 
-/// IPC 命令：在当前远控会话中动态切换「使用安全中转连接」模式，保持窗口与画质/帧率偏好并重建会话。
+/// IPC 命令：切换连接路由模式（`"auto"` / `"p2p_only"` / `"tcp_relay"`），持久化偏好并立即按新模式重连；
+/// 当前无活动会话（如刚连接失败）时自动从 `last_session_params` 取回当前目标参数，绝不因失败关闭窗口。
 #[tauri::command]
-pub async fn set_session_relay_mode(
-    force_relay: bool,
+pub async fn set_session_connection_mode(
+    mode: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     state.require_unlocked()?;
     state.require_authenticated()?;
+
+    let parsed_mode = ConnectionMode::parse_lossy(&mode)
+        .ok_or_else(|| format!("无效的连接模式：{mode}（仅支持 auto / p2p_only / tcp_relay）"))?;
+
     let (watch_only, mut meta) = {
         let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(active) = slot.as_ref().filter(|a| !a.disconnecting) else {
-            return Err("当前无活动远控会话".to_string());
-        };
-        (active.watch_only, active.meta.clone())
+        if let Some(active) = slot.as_ref().filter(|a| !a.disconnecting) {
+            (active.watch_only, active.meta.clone())
+        } else {
+            drop(slot);
+            let saved = state
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            saved.ok_or_else(|| "当前无活动或可重连的远控会话".to_string())?
+        }
     };
     if meta.target.trim().is_empty() {
-        return Err("当前会话缺少连接目标，无法切换传输模式".to_string());
+        return Err("当前会话缺少连接目标，无法切换连接模式".to_string());
     }
 
     let parsed = model::parse_connect_input(&meta.target)?;
@@ -1081,23 +1550,45 @@ pub async fn set_session_relay_mode(
         meta.relay_target_id = found_relay_id;
     }
 
-    let effective_target = if force_relay {
-        match (&parsed, &meta.relay_target_id) {
-            (ConnectTarget::DeviceId(_), _) => parsed,
-            (ConnectTarget::Direct(_), Some(id)) => ConnectTarget::DeviceId(id.clone()),
-            (ConnectTarget::Direct(_), None) => {
-                return Err(
-                    "直连地址未绑定设备码或对方未注册到服务器，无法切换至安全中转；请先配置信令服务器并确认对端在线".to_string()
-                );
-            }
-        }
-    } else {
-        parsed
-    };
+    let force_relay = parsed_mode == ConnectionMode::TcpRelay;
+    let effective_target =
+        effective_target_for_mode(parsed, meta.relay_target_id.as_deref(), parsed_mode)?;
+
+    // 目标与路由模式校验全部通过后再落盘持久化偏好，防止纯 IP 会话误点 TCP 中继污染全局偏好。
+    let app_persist = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app_persist.state::<AppState>();
+        persist_prefs_mutation(&st, &app_prefs::default_prefs_path(), |prefs| {
+            prefs.connection_mode = parsed_mode;
+        })?;
+        notify_background_services_reload(&st, false);
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("保存连接模式偏好任务异常：{e}"))??;
 
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    cancel_auto_reconnect(&state);
+    state.clear_terminal_error();
 
-    // 切换传输模式前先断开并回收旧会话（让对端先退出 LAN 会话，避免与新下发的 PunchCoord/中继令牌竞争或误清理）。
+    let prefs_snap = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    meta.fps = prefs_snap.fps.max(1);
+    meta.bitrate_bps = prefs_snap.bitrate_bps.max(1);
+    meta.connection_mode = parsed_mode;
+    meta.force_relay = force_relay;
+    meta.phase = "connecting".to_string();
+    meta.mtls_active = false;
+    meta.peer_cert_fingerprint = None;
+    meta.connected = false;
+    meta.transport = None;
+    save_last_session_params(&state, watch_only, meta.clone());
+    let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
+
+    // 切换传输模式前先断开并回收旧会话（有界 300ms 非阻塞），避免旧连接与新配对竞争。
     let previous = {
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
         state::clear_session_snapshot_locked(&state.last_session_update);
@@ -1110,6 +1601,10 @@ pub async fn set_session_relay_mode(
         teardown_session_and_wait(&app, old).await;
     }
     let _ = app.emit(
+        "session://active-state",
+        &ActiveSessionInfo::connecting_from_meta(watch_only, &meta),
+    );
+    let _ = app.emit(
         "session://update",
         &SessionUpdate::Connecting {
             phase: rc_ui::session_bridge::ConnectPhase::Connecting,
@@ -1118,15 +1613,20 @@ pub async fn set_session_relay_mode(
     );
 
     let (connect_addr, relay_grant) =
-        match resolve_endpoint_and_grant(&state, effective_target, force_relay).await {
+        match resolve_endpoint_and_grant(&state, effective_target, force_relay, Some(my_epoch))
+            .await
+        {
             Ok(res) => res,
             Err(err) => {
+                state.clear_connecting_epoch(my_epoch);
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                    state.record_terminal_error_if_epoch(my_epoch, err.clone());
                     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
                     let _ = app.emit(
                         "session://update",
                         &SessionUpdate::Ended {
                             reason: err.clone(),
+                            recoverable: false,
                         },
                     );
                 }
@@ -1137,24 +1637,11 @@ pub async fn set_session_relay_mode(
         return Err("会话状态已变更，请重试".to_string());
     }
 
-    let prefs_snap = state
-        .prefs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    meta.fps = prefs_snap.fps.max(1);
-    meta.bitrate_bps = prefs_snap.bitrate_bps.max(1);
-    meta.force_relay = force_relay;
-    meta.mtls_active = false;
-    meta.peer_cert_fingerprint = None;
-    meta.connected = false;
-    meta.transport = None;
-
     let relay_target_for_sec = meta.relay_target_id.clone();
     let grant_for_sec = relay_grant.clone();
     let encrypt_conn = meta.encrypt_connection;
     let app_sec = app.clone();
-    let security = match tauri::async_runtime::spawn_blocking(move || {
+    let sec_res = tauri::async_runtime::spawn_blocking(move || {
         let st_sec = app_sec.state::<AppState>();
         prepare_session_security(
             &st_sec,
@@ -1165,22 +1652,31 @@ pub async fn set_session_relay_mode(
         )
     })
     .await
-    .map_err(|e| format!("准备会话安全配置异常：{e}"))?
-    {
+    .map_err(|e| format!("准备会话安全配置异常：{e}"))
+    .and_then(|res| res);
+    let security = match sec_res {
         Ok(sec) => sec,
         Err(err) => {
+            state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                state.record_terminal_error_if_epoch(my_epoch, err.clone());
                 let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
                 let _ = app.emit(
                     "session://update",
                     &SessionUpdate::Ended {
                         reason: err.clone(),
+                        recoverable: false,
                     },
                 );
             }
             return Err(err);
         }
     };
+
+    if meta.tools_only && app.get_webview_window("session").is_some() {
+        meta.tools_only = false;
+        meta.media_active = true;
+    }
 
     let (req_width, req_height) = if meta.width > 0 && meta.height > 0 {
         (meta.width, meta.height)
@@ -1197,9 +1693,15 @@ pub async fn set_session_relay_mode(
         bitrate_bps: meta.bitrate_bps,
         prefer_hardware: meta.prefer_hardware,
         clipboard_enabled: meta.clipboard_enabled,
-        audio_enabled: meta.audio_enabled,
+        audio_enabled: if meta.tools_only {
+            false
+        } else {
+            meta.audio_enabled
+        },
         relay_grant,
         force_relay,
+        connection_mode: parsed_mode,
+        tools_only: meta.tools_only,
         encrypt_connection: meta.encrypt_connection,
         mtls_config: security.mtls_config,
         owner_grant: security.owner_grant,
@@ -1208,11 +1710,22 @@ pub async fn set_session_relay_mode(
     };
 
     activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)?;
-    Ok(if force_relay {
-        "TCP Relay".to_string()
+    Ok(connection_mode_label(parsed_mode).to_string())
+}
+
+/// IPC 命令：兼容旧版「使用安全中转连接」布尔开关，内部转发至 [`set_session_connection_mode`]。
+#[tauri::command]
+pub async fn set_session_relay_mode(
+    force_relay: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mode = if force_relay {
+        ConnectionMode::TcpRelay
     } else {
-        "直连检测中".to_string()
-    })
+        ConnectionMode::Auto
+    };
+    set_session_connection_mode(mode.as_str().to_string(), app, state).await
 }
 
 /// IPC 命令：在当前活动会话中动态切换观看模式（只读禁止本地输入注入），并向主窗推送状态快照。
@@ -1314,6 +1827,24 @@ pub async fn set_session_mtls_mode(
     }
 
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    cancel_auto_reconnect(&state);
+    state.clear_terminal_error();
+    let prefs_snap = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    meta.fps = prefs_snap.fps.max(1);
+    meta.bitrate_bps = prefs_snap.bitrate_bps.max(1);
+    meta.encrypt_connection = enabled;
+    meta.phase = "connecting".to_string();
+    meta.mtls_active = false;
+    meta.peer_cert_fingerprint = None;
+    meta.connected = false;
+    meta.transport = None;
+    save_last_session_params(&state, watch_only, meta.clone());
+    let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
+
     let previous = {
         let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
         state::clear_session_snapshot_locked(&state.last_session_update);
@@ -1326,6 +1857,10 @@ pub async fn set_session_mtls_mode(
         teardown_session_and_wait(&app, old).await;
     }
     let _ = app.emit(
+        "session://active-state",
+        &ActiveSessionInfo::connecting_from_meta(watch_only, &meta),
+    );
+    let _ = app.emit(
         "session://update",
         &SessionUpdate::Connecting {
             phase: rc_ui::session_bridge::ConnectPhase::Connecting,
@@ -1333,46 +1868,59 @@ pub async fn set_session_mtls_mode(
         },
     );
 
-    let (connect_addr, relay_grant) =
-        match resolve_endpoint_and_grant(&state, effective_target, meta.force_relay).await {
-            Ok(res) => res,
-            Err(err) => {
-                if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                    let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-                    let _ = app.emit(
-                        "session://update",
-                        &SessionUpdate::Ended {
-                            reason: err.clone(),
-                        },
-                    );
-                }
-                return Err(err);
+    let (connect_addr, relay_grant) = match resolve_endpoint_and_grant(
+        &state,
+        effective_target,
+        meta.force_relay,
+        Some(my_epoch),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            state.clear_connecting_epoch(my_epoch);
+            if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                let _ = app.emit(
+                    "session://update",
+                    &SessionUpdate::Ended {
+                        reason: err.clone(),
+                        recoverable: false,
+                    },
+                );
             }
-        };
+            return Err(err);
+        }
+    };
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Err("会话状态已变更，请重试".to_string());
     }
 
-    let prefs_snap = state
-        .prefs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    meta.fps = prefs_snap.fps.max(1);
-    meta.bitrate_bps = prefs_snap.bitrate_bps.max(1);
-    meta.encrypt_connection = enabled;
-    meta.mtls_active = false;
-    meta.peer_cert_fingerprint = None;
-    meta.connected = false;
-    meta.transport = None;
-
-    let security = prepare_session_security(
+    let security = match prepare_session_security(
         &state,
         meta.relay_target_id.as_deref(),
         relay_grant.as_ref(),
         meta.force_relay,
         enabled,
-    )?;
+    ) {
+        Ok(sec) => sec,
+        Err(err) => {
+            state.clear_connecting_epoch(my_epoch);
+            if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                let _ = app.emit(
+                    "session://update",
+                    &SessionUpdate::Ended {
+                        reason: err.clone(),
+                        recoverable: false,
+                    },
+                );
+            }
+            return Err(err);
+        }
+    };
 
     let (req_width, req_height) = if meta.width > 0 && meta.height > 0 {
         (meta.width, meta.height)
@@ -1389,9 +1937,15 @@ pub async fn set_session_mtls_mode(
         bitrate_bps: meta.bitrate_bps,
         prefer_hardware: meta.prefer_hardware,
         clipboard_enabled: meta.clipboard_enabled,
-        audio_enabled: meta.audio_enabled,
+        audio_enabled: if meta.tools_only {
+            false
+        } else {
+            meta.audio_enabled
+        },
         relay_grant,
         force_relay: meta.force_relay,
+        connection_mode: meta.connection_mode,
+        tools_only: meta.tools_only,
         encrypt_connection: enabled,
         mtls_config: security.mtls_config,
         owner_grant: security.owner_grant,
@@ -1403,15 +1957,83 @@ pub async fn set_session_mtls_mode(
     Ok(state.active_session_info())
 }
 
-/// IPC 命令：拉取最近一次会话状态快照（Review M8 + U-H2 / U-H3：
-/// 在单次 `session` 锁内校验 `!disconnecting` 与匹配 `sid`，同时原子取出缓存的被控端锁屏/挂起状态；
-/// 若处于锁屏或采集挂起态，则向 S1 窗口补发一次 `host_screen_state`）。
-#[tauri::command]
-pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<SessionUpdate> {
+/// 纯状态读取 S1 窗口初始化所需的会话快照与被控端锁屏状态（便于离线单测）。
+///
+/// 当活动会话快照为空且无正在运行的未断开会话时，按优先级回退补发：
+/// 1) 当前代次正在自动重连 → `SessionUpdate::Reconnecting`；
+/// 2) 当前代次正在信令/安全协商 → `SessionUpdate::Connecting`；
+/// 3) 当前代次存在不可恢复终态错误 → `SessionUpdate::Ended { recoverable: false }`。
+pub(crate) fn resolve_session_snapshot(
+    state: &AppState,
+) -> (Option<SessionUpdate>, Option<(bool, bool)>) {
     let (snap, cached_screen_state) = state::current_session_snapshot_and_screen_state(
         &state.session,
         &state.last_session_update,
     );
+    if snap.is_some() {
+        return (snap, cached_screen_state);
+    }
+    let has_live_session = {
+        let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().is_some_and(|a| !a.disconnecting)
+    };
+    if has_live_session {
+        return (None, cached_screen_state);
+    }
+    let cur_epoch = state.session_open_epoch.load(Ordering::Acquire);
+    if state.is_auto_reconnect_active() {
+        let (attempt, reason) = state.current_auto_reconnect_status(AUTO_RECONNECT_MAX_ATTEMPTS);
+        return (
+            Some(SessionUpdate::Reconnecting {
+                attempt,
+                max_attempts: AUTO_RECONNECT_MAX_ATTEMPTS,
+                reason,
+            }),
+            None,
+        );
+    }
+    if state.is_connecting_current_epoch() {
+        let watch_only = state
+            .last_session_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(w, _)| *w)
+            .unwrap_or(false);
+        return (
+            Some(SessionUpdate::Connecting {
+                phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+                watch_only,
+            }),
+            None,
+        );
+    }
+    if let Some((err_epoch, reason)) = state
+        .last_terminal_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        if err_epoch == cur_epoch {
+            return (
+                Some(SessionUpdate::Ended {
+                    reason,
+                    recoverable: false,
+                }),
+                None,
+            );
+        }
+    }
+    (None, cached_screen_state)
+}
+
+/// IPC 命令：拉取最近一次会话状态快照（Review M8 + U-H2 / U-H3：
+/// 在单次 `session` 锁内校验 `!disconnecting` 与匹配 `sid`，同时原子取出缓存的被控端锁屏/挂起状态；
+/// 若处于锁屏或采集挂起态，则向 S1 窗口补发一次 `host_screen_state`；
+/// 若当前无活动会话但处于重连中 / 协商中 / 当前代次终态失败，则补发对应状态避免 S1 永久转圈）。
+#[tauri::command]
+pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<SessionUpdate> {
+    let (snap, cached_screen_state) = resolve_session_snapshot(&state);
     if let Some((locked, capture_suspended)) = cached_screen_state {
         let _ = app.emit_to(
             "session",
@@ -1423,6 +2045,44 @@ pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<Se
         );
     }
     snap
+}
+
+/// `SessionCommand::Disconnect` 原子前置状态收敛结果（便于离线单测）。
+enum DisconnectCommandOutcome {
+    /// 槽位为空（例如处于自动重连退避期或信令协商等待期），需立即广播 `inactive` + `Ended`。
+    EmptySlot,
+    /// 槽位中会话已在断开中（幂等忽略）。
+    AlreadyDisconnecting,
+    /// 已向无图层的活动会话发送 `Disconnect`。
+    SentNow,
+    /// 活动会话持有 Metal 图层租约，需先在主线程摘除再按 `sid` 发送 `Disconnect`。
+    NeedsMainThreadDetach(u64, rc_ui::session_bridge::LayerLease),
+}
+
+fn prepare_disconnect_command(state: &AppState, lock_on_exit: bool) -> DisconnectCommandOutcome {
+    let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let _new_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    state.connecting_epoch.store(0, Ordering::Release);
+    state.clear_terminal_error();
+    cancel_auto_reconnect(state);
+
+    let Some(active) = slot.as_mut() else {
+        state::clear_session_snapshot_locked(&state.last_session_update);
+        return DisconnectCommandOutcome::EmptySlot;
+    };
+    if active.disconnecting {
+        return DisconnectCommandOutcome::AlreadyDisconnecting;
+    }
+    active.disconnecting = true;
+    if let Some(lease) = active.layer_state.take_lease() {
+        DisconnectCommandOutcome::NeedsMainThreadDetach(active.id, lease)
+    } else {
+        if lock_on_exit {
+            active.handle.request_lock_on_disconnect();
+        }
+        active.handle.send(SessionCommand::Disconnect);
+        DisconnectCommandOutcome::SentNow
+    }
 }
 
 /// 兼容 `{ "type": "..." }`（规范）与 `{ "kind": "..." }`（历史别名）的会话控制命令反序列化包装。
@@ -1471,24 +2131,33 @@ pub fn session_command(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .lock_on_exit;
-            if let Some((sid, lease)) = state::begin_disconnect(&state.session, |h| {
-                if lock_on_exit {
-                    h.request_lock_on_disconnect();
+            match prepare_disconnect_command(&state, lock_on_exit) {
+                DisconnectCommandOutcome::EmptySlot => {
+                    let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                    let _ = app.emit(
+                        "session://update",
+                        &SessionUpdate::Ended {
+                            reason: "已主动断开远控会话".to_string(),
+                            recoverable: false,
+                        },
+                    );
                 }
-                h.send(SessionCommand::Disconnect);
-            }) {
-                let app_clone = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    metal_attach::detach_leased_layer(&lease);
-                    let st = app_clone.state::<AppState>();
-                    let _ = state::finish_disconnect_on_main_thread(&st.session, sid, |h| {
-                        if lock_on_exit {
-                            h.request_lock_on_disconnect();
-                        }
-                        h.send(SessionCommand::Disconnect);
+                DisconnectCommandOutcome::NeedsMainThreadDetach(sid, lease) => {
+                    let app_clone = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        metal_attach::detach_leased_layer(&lease);
+                        let st = app_clone.state::<AppState>();
+                        let _ = state::finish_disconnect_on_main_thread(&st.session, sid, |h| {
+                            if lock_on_exit {
+                                h.request_lock_on_disconnect();
+                            }
+                            h.send(SessionCommand::Disconnect);
+                        });
+                        drop(lease);
                     });
-                    drop(lease);
-                });
+                }
+                DisconnectCommandOutcome::SentNow
+                | DisconnectCommandOutcome::AlreadyDisconnecting => {}
             }
         }
         other => {
@@ -1831,6 +2500,14 @@ pub(crate) fn shutdown_host_and_lan(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     rc_capture_macos::clear_privacy_curtain();
     stop_auth_maintainer(&state);
+    if let Some(mut mon) = state
+        .network_monitor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        mon.stop();
+    }
     shutdown_signal_client(&state);
     let _ = stop_host_service(&state, true);
     let old_lan = state.lan.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -5912,7 +6589,368 @@ pub fn consume_tray_perm_check() -> bool {
     removed_file || had_pending
 }
 
-/// IPC 命令：在远端触发 `ByeReason::SessionSwitching`（macOS 登录界面切换桌面）后复用上次参数自动重连。
+/// 前端「设置 → 网络」UPnP / NAT-PMP 自动端口映射开关与实时状态快照。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpnpStatusPayload {
+    /// 是否已开启 UPnP / NAT-PMP 自动端口映射。
+    pub enabled: bool,
+    /// 当前实时端口映射状态。
+    pub status: UpnpStatus,
+}
+
+fn query_upnp_status_payload(state: &AppState) -> UpnpStatusPayload {
+    let enabled = sync_prefs_from_disk_if_proxy(state).upnp_enabled;
+    if !enabled {
+        return UpnpStatusPayload {
+            enabled: false,
+            status: UpnpStatus::Disabled,
+        };
+    }
+    let status = if state.is_service_proxy() {
+        match call_agent_ipc(ServiceRequest::GetSnapshot, Duration::from_millis(500)) {
+            Ok(ServiceResponse::Snapshot(snap)) => {
+                snap.upnp_status.unwrap_or(UpnpStatus::Discovering)
+            }
+            _ => UpnpStatus::Unavailable {
+                reason: "后台服务暂未响应".to_string(),
+            },
+        }
+    } else {
+        let client = {
+            let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+            rt.signal_client.as_ref().cloned()
+        };
+        match client {
+            Some(c) => c.upnp_status(),
+            None => UpnpStatus::Unavailable {
+                reason: "信令服务器未连接".to_string(),
+            },
+        }
+    };
+    UpnpStatusPayload { enabled, status }
+}
+
+fn save_upnp_enabled_to_path(state: &AppState, enabled: bool, path: &Path) -> Result<(), String> {
+    persist_prefs_mutation(state, path, |prefs| {
+        prefs.upnp_enabled = enabled;
+    })
+}
+
+/// IPC 命令：查询 UPnP / NAT-PMP 自动端口映射开关与当前状态。
+#[tauri::command]
+pub async fn get_upnp_status(app: AppHandle) -> Result<UpnpStatusPayload, String> {
+    app.state::<AppState>().require_authenticated()?;
+    let app_bg = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app_bg.state::<AppState>();
+        query_upnp_status_payload(&st)
+    })
+    .await
+    .map_err(|e| format!("查询 UPnP 状态任务异常：{e}"))
+}
+
+/// IPC 命令：持久化开关 UPnP / NAT-PMP 自动端口映射并立即生效。
+#[tauri::command]
+pub async fn save_upnp_enabled(enabled: bool, app: AppHandle) -> Result<UpnpStatusPayload, String> {
+    {
+        let st = app.state::<AppState>();
+        st.require_unlocked()?;
+        st.require_authenticated()?;
+    }
+    let app_bg = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app_bg.state::<AppState>();
+        save_upnp_enabled_to_path(&st, enabled, &app_prefs::default_prefs_path())?;
+        if st.is_service_proxy() {
+            notify_background_services_reload_sync(&st, false);
+        } else {
+            let client = {
+                let rt = st.server.lock().unwrap_or_else(|e| e.into_inner());
+                rt.signal_client.as_ref().cloned()
+            };
+            if let Some(c) = client {
+                c.set_upnp_enabled(enabled);
+            }
+        }
+        Ok(query_upnp_status_payload(&st))
+    })
+    .await
+    .map_err(|e| format!("保存 UPnP 设置任务异常：{e}"))?
+}
+
+/// 判断当前是否仍有 S1 远控窗口或任一 W2/W3/W4 工具窗口打开。
+pub(crate) fn has_any_session_or_tool_window(app: &AppHandle) -> bool {
+    app.get_webview_window("session").is_some()
+        || app.get_webview_window("terminal").is_some()
+        || app.get_webview_window("transfer").is_some()
+        || app.get_webview_window("portmap").is_some()
+}
+
+fn is_signal_online_or_connecting(state: &AppState) -> bool {
+    let rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
+    let snap = rt.current_status();
+    matches!(
+        snap.state,
+        ServerConnectionState::Connected | ServerConnectionState::Connecting
+    )
+}
+
+fn resolve_reconnect_target(
+    state: &AppState,
+    meta: &mut ActiveSessionMeta,
+    prefer_device_id_upgrade: bool,
+) -> Result<ConnectTarget, String> {
+    let parsed = model::parse_connect_input(&meta.target)?;
+    if meta.relay_target_id.is_none() {
+        let (_, _, found_relay_id) =
+            resolve_session_target_meta(state, &meta.target, &parsed, Some(&meta.device_name));
+        meta.relay_target_id = found_relay_id;
+    }
+    if meta.connection_mode == ConnectionMode::TcpRelay {
+        return effective_target_for_mode(
+            parsed,
+            meta.relay_target_id.as_deref(),
+            ConnectionMode::TcpRelay,
+        );
+    }
+    if prefer_device_id_upgrade {
+        if let (ConnectTarget::Direct(_), Some(ref did)) = (&parsed, &meta.relay_target_id) {
+            if is_signal_online_or_connecting(state) {
+                return Ok(ConnectTarget::DeviceId(did.clone()));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+async fn reconnect_with_saved_params(
+    app: &AppHandle,
+    state: &AppState,
+    my_epoch: u64,
+    watch_only: bool,
+    mut meta: ActiveSessionMeta,
+    prefer_device_id_upgrade: bool,
+) -> Result<(), String> {
+    if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
+        return Ok(());
+    }
+    let effective_target = resolve_reconnect_target(state, &mut meta, prefer_device_id_upgrade)?;
+    let force_relay = meta.connection_mode == ConnectionMode::TcpRelay;
+    meta.force_relay = force_relay;
+
+    let (connect_addr, relay_grant) =
+        resolve_endpoint_and_grant(state, effective_target, force_relay, Some(my_epoch)).await?;
+    if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
+        return Ok(());
+    }
+
+    let relay_target_for_sec = meta.relay_target_id.clone();
+    let grant_for_sec = relay_grant.clone();
+    let encrypt_conn = meta.encrypt_connection;
+    let app_sec = app.clone();
+    let security = tauri::async_runtime::spawn_blocking(move || {
+        let st_sec = app_sec.state::<AppState>();
+        prepare_session_security(
+            &st_sec,
+            relay_target_for_sec.as_deref(),
+            grant_for_sec.as_ref(),
+            force_relay,
+            encrypt_conn,
+        )
+    })
+    .await
+    .map_err(|e| format!("准备重连安全配置异常：{e}"))??;
+
+    if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
+        return Ok(());
+    }
+
+    if meta.tools_only && app.get_webview_window("session").is_some() {
+        meta.tools_only = false;
+        meta.media_active = true;
+    }
+
+    meta.connected = false;
+    meta.transport = None;
+    meta.mtls_active = false;
+    meta.peer_cert_fingerprint = None;
+    meta.phase = "connecting".to_string();
+
+    let ui_cfg = UiSessionConfig {
+        connect_addr,
+        password: meta.password.clone(),
+        watch_only,
+        width: meta.width,
+        height: meta.height,
+        fps: meta.fps,
+        bitrate_bps: meta.bitrate_bps,
+        prefer_hardware: meta.prefer_hardware,
+        clipboard_enabled: meta.clipboard_enabled,
+        audio_enabled: if meta.tools_only {
+            false
+        } else {
+            meta.audio_enabled
+        },
+        relay_grant,
+        force_relay,
+        connection_mode: meta.connection_mode,
+        tools_only: meta.tools_only,
+        encrypt_connection: meta.encrypt_connection,
+        mtls_config: security.mtls_config,
+        owner_grant: security.owner_grant,
+        owner_signer: security.owner_signer,
+        lan_direct_addr: security.lan_direct_addr,
+    };
+
+    activate_session_with_cfg(app, state, my_epoch, ui_cfg, watch_only, meta, None)
+}
+
+/// 自动重连退避序列（8 次 / 约 49 秒）。
+const AUTO_RECONNECT_BACKOFFS_SECS: [u64; 8] = [1, 2, 3, 5, 8, 10, 10, 10];
+/// 自动重连最大重试次数。
+pub(crate) const AUTO_RECONNECT_MAX_ATTEMPTS: u32 = AUTO_RECONNECT_BACKOFFS_SECS.len() as u32;
+/// 切网或用户点击「立即重试」唤醒后的短防抖延迟（500ms）。
+const AUTO_RECONNECT_WAKE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// 启动后台无感自动重连任务（退避 `[1s, 2s, 3s, 5s, 8s, 10s, 10s, 10s]`，支持切网与「立即重试」唤醒；
+/// 8 次耗尽后仅推送不可恢复 `Ended` 与 `inactive` 并记录终态错误，绝不自动关闭 S1 窗口）。
+pub(crate) fn spawn_auto_reconnect_task(
+    app: AppHandle,
+    expected_epoch: u64,
+    initial_reason: String,
+) {
+    let st = app.state::<AppState>();
+    let start_idx = st.auto_reconnect_attempts.load(Ordering::Acquire) as usize;
+    let initial_attempt = ((start_idx + 1) as u32).min(AUTO_RECONNECT_MAX_ATTEMPTS);
+    let Some(guard) =
+        st.try_acquire_auto_reconnect(expected_epoch, initial_attempt, initial_reason.clone())
+    else {
+        return;
+    };
+    let app_bg = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let guard = guard;
+        let st = app_bg.state::<AppState>();
+        let max_attempts = AUTO_RECONNECT_MAX_ATTEMPTS;
+        let start_idx = st.auto_reconnect_attempts.load(Ordering::Acquire) as usize;
+        let mut last_err = initial_reason;
+
+        for (idx, &delay_secs) in AUTO_RECONNECT_BACKOFFS_SECS
+            .iter()
+            .enumerate()
+            .skip(start_idx)
+        {
+            if st.session_open_epoch.load(Ordering::Acquire) != expected_epoch
+                || !has_any_session_or_tool_window(&app_bg)
+                || st.is_quitting()
+                || st.gate_state() != AppGateState::Authenticated
+            {
+                return;
+            }
+            let Some((watch_only, mut meta)) = st
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            else {
+                last_err = "暂无可重连的历史远控会话参数".to_string();
+                break;
+            };
+
+            let has_session_window = app_bg.get_webview_window("session").is_some();
+            if has_session_window {
+                meta.media_active = true;
+                meta.tools_only = false;
+            } else {
+                meta.media_active = false;
+                meta.tools_only = true;
+            }
+            meta.phase = "reconnecting".to_string();
+            meta.connected = false;
+            save_last_session_params(&st, watch_only, meta.clone());
+
+            let attempt = (idx + 1) as u32;
+            st.update_auto_reconnect_status(expected_epoch, attempt, last_err.clone());
+            let _ = app_bg.emit(
+                "session://update",
+                &SessionUpdate::Reconnecting {
+                    attempt,
+                    max_attempts,
+                    reason: last_err.clone(),
+                },
+            );
+            let _ = app_bg.emit(
+                "session://active-state",
+                &ActiveSessionInfo::reconnecting_from_meta(watch_only, &meta),
+            );
+
+            // 使用条件变量等待本轮退避：被切网或用户「立即重试」唤醒时缩短至 500ms 立刻尝试。
+            let wake_pair = Arc::clone(&st.auto_reconnect_wake);
+            let wait_dur = Duration::from_secs(delay_secs);
+            let woken_early = tauri::async_runtime::spawn_blocking(move || {
+                let (lock, cv) = &*wake_pair;
+                let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let start_seq = *guard;
+                let (after_guard, _wait_res) = cv
+                    .wait_timeout_while(guard, wait_dur, |seq| *seq == start_seq)
+                    .unwrap_or_else(|e| e.into_inner());
+                *after_guard != start_seq
+            })
+            .await
+            .unwrap_or(false);
+
+            if st.session_open_epoch.load(Ordering::Acquire) != expected_epoch
+                || !has_any_session_or_tool_window(&app_bg)
+                || st.is_quitting()
+            {
+                return;
+            }
+            if woken_early {
+                let _ = tauri::async_runtime::spawn_blocking(|| {
+                    std::thread::sleep(AUTO_RECONNECT_WAKE_DEBOUNCE);
+                })
+                .await;
+                if st.session_open_epoch.load(Ordering::Acquire) != expected_epoch
+                    || !has_any_session_or_tool_window(&app_bg)
+                    || st.is_quitting()
+                {
+                    return;
+                }
+            }
+
+            st.auto_reconnect_attempts.store(attempt, Ordering::Release);
+            match reconnect_with_saved_params(&app_bg, &st, expected_epoch, watch_only, meta, true)
+                .await
+            {
+                Ok(()) => {
+                    return;
+                }
+                Err(err) => {
+                    last_err = err;
+                }
+            }
+        }
+
+        // 8 次全部耗尽：仅在代次未变更时记录终态错误、释放活跃令牌并通知终态失败与非活动态，绝不自动关闭 S1 窗口。
+        if st.session_open_epoch.load(Ordering::Acquire) == expected_epoch {
+            let reason = format!("自动重连失败（已重试 {max_attempts} 次）：{last_err}");
+            st.auto_reconnect_attempts.store(0, Ordering::Release);
+            st.record_terminal_error_if_epoch(expected_epoch, reason.clone());
+            drop(guard);
+            let _ = app_bg.emit("session://active-state", &ActiveSessionInfo::inactive());
+            let _ = app_bg.emit(
+                "session://update",
+                &SessionUpdate::Ended {
+                    reason,
+                    recoverable: false,
+                },
+            );
+        }
+    });
+}
+
+/// IPC 命令：在远端触发 `ByeReason::SessionSwitching`（macOS 登录界面切换桌面）或连接失败后复用上次参数重新连接。
 #[tauri::command]
 pub async fn reconnect_last_session(
     app: AppHandle,
@@ -5931,59 +6969,74 @@ pub async fn reconnect_last_session(
     };
 
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let parsed = model::parse_connect_input(&meta.target)?;
-    let effective_target = if meta.force_relay {
-        match (&parsed, &meta.relay_target_id) {
-            (ConnectTarget::DeviceId(_), _) => parsed,
-            (ConnectTarget::Direct(_), Some(id)) => ConnectTarget::DeviceId(id.clone()),
-            (ConnectTarget::Direct(_), None) => {
-                return Err("直连地址无法强制开启安全中转".to_string());
-            }
-        }
-    } else {
-        parsed
-    };
+    cancel_auto_reconnect(&state);
+    state.clear_terminal_error();
 
-    let (connect_addr, relay_grant) =
-        resolve_endpoint_and_grant(&state, effective_target, meta.force_relay).await?;
-    if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
-        return Ok(());
-    }
-
-    let security = prepare_session_security(
-        &state,
-        meta.relay_target_id.as_deref(),
-        relay_grant.as_ref(),
-        meta.force_relay,
-        meta.encrypt_connection,
-    )?;
-
+    meta.phase = "connecting".to_string();
     meta.connected = false;
     meta.transport = None;
     meta.mtls_active = false;
     meta.peer_cert_fingerprint = None;
+    save_last_session_params(&state, watch_only, meta.clone());
+    let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
 
-    let ui_cfg = UiSessionConfig {
-        connect_addr,
-        password: meta.password.clone(),
-        watch_only,
-        width: meta.width,
-        height: meta.height,
-        fps: meta.fps,
-        bitrate_bps: meta.bitrate_bps,
-        prefer_hardware: meta.prefer_hardware,
-        clipboard_enabled: meta.clipboard_enabled,
-        audio_enabled: meta.audio_enabled,
-        relay_grant,
-        force_relay: meta.force_relay,
-        encrypt_connection: meta.encrypt_connection,
-        mtls_config: security.mtls_config,
-        owner_grant: security.owner_grant,
-        owner_signer: security.owner_signer,
-        lan_direct_addr: security.lan_direct_addr,
+    let previous = {
+        let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        slot.take()
     };
+    if let Some(old) = previous {
+        let _ = old.handle.tools().detach_all_terminals();
+        let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
+        teardown_session_and_wait(&app, old).await;
+    }
 
-    activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)
+    let _ = app.emit(
+        "session://active-state",
+        &ActiveSessionInfo::connecting_from_meta(watch_only, &meta),
+    );
+    let _ = app.emit(
+        "session://update",
+        &SessionUpdate::Connecting {
+            phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+            watch_only,
+        },
+    );
+
+    if let Err(err) =
+        reconnect_with_saved_params(&app, &state, my_epoch, watch_only, meta, true).await
+    {
+        state.clear_connecting_epoch(my_epoch);
+        if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+            state.record_terminal_error_if_epoch(my_epoch, err.clone());
+            let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+            let _ = app.emit(
+                "session://update",
+                &SessionUpdate::Ended {
+                    reason: err.clone(),
+                    recoverable: false,
+                },
+            );
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// IPC 命令：立即重试连接（若处于自动重连退避期则立刻唤醒；否则直接复用上次连接参数立即重连）。
+#[tauri::command]
+pub async fn trigger_reconnect_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    if state.is_auto_reconnect_active() {
+        state.wake_auto_reconnect();
+        return Ok(());
+    }
+    reconnect_last_session(app, state).await
 }
 
 /// IPC 命令：彻底「整体退出」RabbitControl（同时终止系统后台服务与控制端界面，不触发自动重启）。
@@ -8307,5 +9360,282 @@ mod tests {
         assert!(!missing_custom.exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_connection_mode_respects_force_relay_then_request_then_prefs() {
+        assert_eq!(
+            resolve_connection_mode(true, Some("p2p_only"), ConnectionMode::Auto),
+            ConnectionMode::TcpRelay
+        );
+        assert_eq!(
+            resolve_connection_mode(false, Some("p2p_only"), ConnectionMode::Auto),
+            ConnectionMode::P2pOnly
+        );
+        assert_eq!(
+            resolve_connection_mode(false, Some("invalid"), ConnectionMode::TcpRelay),
+            ConnectionMode::TcpRelay
+        );
+        assert_eq!(
+            resolve_connection_mode(false, None, ConnectionMode::P2pOnly),
+            ConnectionMode::P2pOnly
+        );
+    }
+
+    #[test]
+    fn headless_reuse_matches_same_target_across_phases_without_teardown() {
+        let mut active = ActiveSession::new(42, (), false);
+        active.set_meta(ActiveSessionMeta {
+            target: "604 928 235".to_string(),
+            device_key: "604928235".to_string(),
+            device_name: "Studio Mac".to_string(),
+            relay_target_id: Some("604928235".to_string()),
+            tools_only: true,
+            media_active: false,
+            phase: "connecting".to_string(),
+            connection_mode: ConnectionMode::Auto,
+            ..Default::default()
+        });
+        let parsed_same = model::parse_connect_input("604928235").unwrap();
+        let parsed_other = model::parse_connect_input("999888777").unwrap();
+
+        // connecting / connected / reconnecting 同目标纯工具会话均直接复用，不拆旧会话。
+        for phase in ["connecting", "connected", "reconnecting"] {
+            active.meta.phase = phase.to_string();
+            assert!(
+                can_reuse_headless_session(
+                    &active,
+                    "604928235",
+                    &parsed_same,
+                    "604928235",
+                    Some("604928235"),
+                ),
+                "phase={phase} should reuse same-target session"
+            );
+        }
+
+        // 不同目标不可复用。
+        assert!(!can_reuse_headless_session(
+            &active,
+            "999888777",
+            &parsed_other,
+            "999888777",
+            Some("999888777"),
+        ));
+
+        // 观看模式不可复用于可写工具会话。
+        active.watch_only = true;
+        assert!(!can_reuse_headless_session(
+            &active,
+            "604928235",
+            &parsed_same,
+            "604928235",
+            Some("604928235"),
+        ));
+
+        // disconnecting 中不可复用。
+        active.watch_only = false;
+        active.disconnecting = true;
+        assert!(!can_reuse_headless_session(
+            &active,
+            "604928235",
+            &parsed_same,
+            "604928235",
+            Some("604928235"),
+        ));
+    }
+
+    #[test]
+    fn failed_session_preserves_last_session_params_and_persists_upnp_pref() {
+        let state = AppState::new_for_test();
+        let meta = ActiveSessionMeta {
+            target: "604928235".to_string(),
+            device_key: "604928235".to_string(),
+            device_name: "Studio Mac".to_string(),
+            relay_target_id: Some("604928235".to_string()),
+            connection_mode: ConnectionMode::P2pOnly,
+            media_active: true,
+            tools_only: false,
+            phase: "connecting".to_string(),
+            ..Default::default()
+        };
+        save_last_session_params(&state, false, meta.clone());
+
+        // 即使活动会话槽为空（模拟连接失败态），last_session_params 仍完整保留本次目标参数。
+        assert!(state.session.lock().unwrap().is_none());
+        let saved = state
+            .last_session_params
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("last_session_params must be preserved on failure");
+        assert!(!saved.0);
+        assert_eq!(saved.1.target, "604928235");
+        assert_eq!(saved.1.connection_mode, ConnectionMode::P2pOnly);
+
+        // UPnP 开关持久化验证。
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-upnp-pref-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let prefs_path = base.join("prefs.json");
+        save_upnp_enabled_to_path(&state, false, &prefs_path).expect("save upnp_enabled=false");
+        assert!(!state.prefs.lock().unwrap().upnp_enabled);
+        assert!(!app_prefs::load_from_path(&prefs_path).upnp_enabled);
+
+        save_upnp_enabled_to_path(&state, true, &prefs_path).expect("save upnp_enabled=true");
+        assert!(state.prefs.lock().unwrap().upnp_enabled);
+        assert!(app_prefs::load_from_path(&prefs_path).upnp_enabled);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn session_snapshot_returns_reconnecting_connecting_and_terminal_error_for_current_epoch() {
+        let state = AppState::new_for_test();
+        let epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        save_last_session_params(
+            &state,
+            true,
+            ActiveSessionMeta {
+                target: "604928235".to_string(),
+                device_key: "604928235".to_string(),
+                device_name: "Studio Mac".to_string(),
+                ..Default::default()
+            },
+        );
+
+        // 1) 信令协商期返回 Connecting（携带 watch_only）。
+        state.connecting_epoch.store(epoch, Ordering::Release);
+        assert_eq!(
+            resolve_session_snapshot(&state).0,
+            Some(SessionUpdate::Connecting {
+                phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+                watch_only: true,
+            })
+        );
+        state.clear_connecting_epoch(epoch);
+
+        // 2) 自动重连期返回 Reconnecting（携带最新 attempt/max_attempts/reason）。
+        let reconn_guard = state
+            .try_acquire_auto_reconnect(epoch, 2, "对端短暂失联".to_string())
+            .expect("acquire reconnect");
+        assert_eq!(
+            resolve_session_snapshot(&state).0,
+            Some(SessionUpdate::Reconnecting {
+                attempt: 2,
+                max_attempts: AUTO_RECONNECT_MAX_ATTEMPTS,
+                reason: "对端短暂失联".to_string(),
+            })
+        );
+        drop(reconn_guard);
+
+        // 3) 快速/早期失败写入当前 epoch 终态错误后，晚加载 S1 通过 session_snapshot 可 100% 补领 Ended。
+        state.record_terminal_error_if_epoch(epoch, "对端设备离线".to_string());
+        assert_eq!(
+            resolve_session_snapshot(&state).0,
+            Some(SessionUpdate::Ended {
+                reason: "对端设备离线".to_string(),
+                recoverable: false,
+            })
+        );
+
+        // 4) 进入新一代次后，旧 epoch 终态错误绝不会串台返回给新窗口。
+        let _next_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        assert_eq!(resolve_session_snapshot(&state).0, None);
+    }
+
+    #[test]
+    fn disconnect_command_on_empty_slot_cancels_auto_reconnect_and_connecting_epoch() {
+        let state = AppState::new_for_test();
+        let epoch1 = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let reconn_guard = state
+            .try_acquire_auto_reconnect(epoch1, 3, "网络波动".to_string())
+            .expect("acquire auto reconnect");
+        state.auto_reconnect_attempts.store(3, Ordering::Release);
+        state.connecting_epoch.store(epoch1, Ordering::Release);
+        state.record_terminal_error_if_epoch(epoch1, "旧失败".to_string());
+        let wake_before = *state.auto_reconnect_wake.0.lock().unwrap();
+
+        let outcome = prepare_disconnect_command(&state, false);
+        assert!(matches!(outcome, DisconnectCommandOutcome::EmptySlot));
+        assert_eq!(state.session_open_epoch.load(Ordering::Acquire), epoch1 + 1);
+        assert_eq!(state.connecting_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(state.auto_reconnect_attempts.load(Ordering::Acquire), 0);
+        assert!(state.last_terminal_error.lock().unwrap().is_none());
+        assert!(
+            !state.is_auto_reconnect_active(),
+            "Disconnect 后即使旧任务尚未 drop 守卫，is_auto_reconnect_active 也必须立即为 false"
+        );
+        assert!(
+            *state.auto_reconnect_wake.0.lock().unwrap() > wake_before,
+            "Disconnect 必须唤醒退避睡眠中的自动重连任务"
+        );
+        assert!(!state.active_session_info().active);
+
+        drop(reconn_guard);
+        assert_eq!(state.auto_reconnect_active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn persisted_tcp_relay_falls_back_to_auto_for_pure_direct_ip_without_overwriting_prefs() {
+        let direct = model::parse_connect_input("192.168.1.50:9901").unwrap();
+        let device_id = model::parse_connect_input("604928235").unwrap();
+
+        // 1) 全局持久化偏好为 TcpRelay，未显式传 force_relay / connection_mode，纯 IP 直连（无 relay_target_id）自动回退 Auto。
+        let fallback_mode = resolve_connection_mode_for_target(
+            false,
+            None,
+            ConnectionMode::TcpRelay,
+            &direct,
+            None,
+        );
+        assert_eq!(fallback_mode, ConnectionMode::Auto);
+        assert_eq!(
+            effective_target_for_mode(direct.clone(), None, fallback_mode).unwrap(),
+            direct
+        );
+
+        // 2) 若显式传 force_relay=true 或 connection_mode="tcp_relay"，仍保持 TcpRelay 并由 effective_target_for_mode 报错。
+        let explicit_force =
+            resolve_connection_mode_for_target(true, None, ConnectionMode::Auto, &direct, None);
+        assert_eq!(explicit_force, ConnectionMode::TcpRelay);
+        assert!(effective_target_for_mode(direct.clone(), None, explicit_force).is_err());
+
+        let explicit_mode = resolve_connection_mode_for_target(
+            false,
+            Some("tcp_relay"),
+            ConnectionMode::Auto,
+            &direct,
+            None,
+        );
+        assert_eq!(explicit_mode, ConnectionMode::TcpRelay);
+        assert!(effective_target_for_mode(direct.clone(), None, explicit_mode).is_err());
+
+        // 3) 9 位设备码或绑定了 relay_target_id 的局域网直连仍尊重持久化 TcpRelay。
+        assert_eq!(
+            resolve_connection_mode_for_target(
+                false,
+                None,
+                ConnectionMode::TcpRelay,
+                &device_id,
+                Some("604928235"),
+            ),
+            ConnectionMode::TcpRelay
+        );
+        assert_eq!(
+            resolve_connection_mode_for_target(
+                false,
+                None,
+                ConnectionMode::TcpRelay,
+                &direct,
+                Some("604928235"),
+            ),
+            ConnectionMode::TcpRelay
+        );
     }
 }

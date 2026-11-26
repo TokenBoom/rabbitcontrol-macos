@@ -64,6 +64,11 @@
   var pendingDeleteRule = null;
   var sessionOnline = !IS_TAURI;
   var sessionWatchOnly = false;
+  var sessionPhase = IS_TAURI ? 'offline' : 'online'; /* offline | connecting | reconnecting | online */
+  var reconnectAttempt = 0;
+  var reconnectMax = 8;
+  var lastEndedReason = '';
+  var triggerReconnectFn = null;
   var openAddBtn = document.getElementById('open-add');
 
   var ICON = {
@@ -268,6 +273,32 @@
     sortEl.classList.toggle('is-desc', sortAsc === false);
 
     if (!mappings.length) {
+      if (IS_TAURI && sessionPhase === 'connecting') {
+        body.innerHTML = '<div class="pm-empty">正在建立安全连接…</div>';
+        return;
+      }
+      if (IS_TAURI && sessionPhase === 'reconnecting') {
+        body.innerHTML =
+          '<div class="pm-empty" style="flex-direction:column;gap:10px;">' +
+          '<span>连接中断，正在自动重连 (' +
+          escapeHtml(reconnectAttempt || 1) +
+          '/' +
+          escapeHtml(reconnectMax || 8) +
+          ')…</span>' +
+          '<button type="button" class="btn btn--primary" data-reconnect-now>立即重试</button>' +
+          '</div>';
+        return;
+      }
+      if (IS_TAURI && !sessionOnline && !sessionWatchOnly) {
+        body.innerHTML =
+          '<div class="pm-empty" style="flex-direction:column;gap:10px;">' +
+          '<span>' +
+          escapeHtml(lastEndedReason || '远控会话未连接') +
+          '</span>' +
+          '<button type="button" class="btn btn--primary" data-reconnect-now>重新连接</button>' +
+          '</div>';
+        return;
+      }
       body.innerHTML = '<div class="pm-empty">暂无映射，点击右上角添加</div>';
       return;
     }
@@ -556,6 +587,13 @@
   });
 
   document.getElementById('map-body').addEventListener('click', function (event) {
+    var reconnectEl = event.target.closest('[data-reconnect-now]');
+    if (reconnectEl) {
+      if (typeof triggerReconnectFn === 'function') {
+        triggerReconnectFn();
+      }
+      return;
+    }
     var more = event.target.closest('[data-more]');
     if (!more) return;
     if (!IS_TAURI) {
@@ -656,11 +694,52 @@
   validateLive();
 
   if (IS_TAURI) {
+    var headerEl = document.querySelector('.pm-header');
     var headerNameEl = document.getElementById('pm-device-name');
     var headerDotEl = document.getElementById('pm-status-dot');
     var headerStateEl = document.getElementById('pm-status-text');
+    var headerReconnectBtn = null;
+    if (headerEl) {
+      headerReconnectBtn = document.createElement('button');
+      headerReconnectBtn.type = 'button';
+      headerReconnectBtn.className = 'btn btn--secondary';
+      headerReconnectBtn.style.marginLeft = 'auto';
+      headerReconnectBtn.style.height = '28px';
+      headerReconnectBtn.style.padding = '0 12px';
+      headerReconnectBtn.style.fontSize = 'var(--size-secondary)';
+      headerReconnectBtn.hidden = true;
+      headerReconnectBtn.textContent = '重新连接';
+      headerReconnectBtn.addEventListener('click', function () {
+        if (typeof triggerReconnectFn === 'function') {
+          triggerReconnectFn();
+        }
+      });
+      headerEl.appendChild(headerReconnectBtn);
+    }
     var deviceParam = new URLSearchParams(window.location.search).get('device') || '';
     var currentDeviceName = '';
+
+    triggerReconnectFn = function () {
+      var fn =
+        typeof Bridge.triggerReconnectNow === 'function'
+          ? Bridge.triggerReconnectNow
+          : typeof Bridge.reconnectLastSession === 'function'
+            ? Bridge.reconnectLastSession
+            : null;
+      if (!fn) {
+        toast('当前版本暂不支持自动重连，请从主窗口重新连接');
+        return;
+      }
+      lastEndedReason = '';
+      updateHeaderStatus('connecting', currentDeviceName, false);
+      toast('正在重新连接…');
+      fn().catch(function (err) {
+        var msg = errMessage(err);
+        lastEndedReason = msg;
+        updateHeaderStatus('offline', '', false);
+        toast(msg);
+      });
+    };
 
     function syncToolbarAvailability() {
       var blocked = !sessionOnline || sessionWatchOnly;
@@ -685,9 +764,11 @@
     function updateHeaderStatus(state, nameOverride, watchOnlyFlag) {
       var isOnline = state === 'online';
       var isConnecting = state === 'connecting';
+      var isReconnecting = state === 'reconnecting';
       var isWatchOnly = Boolean(isOnline && watchOnlyFlag);
       var wasReady = sessionOnline && !sessionWatchOnly;
 
+      sessionPhase = state || 'offline';
       sessionOnline = isOnline;
       sessionWatchOnly = isWatchOnly;
       if (state === 'offline') {
@@ -701,7 +782,7 @@
         headerNameEl.textContent =
           currentDeviceName ||
           deviceParam ||
-          (isOnline || isConnecting ? '远程设备' : '未连接设备');
+          (isOnline || isConnecting || isReconnecting ? '远程设备' : '未连接设备');
       }
       if (headerDotEl) {
         headerDotEl.classList.toggle('status-dot--online', isOnline);
@@ -712,9 +793,22 @@
           ? '观看模式（只读）'
           : isOnline
           ? '已连接'
+          : isReconnecting
+          ? '连接中断，正在自动重连 (' + (reconnectAttempt || 1) + '/' + (reconnectMax || 8) + ')…'
           : isConnecting
-          ? '连接中…'
+          ? '正在建立安全连接…'
           : '未连接';
+      }
+      if (headerReconnectBtn) {
+        if (isReconnecting) {
+          headerReconnectBtn.textContent = '立即重试';
+          headerReconnectBtn.hidden = false;
+        } else if (!isOnline && !isConnecting && !isWatchOnly) {
+          headerReconnectBtn.textContent = '重新连接';
+          headerReconnectBtn.hidden = false;
+        } else {
+          headerReconnectBtn.hidden = true;
+        }
       }
 
       var nowReady = sessionOnline && !sessionWatchOnly;
@@ -724,8 +818,10 @@
           .catch(function (err) {
             toast(errMessage(err));
           });
-      } else if (!isOnline && !isConnecting && mappings.length) {
+      } else if (!isOnline && !isConnecting && !isReconnecting && mappings.length) {
         mappings = [];
+        render();
+      } else if (!mappings.length) {
         render();
       }
     }
@@ -736,7 +832,11 @@
         return;
       }
       var name = info.deviceName || info.target || '';
-      if (info.connected) {
+      var phase = info.phase ? String(info.phase) : '';
+      if (phase === 'reconnecting') {
+        updateHeaderStatus('reconnecting', name, false);
+      } else if (info.connected) {
+        lastEndedReason = '';
         updateHeaderStatus('online', name, Boolean(info.watchOnly));
       } else {
         updateHeaderStatus('connecting', name, false);
@@ -750,13 +850,21 @@
       var data = upd.data || {};
       var devName = data.device_name || data.device || '';
       if (upd.kind === 'negotiated') {
+        lastEndedReason = '';
         var nextWatch = typeof data.watch_only === 'boolean' ? data.watch_only : sessionWatchOnly;
         updateHeaderStatus('online', devName, nextWatch);
       } else if (upd.kind === 'hud') {
+        lastEndedReason = '';
         updateHeaderStatus('online', devName, sessionWatchOnly);
       } else if (upd.kind === 'connecting') {
+        lastEndedReason = '';
         updateHeaderStatus('connecting', devName, false);
+      } else if (upd.kind === 'reconnecting') {
+        reconnectAttempt = Number(data.attempt) || 1;
+        reconnectMax = Number(data.max_attempts || data.maxAttempts) || 8;
+        updateHeaderStatus('reconnecting', devName, false);
       } else if (upd.kind === 'ended') {
+        lastEndedReason = data.reason ? String(data.reason) : '远控会话已断开';
         updateHeaderStatus('offline', '', false);
       }
     }

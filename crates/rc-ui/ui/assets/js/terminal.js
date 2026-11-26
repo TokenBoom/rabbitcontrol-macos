@@ -395,9 +395,16 @@
       active: !IS_TAURI,
       connected: !IS_TAURI,
       watchOnly: false,
+      phase: !IS_TAURI ? 'connected' : '',
+      reconnectingAttempt: 0,
+      reconnectingMax: 8,
+      reconnectingReason: '',
       deviceName: IS_TAURI ? '' : 'yii’s MacBook Pro'
     };
     var lastEndedReason = '';
+    var mgrBannerEl = null;
+    var mgrBannerTextEl = null;
+    var mgrBannerBtnEl = null;
     var viewMode = 'list'; // 'list' | 'terminal'
     var sessions = []; // [{ termId, name, title, cwd, createdAtUnixSec, cols, rows, attached }]
     var tabByTermId = Object.create(null);
@@ -801,6 +808,115 @@
       }
     }
 
+    function triggerSessionReconnect() {
+      if (!IS_TAURI) {
+        showToast('正在尝试重新连接…（预览）');
+        return;
+      }
+      var fn =
+        typeof Bridge.triggerReconnectNow === 'function'
+          ? Bridge.triggerReconnectNow
+          : typeof Bridge.reconnectLastSession === 'function'
+            ? Bridge.reconnectLastSession
+            : null;
+      if (!fn) {
+        showToast('当前版本暂不支持自动重连，请从主窗口重新连接');
+        return;
+      }
+      sessionState.active = true;
+      sessionState.connected = false;
+      sessionState.phase = 'connecting';
+      lastEndedReason = '';
+      if (viewMode === 'list') {
+        renderManagerView();
+      } else {
+        hideNotice();
+        syncLiveChrome();
+      }
+      showToast('正在重新连接…');
+      fn().catch(function (err) {
+        var msg = errMessage(err, '重新连接失败');
+        sessionState.active = false;
+        sessionState.connected = false;
+        sessionState.phase = 'ended';
+        lastEndedReason = msg;
+        handleDisconnectState(msg);
+        showToast(msg);
+      });
+    }
+
+    function ensureMgrBanner() {
+      if (mgrBannerEl || !listViewEl) return mgrBannerEl;
+      var box = document.createElement('div');
+      box.style.display = 'flex';
+      box.style.alignItems = 'center';
+      box.style.justifyContent = 'space-between';
+      box.style.gap = '12px';
+      box.style.marginBottom = '14px';
+      box.style.padding = '10px 14px';
+      box.style.border = '1px solid var(--stroke)';
+      box.style.borderRadius = 'var(--r-card)';
+      box.style.background = 'var(--bg-card)';
+      box.hidden = true;
+
+      var txt = document.createElement('span');
+      txt.style.fontSize = 'var(--size-secondary)';
+      txt.style.color = 'var(--text-primary)';
+      txt.style.lineHeight = '20px';
+      txt.style.minWidth = '0';
+      txt.style.overflowWrap = 'anywhere';
+      box.appendChild(txt);
+
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tm-btn-light tm-btn-light--primary';
+      btn.textContent = '重新连接';
+      btn.addEventListener('click', function () {
+        triggerSessionReconnect();
+      });
+      box.appendChild(btn);
+
+      if (sessionListEl && sessionListEl.parentNode === listViewEl) {
+        listViewEl.insertBefore(box, sessionListEl);
+      } else {
+        listViewEl.appendChild(box);
+      }
+      mgrBannerEl = box;
+      mgrBannerTextEl = txt;
+      mgrBannerBtnEl = btn;
+      return mgrBannerEl;
+    }
+
+    function syncMgrBanner() {
+      var banner = ensureMgrBanner();
+      if (!banner || !mgrBannerTextEl || !mgrBannerBtnEl) return;
+      if (!IS_TAURI || isSessionReady() || sessionState.watchOnly) {
+        banner.hidden = true;
+        return;
+      }
+      if (sessionState.phase === 'reconnecting') {
+        var attempt = sessionState.reconnectingAttempt || 1;
+        var max = sessionState.reconnectingMax || 8;
+        var detail = sessionState.reconnectingReason ? '（' + sessionState.reconnectingReason + '）' : '';
+        mgrBannerTextEl.textContent =
+          '连接中断，正在自动重连 (' + attempt + '/' + max + ')…' + detail;
+        mgrBannerBtnEl.textContent = '立即重试';
+        banner.hidden = false;
+        return;
+      }
+      if (sessionState.active && !sessionState.connected) {
+        banner.hidden = true;
+        return;
+      }
+      if (!sessionState.active) {
+        mgrBannerTextEl.textContent = lastEndedReason || '远控连接已断开';
+        mgrBannerBtnEl.textContent = '重新连接';
+        banner.hidden = false;
+        return;
+      }
+      banner.hidden = true;
+    }
+
     function renderManagerView() {
       if (deviceNameEl) {
         deviceNameEl.textContent = sessionState.deviceName || '远程设备';
@@ -815,13 +931,23 @@
         } else if (sessionState.watchOnly) {
           mgrDotEl.classList.add('is-warning');
           mgrStatusTextEl.textContent = '只读观看模式';
+        } else if (sessionState.phase === 'reconnecting') {
+          mgrDotEl.classList.add('is-warning');
+          mgrStatusTextEl.textContent =
+            '自动重连中 (' +
+            (sessionState.reconnectingAttempt || 1) +
+            '/' +
+            (sessionState.reconnectingMax || 8) +
+            ')…';
         } else if (sessionState.active && !sessionState.connected) {
           mgrDotEl.classList.add('is-warning');
-          mgrStatusTextEl.textContent = '正在连接…';
+          mgrStatusTextEl.textContent = '正在建立安全连接…';
         } else {
           mgrStatusTextEl.textContent = '未连接';
         }
       }
+
+      syncMgrBanner();
 
       if (titleEl && viewMode === 'list') {
         titleEl.textContent = '终端远控';
@@ -842,10 +968,17 @@
         if (emptyTextEl) {
           if (sessionState.watchOnly) {
             emptyTextEl.textContent = '当前为只读观看模式，无法管理或打开远程终端';
+          } else if (sessionState.phase === 'reconnecting') {
+            emptyTextEl.textContent =
+              '连接中断，正在自动重连 (' +
+              (sessionState.reconnectingAttempt || 1) +
+              '/' +
+              (sessionState.reconnectingMax || 8) +
+              ')…';
           } else if (sessionState.active && !sessionState.connected) {
-            emptyTextEl.textContent = '正在建立远控连接，请稍候…';
+            emptyTextEl.textContent = '正在建立安全连接，请稍候…';
           } else if (!sessionState.active) {
-            emptyTextEl.textContent = lastEndedReason || '请先在主窗口或远程桌面窗口建立远控会话';
+            emptyTextEl.textContent = lastEndedReason || '远控会话未连接，可点击上方「重新连接」恢复';
           } else {
             emptyTextEl.textContent = '暂无运行中的终端会话，点击右上角「创建会话」开始';
           }
@@ -1637,13 +1770,30 @@
       } else if (tab.connected) {
         setStatus('online', '已连接' + devSuffix);
         if (reconnectBtn) reconnectBtn.hidden = true;
+      } else if (sessionState.phase === 'reconnecting') {
+        setStatus(
+          'connecting',
+          '自动重连中 (' +
+            (sessionState.reconnectingAttempt || 1) +
+            '/' +
+            (sessionState.reconnectingMax || 8) +
+            ')…'
+        );
+        if (reconnectBtn) {
+          reconnectBtn.textContent = '立即重试';
+          reconnectBtn.hidden = false;
+        }
+      } else if (sessionState.active && !sessionState.connected) {
+        setStatus('connecting', '正在建立安全连接…' + devSuffix);
+        if (reconnectBtn) reconnectBtn.hidden = true;
       } else {
         setStatus('error', '未连接' + devSuffix);
         var noticeBlocksReconnect = Boolean(
           noticeEl && !noticeEl.hidden && noticeReconnectBtn && noticeReconnectBtn.hidden
         );
         if (reconnectBtn) {
-          reconnectBtn.hidden = !isSessionReady() || noticeBlocksReconnect;
+          reconnectBtn.textContent = isSessionReady() ? '重新附着' : '重新连接';
+          reconnectBtn.hidden = sessionState.watchOnly || noticeBlocksReconnect;
         }
       }
 
@@ -1853,6 +2003,10 @@
     }
 
     function reattachCurrentSession() {
+      if (!isSessionReady()) {
+        triggerSessionReconnect();
+        return;
+      }
       if (activeTermId != null) {
         openSessionTerminal(activeTermId);
       } else {
@@ -2110,7 +2264,8 @@
       }
     }
 
-    function handleDisconnectState(reasonText) {
+    function handleDisconnectState(reasonText, opts) {
+      var options = opts || {};
       pendingOpenKinds = [];
       finishBgCreate();
       finishAttachCreate();
@@ -2126,6 +2281,12 @@
         if (activeTab && !activeTab.disconnectNoticed) {
           activeTab.disconnectNoticed = true;
           writeSystemNoticeToXterm('[' + (reasonText || '远控会话已断开') + ']');
+        }
+        if (options.showNotice !== false && !sessionState.watchOnly) {
+          if (noticeReconnectBtn) {
+            noticeReconnectBtn.textContent = options.reconnectLabel || '重新连接';
+          }
+          showNotice(reasonText || '远控会话已断开', true);
         }
         syncLiveChrome();
       } else {
@@ -2154,19 +2315,33 @@
       sessionState.watchOnly = Boolean(
         s.watchOnly !== undefined ? s.watchOnly : s.watch_only
       );
+      var rawPhase = s.phase ? String(s.phase) : '';
+      sessionState.phase =
+        rawPhase || (sessionState.connected ? 'connected' : sessionState.active ? 'connecting' : '');
       if (s.deviceName || s.device_name || s.target) {
         sessionState.deviceName = String(s.deviceName || s.device_name || s.target);
       }
 
       if (!sessionState.active) {
-        handleDisconnectState(lastEndedReason || '远控会话已断开');
+        handleDisconnectState(lastEndedReason || '远控会话已断开', { reconnectLabel: '重新连接' });
+        return;
+      }
+
+      if (sessionState.phase === 'reconnecting') {
+        var recMsg =
+          '连接中断，正在自动重连 (' +
+          (sessionState.reconnectingAttempt || 1) +
+          '/' +
+          (sessionState.reconnectingMax || 8) +
+          ')…';
+        handleDisconnectState(recMsg, { reconnectLabel: '立即重试' });
         return;
       }
 
       lastEndedReason = '';
 
       if (sessionState.watchOnly) {
-        handleDisconnectState('当前为只读观看模式，无法使用远程终端');
+        handleDisconnectState('当前为只读观看模式，无法使用远程终端', { showNotice: false });
         return;
       }
 
@@ -2176,6 +2351,7 @@
         return;
       }
 
+      hideNotice();
       if (!wasReady) {
         resetSessionTimer();
         refreshSessionList();
@@ -2190,21 +2366,51 @@
 
     function handleSessionUpdate(upd) {
       if (!upd || !upd.kind) return;
+      var data = upd.data || {};
+      if (upd.kind === 'connecting') {
+        sessionState.active = true;
+        sessionState.connected = false;
+        sessionState.phase = 'connecting';
+        lastEndedReason = '';
+        if (data.device_name || data.device) {
+          sessionState.deviceName = String(data.device_name || data.device);
+        }
+        if (viewMode === 'list') renderManagerView();
+        else syncLiveChrome();
+        return;
+      }
+      if (upd.kind === 'reconnecting') {
+        sessionState.active = true;
+        sessionState.connected = false;
+        sessionState.phase = 'reconnecting';
+        sessionState.reconnectingAttempt = Number(data.attempt) || 1;
+        sessionState.reconnectingMax = Number(data.max_attempts || data.maxAttempts) || 8;
+        sessionState.reconnectingReason = data.reason ? String(data.reason) : '';
+        var recMsg =
+          '连接中断，正在自动重连 (' +
+          sessionState.reconnectingAttempt +
+          '/' +
+          sessionState.reconnectingMax +
+          ')…';
+        handleDisconnectState(recMsg, { reconnectLabel: '立即重试' });
+        return;
+      }
       if (upd.kind === 'ended') {
-        var reason = (upd.data && upd.data.reason) || '远控会话已断开';
+        var reason = (data && data.reason) || '远控会话已断开';
         lastEndedReason = reason;
         sessionState.active = false;
         sessionState.connected = false;
         sessionState.watchOnly = false;
-        handleDisconnectState(reason);
+        sessionState.phase = 'ended';
+        handleDisconnectState(reason, { reconnectLabel: '重新连接' });
         return;
       }
       if (upd.kind === 'negotiated') {
-        var data = upd.data || {};
         var wasReady = isSessionReady();
         lastEndedReason = '';
         sessionState.active = true;
         sessionState.connected = true;
+        sessionState.phase = 'connected';
         if (typeof data.watch_only === 'boolean') {
           sessionState.watchOnly = data.watch_only;
         }
@@ -2212,9 +2418,10 @@
           sessionState.deviceName = String(data.device_name || data.device);
         }
         if (sessionState.watchOnly) {
-          handleDisconnectState('当前为只读观看模式，无法使用远程终端');
+          handleDisconnectState('当前为只读观看模式，无法使用远程终端', { showNotice: false });
           return;
         }
+        hideNotice();
         if (!wasReady) {
           resetSessionTimer();
           refreshSessionList();

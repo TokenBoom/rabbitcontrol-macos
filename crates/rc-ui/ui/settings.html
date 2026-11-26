@@ -271,6 +271,28 @@
           </div>
         </section>
 
+        <!-- G1.5 UPnP / NAT-PMP 端口映射 -->
+        <section class="rc-group" aria-label="UPnP / NAT-PMP 端口映射">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-upnp-enabled">UPnP / NAT-PMP 端口映射</div>
+              <div class="rc-setting-row__desc">自动向路由器申请公网 UDP 端口映射，提升跨网 P2P 直连成功率。</div>
+              <div class="rc-status-badge rc-status-badge--disabled" id="upnp-status-badge"
+                   role="status" aria-live="polite">
+                <span class="rc-status-badge__dot" id="upnp-status-dot" aria-hidden="true"></span>
+                <span class="rc-status-badge__text" id="upnp-status-text">未开启</span>
+              </div>
+              <div class="rc-setting-row__detail" id="upnp-status-detail" hidden></div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-upnp-enabled" aria-labelledby="row-upnp-enabled" />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+        </section>
+
         <!-- G2 自动更新镜像加速 -->
         <section class="rc-group" aria-label="自动更新下载镜像">
           <div class="rc-setting-row">
@@ -350,6 +372,9 @@
           if (panels[panelKey]) panels[panelKey].hidden = panelKey !== key;
         });
         panelEmpty.hidden = Boolean(panels[key]);
+        if (key === "network" && typeof refreshUpnpStatus === "function") {
+          refreshUpnpStatus();
+        }
       }
 
       tabs.forEach(function (tab, i) {
@@ -1114,6 +1139,148 @@
           }
         });
       });
+
+      /* ── UPnP / NAT-PMP 自动端口映射设置与状态 ────────────────── */
+      var UPNP_STORE_KEY = "rc.settings.upnp.v1";
+      var optUpnpEnabled = document.getElementById("opt-upnp-enabled");
+      var upnpStatusBadge = document.getElementById("upnp-status-badge");
+      var upnpStatusText = document.getElementById("upnp-status-text");
+      var upnpStatusDetail = document.getElementById("upnp-status-detail");
+      var upnpPollTimer = 0;
+
+      function formatUpnpProtocol(proto) {
+        var p = String(proto || "").trim().toLowerCase();
+        if (p === "upnp_igd_v2") return "UPnP IGD v2";
+        if (p === "upnp_igd_v1" || p === "upnp_igd") return "UPnP IGD";
+        if (p === "nat_pmp" || p === "nat-pmp") return "NAT-PMP";
+        return proto ? String(proto) : "UPnP IGD";
+      }
+
+      function applyUpnpStatus(payload) {
+        if (!upnpStatusBadge || !upnpStatusText) return;
+        var data = payload && typeof payload === "object" ? payload : {};
+        var enabled = Boolean(data.enabled);
+        if (optUpnpEnabled) {
+          optUpnpEnabled.checked = enabled;
+        }
+        var st = data.status && typeof data.status === "object" ? data.status : {};
+        var state = String(st.state || (enabled ? "discovering" : "disabled")).toLowerCase();
+        upnpStatusBadge.classList.remove(
+          "rc-status-badge--disabled",
+          "rc-status-badge--connecting",
+          "rc-status-badge--connected",
+          "rc-status-badge--error"
+        );
+        if (upnpStatusDetail) {
+          upnpStatusDetail.classList.remove("rc-setting-row__detail--error", "rc-setting-row__detail--ok");
+          upnpStatusDetail.textContent = "";
+          upnpStatusDetail.title = "";
+          upnpStatusDetail.hidden = true;
+        }
+        window.clearTimeout(upnpPollTimer);
+        upnpPollTimer = 0;
+
+        if (!enabled || state === "disabled") {
+          upnpStatusBadge.classList.add("rc-status-badge--disabled");
+          upnpStatusText.textContent = "未开启";
+          upnpStatusBadge.title = "未开启";
+          return;
+        }
+        if (state === "mapped") {
+          var extAddr = st.external_addr || st.externalAddr || "";
+          var protoLabel = formatUpnpProtocol(st.protocol);
+          var mappedText = extAddr
+            ? "已映射 " + extAddr + " (" + protoLabel + ")"
+            : "已映射 (" + protoLabel + ")";
+          upnpStatusBadge.classList.add("rc-status-badge--connected");
+          upnpStatusText.textContent = mappedText;
+          upnpStatusBadge.title = mappedText;
+          return;
+        }
+        if (state === "discovering") {
+          upnpStatusBadge.classList.add("rc-status-badge--connecting");
+          upnpStatusText.textContent = "正在探测路由器…";
+          upnpStatusBadge.title = "正在探测路由器…";
+          if (IS_TAURI && panels.network && !panels.network.hidden) {
+            upnpPollTimer = window.setTimeout(function () {
+              upnpPollTimer = 0;
+              if (panels.network && !panels.network.hidden) {
+                refreshUpnpStatus();
+              }
+            }, 3000);
+          }
+          return;
+        }
+        upnpStatusBadge.classList.add("rc-status-badge--error");
+        upnpStatusText.textContent = "路由器不支持或处于多层 NAT";
+        var reason = st.reason ? String(st.reason).trim() : "";
+        upnpStatusBadge.title = reason || "路由器不支持或处于多层 NAT";
+        if (upnpStatusDetail && reason) {
+          upnpStatusDetail.classList.add("rc-setting-row__detail--error");
+          upnpStatusDetail.textContent = reason;
+          upnpStatusDetail.title = reason;
+          upnpStatusDetail.hidden = false;
+        }
+      }
+
+      function refreshUpnpStatus() {
+        if (!optUpnpEnabled) return;
+        if (IS_TAURI && typeof Bridge.getUpnpStatus === "function") {
+          Bridge.getUpnpStatus()
+            .then(applyUpnpStatus)
+            .catch(function () {
+              applyUpnpStatus({ enabled: Boolean(optUpnpEnabled.checked), status: { state: "disabled" } });
+            });
+          return;
+        }
+        var saved = false;
+        try {
+          saved = JSON.parse(window.localStorage.getItem(UPNP_STORE_KEY) || "false") === true;
+        } catch (err) {
+          saved = false;
+        }
+        applyUpnpStatus({
+          enabled: saved,
+          status: saved
+            ? { state: "mapped", external_addr: "203.0.113.10:49152", protocol: "upnp_igd_v2" }
+            : { state: "disabled" }
+        });
+      }
+
+      if (optUpnpEnabled) {
+        optUpnpEnabled.addEventListener("change", function () {
+          var desired = Boolean(optUpnpEnabled.checked);
+          if (!IS_TAURI || typeof Bridge.saveUpnpEnabled !== "function") {
+            try {
+              window.localStorage.setItem(UPNP_STORE_KEY, JSON.stringify(desired));
+            } catch (err) {
+              /* ignore */
+            }
+            applyUpnpStatus({
+              enabled: desired,
+              status: desired
+                ? { state: "mapped", external_addr: "203.0.113.10:49152", protocol: "upnp_igd_v2" }
+                : { state: "disabled" }
+            });
+            toast(desired ? "已开启 UPnP / NAT-PMP 端口映射（预览）" : "已关闭 UPnP / NAT-PMP 端口映射（预览）");
+            return;
+          }
+          optUpnpEnabled.disabled = true;
+          Bridge.saveUpnpEnabled(desired)
+            .then(function (rep) {
+              applyUpnpStatus(rep);
+              toast(desired ? "已开启 UPnP / NAT-PMP 端口映射" : "已关闭 UPnP / NAT-PMP 端口映射");
+            })
+            .catch(function (err) {
+              optUpnpEnabled.checked = !desired;
+              toast("保存 UPnP 设置失败：" + String(err));
+            })
+            .then(function () {
+              optUpnpEnabled.disabled = false;
+            });
+        });
+        refreshUpnpStatus();
+      }
 
       /* ── 自动更新镜像加速前缀配置 ───────────────────────────── */
       var optUpdateMirror = document.getElementById("opt-update-mirror");

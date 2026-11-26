@@ -29,6 +29,7 @@ use rc_ui::host_bridge::{
 };
 use rc_ui::lan_discovery::{self, LanDiscoveryHandle};
 use rc_ui::metal_attach::{self, StatusBarAction, StatusBarDisplay};
+use rc_ui::network_monitor::NetworkMonitorHandle;
 use rc_ui::permissions::{self, PermissionSnapshot};
 use rc_ui::server_config::{self, ServerConfig, ServerConnectionState};
 use rc_ui::service_ipc::{
@@ -40,6 +41,16 @@ use rc_ui::service_manager;
 use rc_ui::signal_client::{DeviceStatusEvent, SignalClientHandle, SignalClientOptions};
 
 const MAX_PENDING_DEVICE_EVENTS: usize = 64;
+const DEFAULT_REQUEST_CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+fn resolve_request_connect_timeout(timeout_ms: u64) -> Duration {
+    let effective_ms = if timeout_ms == 0 {
+        DEFAULT_REQUEST_CONNECT_TIMEOUT_MS
+    } else {
+        timeout_ms.clamp(1_000, 30_000)
+    };
+    Duration::from_millis(effective_ms)
+}
 
 fn normalize_device_id_digits(raw: &str) -> String {
     raw.chars()
@@ -558,6 +569,7 @@ impl AgentInner {
             allow_remote_assist: self.signal_allow_remote_assist(),
             allow_remote_control: Some(self.allow_owner_control),
             dynamic_lan_discovery: true,
+            upnp_enabled: self.prefs.upnp_enabled,
         };
         let mut lan_addrs = Vec::new();
         if let Some(ip) = lan_discovery::detect_local_lan_ipv4() {
@@ -764,6 +776,9 @@ impl AgentInner {
             self.start_signal()
         } else {
             self.sync_signal_allow_assist();
+            if let Some(ref sig) = self.signal {
+                sig.set_upnp_enabled(self.prefs.upnp_enabled);
+            }
             None
         };
         self.sync_lan_advertising();
@@ -783,6 +798,9 @@ impl AgentInner {
         self.custom_password = custom;
         let retired = self.ensure_host_state();
         self.sync_signal_allow_assist();
+        if let Some(ref sig) = self.signal {
+            sig.set_upnp_enabled(self.prefs.upnp_enabled);
+        }
         if let Some(ref running_host) = self.host {
             let pw_opt = if self.password.is_empty() {
                 None
@@ -814,6 +832,7 @@ impl AgentInner {
             session_type: self.session_type,
             degraded_permissions: self.degraded_permissions,
             permissions: self.permissions.clone(),
+            upnp_status: self.signal.as_ref().map(|s| s.upnp_status()),
         }
     }
 
@@ -1416,7 +1435,7 @@ fn main() {
                         message: "请先在「设置 → 网络」配置并连接服务器".to_string(),
                     };
                 }
-                let timeout = Duration::from_millis(timeout_ms.clamp(1_000, 30_000));
+                let timeout = resolve_request_connect_timeout(timeout_ms);
                 let res = if force_relay {
                     sig.request_relay(&target_id, timeout)
                 } else {
@@ -1453,6 +1472,25 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // 启动本机网络路由切换监测器：切网/恢复联网时触发信令快重连并清空刷新局域网节点表。
+    let agent_net = Arc::clone(&agent);
+    let mut net_monitor = NetworkMonitorHandle::spawn(move |ev| {
+        eprintln!(
+            "[rc-host-agent] 检测到本机网络变化 (connectivity: {} -> {}, addrs: {:?})，触发信令快重连与局域网刷新",
+            ev.had_connectivity, ev.has_connectivity, ev.fingerprint
+        );
+        let sig_opt = {
+            let guard = agent_net.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref lan) = guard.lan {
+                lan.clear_and_refresh();
+            }
+            guard.signal.clone()
+        };
+        if let Some(sig) = sig_opt {
+            sig.trigger_reconnect("network_route_changed");
+        }
+    });
 
     if session_type == ServiceSessionType::Aqua {
         let agent_tray = Arc::clone(&agent);
@@ -1531,7 +1569,8 @@ fn main() {
     } else {
         ByeReason::Normal
     };
-    // 停机前先在主线程显式清理物理隐私幕布窗口，避免后续 `retired.stop_all` join 被控线程时发生主队列等待超时。
+    // 停机前先停止网络监测器，避免退出清理期间触发重连；并在主线程显式清理物理隐私幕布窗口。
+    net_monitor.stop();
     #[cfg(target_os = "macos")]
     rc_capture_macos::clear_privacy_curtain();
     let retired = agent
@@ -1614,5 +1653,29 @@ mod tests {
         assert_eq!(normalize_device_id_digits("604 928 235"), "604928235");
         assert_eq!(normalize_device_id_digits("604-928-235"), "604928235");
         assert_eq!(normalize_device_id_digits("604928235"), "604928235");
+    }
+
+    #[test]
+    fn resolve_request_connect_timeout_defaults_and_passes_through() {
+        assert_eq!(
+            resolve_request_connect_timeout(0),
+            Duration::from_millis(DEFAULT_REQUEST_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolve_request_connect_timeout(5_000),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            resolve_request_connect_timeout(12_000),
+            Duration::from_millis(12_000)
+        );
+        assert_eq!(
+            resolve_request_connect_timeout(200),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            resolve_request_connect_timeout(60_000),
+            Duration::from_millis(30_000)
+        );
     }
 }

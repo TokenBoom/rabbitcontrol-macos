@@ -11,10 +11,10 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
-use rc_ui::app_prefs::{self, AppPrefs};
+use rc_ui::app_prefs::{self, AppPrefs, ConnectionMode};
 use rc_ui::auth_client::{self, AuthMaintainerHandle, AuthSessionManager};
 use rc_ui::cert_manager::{self, CertManager};
 use rc_ui::host_bridge::{self, HostApprovalPrompt, HostHandle, HostUpdate};
@@ -133,6 +133,14 @@ pub struct ActiveSessionMeta {
     pub audio_enabled: bool,
     /// 是否强制走中继。
     pub force_relay: bool,
+    /// 本次会话连接路由模式（`Auto` / `P2pOnly` / `TcpRelay`）。
+    pub connection_mode: ConnectionMode,
+    /// 当前是否处于桌面媒体活跃渲染态（纯工具模式或降级无头时为 `false`）。
+    pub media_active: bool,
+    /// 当前会话阶段（`"connecting"` / `"connected"` / `"reconnecting"`）。
+    pub phase: String,
+    /// 是否为纯工具无头会话（未开启视频采集/解码管线）。
+    pub tools_only: bool,
     /// 本次会话是否开启端到端 mTLS 加密握手。
     pub encrypt_connection: bool,
     /// 当前会话实际 negotiated 是否激活了 mTLS/E2EE。
@@ -165,6 +173,12 @@ pub struct ActiveSessionInfo {
     pub transport: Option<String>,
     /// 是否已启用强制中继模式。
     pub force_relay: bool,
+    /// 当前是否处于桌面媒体渲染活跃态。
+    pub media_active: bool,
+    /// 当前会话阶段（`"connecting"` / `"connected"` / `"reconnecting"` / `""`）。
+    pub phase: String,
+    /// 当前会话连接路由模式（`"auto"` / `"p2p_only"` / `"tcp_relay"`）。
+    pub connection_mode: ConnectionMode,
     /// 本次会话是否启用端到端 mTLS 加密。
     pub encrypt_connection: bool,
     /// 当前握手实际激活的 mTLS 状态。
@@ -177,6 +191,69 @@ impl ActiveSessionInfo {
     /// 返回空会话（未控制任何设备）快照。
     pub fn inactive() -> Self {
         Self::default()
+    }
+
+    /// 由保存的会话元数据构造自动重连中快照。
+    pub fn reconnecting_from_meta(watch_only: bool, meta: &ActiveSessionMeta) -> Self {
+        Self {
+            active: true,
+            target: (!meta.target.is_empty()).then(|| meta.target.clone()),
+            device_key: (!meta.device_key.is_empty()).then(|| meta.device_key.clone()),
+            device_name: (!meta.device_name.is_empty()).then(|| meta.device_name.clone()),
+            watch_only,
+            connected: false,
+            transport: None,
+            force_relay: meta.force_relay,
+            media_active: meta.media_active,
+            phase: "reconnecting".to_string(),
+            connection_mode: meta.connection_mode,
+            encrypt_connection: meta.encrypt_connection,
+            mtls_active: false,
+            peer_cert_fingerprint: None,
+        }
+    }
+
+    /// 由保存的会话元数据构造信令/安全协商中快照。
+    pub fn connecting_from_meta(watch_only: bool, meta: &ActiveSessionMeta) -> Self {
+        Self {
+            active: true,
+            target: (!meta.target.is_empty()).then(|| meta.target.clone()),
+            device_key: (!meta.device_key.is_empty()).then(|| meta.device_key.clone()),
+            device_name: (!meta.device_name.is_empty()).then(|| meta.device_name.clone()),
+            watch_only,
+            connected: false,
+            transport: None,
+            force_relay: meta.force_relay,
+            media_active: !meta.tools_only,
+            phase: "connecting".to_string(),
+            connection_mode: meta.connection_mode,
+            encrypt_connection: meta.encrypt_connection,
+            mtls_active: false,
+            peer_cert_fingerprint: None,
+        }
+    }
+}
+
+/// 自动重连任务活跃令牌 RAII 守卫：退出时仅通过 `compare_exchange(token, 0)` 释放自身所有权，
+/// 绝不误清已被后代重连任务接管的活跃令牌。
+pub struct AutoReconnectActiveGuard {
+    active: Arc<AtomicU64>,
+    token: u64,
+}
+
+impl AutoReconnectActiveGuard {
+    /// 读取本守卫持有的单调递增任务令牌（仅供测试断言）。
+    #[cfg(test)]
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl Drop for AutoReconnectActiveGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .active
+            .compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -239,6 +316,9 @@ impl<H> ActiveSession<H> {
             connected: self.meta.connected,
             transport: self.meta.transport.clone(),
             force_relay: self.meta.force_relay,
+            media_active: self.meta.media_active,
+            phase: self.meta.phase.clone(),
+            connection_mode: self.meta.connection_mode,
             encrypt_connection: self.meta.encrypt_connection,
             mtls_active: self.meta.mtls_active,
             peer_cert_fingerprint: self.meta.peer_cert_fingerprint.clone(),
@@ -379,6 +459,7 @@ pub fn should_sync_layer_on_main_thread<H>(
 ///   `MetalRenderer`，即使并发 `open_session` 替换并 drop 旧会话也不会 UAF），再按 `sid` 核对发送
 ///   `Disconnect`；
 /// - 否则在持锁期间直接发送 `Disconnect`。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn begin_disconnect<H>(
     slot: &Mutex<Option<ActiveSession<H>>>,
     send_disconnect_now: impl FnOnce(&H),
@@ -830,9 +911,13 @@ pub struct AppState {
     /// 最近一次会话状态更新快照，附带会话代际号 `sid`（Review M8 + U-H2 / U-H3：
     /// 锁序恒为 `session -> last_session_update`，防旧会话快照串台或泄露过期 `Ended`）。
     pub last_session_update: Mutex<Option<(u64, SessionUpdate)>>,
+    /// 绑定 `session_open_epoch` 的最近一次不可恢复会话终态错误（供晚挂载 S1 窗口通过 `session_snapshot` 补领失败面板）。
+    pub last_terminal_error: Mutex<Option<(u64, String)>>,
     /// 会话打开代次计数器（H9：`open_session` 与 `disconnect_active_session` 递增，
     /// 使在途 `request_connect` 在被更新请求或关窗取消后自动作废）。
     pub session_open_epoch: AtomicU64,
+    /// 当前正在执行信令/安全协商的会话代次（`0` 表示无在途协商）。
+    pub connecting_epoch: AtomicU64,
     /// 记录最近一次由 `close_session_window` 主动关闭的代次，避免异步 `WindowEvent::Destroyed` 二次递增 `session_open_epoch` 或误杀新会话窗。
     pub programmatic_close_epoch: AtomicU64,
     /// 本机被控端运行时状态（一体化 All-in-One 模式）。
@@ -864,8 +949,22 @@ pub struct AppState {
     /// macOS 系统快捷键主动拦截器（开启「发送系统快捷键到被控端」且 S1 窗口获焦时生效）。
     #[cfg(target_os = "macos")]
     pub shortcut_tap: Mutex<Option<rc_input_macos::SystemShortcutTap>>,
-    /// 最近一次建立的活动会话连接参数（供 `ByeReason::SessionSwitching` 自动重连复用，不含口令出参）。
+    /// 最近一次建立的活动会话连接参数（供 `ByeReason::SessionSwitching` / 自动重连 / 切换模式复用，不含口令出参）。
     pub last_session_params: Mutex<Option<(bool, ActiveSessionMeta)>>,
+    /// 自动重连退避期唤醒信号（切网恢复或用户点击「立即重试」时递增序列并通知条件变量）。
+    pub auto_reconnect_wake: Arc<(Mutex<u64>, Condvar)>,
+    /// 当前活跃自动重连任务的单调递增令牌（`0` 表示空闲，非零为任务专属 `task_token`）。
+    pub auto_reconnect_active: Arc<AtomicU64>,
+    /// 自动重连任务令牌单调递增序列。
+    pub auto_reconnect_token_seq: AtomicU64,
+    /// 当前活跃自动重连任务绑定的 `session_open_epoch`（用于区分在途旧代次与当前代次）。
+    pub auto_reconnect_epoch: AtomicU64,
+    /// 当前自动重连任务的最新状态 `(epoch, attempt, reason)`（供 `session_snapshot` 与 `focus_session_window` 补发，同时串行化抢占）。
+    pub auto_reconnect_status: Mutex<Option<(u64, u32, String)>>,
+    /// 当前连续自动重连已消耗的尝试次数（每次收到 `Negotiated` 或用户发起新连接/断开后清零）。
+    pub auto_reconnect_attempts: AtomicU32,
+    /// 本机网络路由切换监测器句柄（随 `AppState` 生命周期驻留并在退出时干净回收）。
+    pub network_monitor: Mutex<Option<rc_ui::network_monitor::NetworkMonitorHandle>>,
     /// 最近一次拉取到的 GitHub Release 元数据缓存（供检查更新、自更新与远程更新复用）。
     pub latest_release: Mutex<Option<rc_ui::updater::ReleaseInfo>>,
     /// 当前是否已有本机自更新后台任务在执行（单任务防重入）。
@@ -886,6 +985,14 @@ pub struct AppState {
 
 impl Drop for AppState {
     fn drop(&mut self) {
+        if let Some(mut mon) = self
+            .network_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            mon.stop();
+        }
         if let Some(mut srv) = self
             .gui_ipc
             .lock()
@@ -970,7 +1077,9 @@ impl AppState {
         Self {
             session: Mutex::new(None),
             last_session_update: Mutex::new(None),
+            last_terminal_error: Mutex::new(None),
             session_open_epoch: AtomicU64::new(0),
+            connecting_epoch: AtomicU64::new(0),
             programmatic_close_epoch: AtomicU64::new(0),
             host: Mutex::new(host_rt),
             lan: Mutex::new(None),
@@ -988,6 +1097,13 @@ impl AppState {
             #[cfg(target_os = "macos")]
             shortcut_tap: Mutex::new(None),
             last_session_params: Mutex::new(None),
+            auto_reconnect_wake: Arc::new((Mutex::new(0), Condvar::new())),
+            auto_reconnect_active: Arc::new(AtomicU64::new(0)),
+            auto_reconnect_token_seq: AtomicU64::new(0),
+            auto_reconnect_epoch: AtomicU64::new(0),
+            auto_reconnect_status: Mutex::new(None),
+            auto_reconnect_attempts: AtomicU32::new(0),
+            network_monitor: Mutex::new(None),
             latest_release: Mutex::new(None),
             self_update_running: Arc::new(AtomicBool::new(false)),
             self_update_cancel: Arc::new(AtomicBool::new(false)),
@@ -1191,12 +1307,172 @@ impl AppState {
         }
     }
 
-    /// 获取当前活动会话状态只读快照（未连接或已发起断开时返回 `active: false`）。
+    /// 唤醒处于自动重连退避期的后台任务（切网恢复或用户点击「立即重试」时调用）。
+    pub fn wake_auto_reconnect(&self) {
+        let (lock, cv) = &*self.auto_reconnect_wake;
+        let mut seq = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *seq = seq.wrapping_add(1);
+        cv.notify_all();
+    }
+
+    /// 当前会话代次是否正处于活跃自动重连中。
+    pub fn is_auto_reconnect_active(&self) -> bool {
+        self.auto_reconnect_active.load(Ordering::Acquire) != 0
+            && self.auto_reconnect_epoch.load(Ordering::Acquire)
+                == self.session_open_epoch.load(Ordering::Acquire)
+    }
+
+    /// 抢占当前会话代次的自动重连任务令牌；若同代次已有活跃任务或当前代次已过期则返回 `None`。
+    /// 若槽位中残留旧代次正在退出的任务令牌，则直接接管为新令牌（旧守卫退出时 CAS 自动失败，绝不误清）。
+    pub fn try_acquire_auto_reconnect(
+        &self,
+        expected_epoch: u64,
+        initial_attempt: u32,
+        initial_reason: String,
+    ) -> Option<AutoReconnectActiveGuard> {
+        let mut status_guard = self
+            .auto_reconnect_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.session_open_epoch.load(Ordering::Acquire) != expected_epoch {
+            return None;
+        }
+        let mut my_token = self
+            .auto_reconnect_token_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if my_token == 0 {
+            my_token = self
+                .auto_reconnect_token_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+        }
+        loop {
+            let cur = self.auto_reconnect_active.load(Ordering::Acquire);
+            if cur == 0 {
+                self.auto_reconnect_epoch
+                    .store(expected_epoch, Ordering::Release);
+                if self
+                    .auto_reconnect_active
+                    .compare_exchange(0, my_token, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                let cur_ep = self.auto_reconnect_epoch.load(Ordering::Acquire);
+                if cur_ep == expected_epoch {
+                    return None;
+                }
+                if self.session_open_epoch.load(Ordering::Acquire) != expected_epoch {
+                    return None;
+                }
+                self.auto_reconnect_epoch
+                    .store(expected_epoch, Ordering::Release);
+                if self
+                    .auto_reconnect_active
+                    .compare_exchange(cur, my_token, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        *status_guard = Some((expected_epoch, initial_attempt, initial_reason));
+        Some(AutoReconnectActiveGuard {
+            active: Arc::clone(&self.auto_reconnect_active),
+            token: my_token,
+        })
+    }
+
+    /// 更新当前自动重连任务的最新尝试次数与原因。
+    pub fn update_auto_reconnect_status(&self, epoch: u64, attempt: u32, reason: String) {
+        let mut guard = self
+            .auto_reconnect_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.session_open_epoch.load(Ordering::Acquire) == epoch {
+            *guard = Some((epoch, attempt, reason));
+        }
+    }
+
+    /// 读取当前会话代次的自动重连尝试次数与原因（供 `session_snapshot` / `focus_session_window` 补发）。
+    pub fn current_auto_reconnect_status(&self, max_attempts: u32) -> (u32, String) {
+        let cur_epoch = self.session_open_epoch.load(Ordering::Acquire);
+        let guard = self
+            .auto_reconnect_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((ep, attempt, ref reason)) = *guard {
+            if ep == cur_epoch {
+                return (attempt.clamp(1, max_attempts.max(1)), reason.clone());
+            }
+        }
+        let attempts = self.auto_reconnect_attempts.load(Ordering::Acquire);
+        (
+            attempts.clamp(1, max_attempts.max(1)),
+            "网络中断，正在自动重连".to_string(),
+        )
+    }
+
+    /// 当前会话代次是否处于信令/安全协商期。
+    pub fn is_connecting_current_epoch(&self) -> bool {
+        let cur = self.session_open_epoch.load(Ordering::Acquire);
+        cur != 0 && self.connecting_epoch.load(Ordering::Acquire) == cur
+    }
+
+    /// 原子清零指定代次的信令/安全协商期标记（仅匹配 `epoch` 时归零，防旧请求误清新一代次）。
+    pub fn clear_connecting_epoch(&self, epoch: u64) {
+        let _ =
+            self.connecting_epoch
+                .compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// 在当前代次仍等于 `epoch` 时记录不可恢复终态错误（供晚加载 S1 窗口通过 `session_snapshot` 补领失败面板）。
+    pub fn record_terminal_error_if_epoch(&self, epoch: u64, reason: String) {
+        let mut guard = self
+            .last_terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.session_open_epoch.load(Ordering::Acquire) == epoch {
+            *guard = Some((epoch, reason));
+        }
+    }
+
+    /// 清空已记录的会话终态错误。
+    pub fn clear_terminal_error(&self) {
+        *self
+            .last_terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 获取当前活动会话状态只读快照（未连接或已发起断开时返回 `active: false`；自动重连中返回 `reconnecting` 快照；信令协商期返回 `connecting` 快照）。
     pub fn active_session_info(&self) -> ActiveSessionInfo {
         let slot = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref()
-            .map(ActiveSession::info)
-            .unwrap_or_else(ActiveSessionInfo::inactive)
+        if let Some(active) = slot.as_ref() {
+            return active.info();
+        }
+        drop(slot);
+        if self.is_auto_reconnect_active() {
+            if let Some((watch_only, ref meta)) = *self
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            {
+                return ActiveSessionInfo::reconnecting_from_meta(watch_only, meta);
+            }
+        }
+        if self.is_connecting_current_epoch() {
+            if let Some((watch_only, ref meta)) = *self
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            {
+                return ActiveSessionInfo::connecting_from_meta(watch_only, meta);
+            }
+        }
+        ActiveSessionInfo::inactive()
     }
 
     /// 分配下一个唯一的会话代际号。
@@ -1731,6 +2007,7 @@ mod tests {
             1,
             SessionUpdate::Ended {
                 reason: "旧会话已结束".to_string(),
+                recoverable: false,
             },
         );
         assert_eq!(current_session_snapshot(&session_slot, &snap_slot), None);
@@ -1747,6 +2024,7 @@ mod tests {
             1,
             SessionUpdate::Ended {
                 reason: "过期事件".to_string(),
+                recoverable: false,
             },
         );
         assert_eq!(current_session_snapshot(&session_slot, &snap_slot), None);
@@ -1836,5 +2114,156 @@ mod tests {
             current_session_snapshot_and_screen_state(&session_slot, &snap_slot),
             (Some(connecting), None)
         );
+    }
+
+    #[test]
+    fn active_session_info_exposes_media_phase_and_connection_mode() {
+        let inactive = ActiveSessionInfo::inactive();
+        assert!(!inactive.active);
+        assert!(!inactive.media_active);
+        assert!(inactive.phase.is_empty());
+        assert_eq!(inactive.connection_mode, ConnectionMode::Auto);
+
+        let mut active = ActiveSession::new(9, FakeSessionHandle::default(), false);
+        active.set_meta(ActiveSessionMeta {
+            target: "604928235".to_string(),
+            device_key: "604928235".to_string(),
+            device_name: "Studio Mac".to_string(),
+            media_active: false,
+            tools_only: true,
+            phase: "connecting".to_string(),
+            connection_mode: ConnectionMode::P2pOnly,
+            ..Default::default()
+        });
+        let info = active.info();
+        assert!(info.active);
+        assert!(!info.media_active);
+        assert_eq!(info.phase, "connecting");
+        assert_eq!(info.connection_mode, ConnectionMode::P2pOnly);
+
+        let serialized = serde_json::to_value(&info).expect("serialize ActiveSessionInfo");
+        assert_eq!(serialized["mediaActive"], serde_json::json!(false));
+        assert_eq!(serialized["phase"], serde_json::json!("connecting"));
+        assert_eq!(serialized["connectionMode"], serde_json::json!("p2p_only"));
+
+        // Reconnecting snapshot falls back to last_session_params while auto_reconnect_active is non-zero at current epoch.
+        let app_state = AppState::new_for_test();
+        *app_state.last_session_params.lock().unwrap() = Some((false, active.meta.clone()));
+        assert!(!app_state.active_session_info().active);
+
+        app_state.auto_reconnect_active.store(1, Ordering::Release);
+        let reconn = app_state.active_session_info();
+        assert!(reconn.active);
+        assert!(!reconn.connected);
+        assert_eq!(reconn.phase, "reconnecting");
+        assert_eq!(reconn.connection_mode, ConnectionMode::P2pOnly);
+        assert!(!reconn.media_active);
+
+        // wake_auto_reconnect increments wake sequence monotonically.
+        let before = *app_state.auto_reconnect_wake.0.lock().unwrap();
+        app_state.wake_auto_reconnect();
+        let after = *app_state.auto_reconnect_wake.0.lock().unwrap();
+        assert_eq!(after, before.wrapping_add(1));
+    }
+
+    #[test]
+    fn auto_reconnect_active_guard_token_cas_does_not_clobber_successor() {
+        let state = AppState::new_for_test();
+        state.session_open_epoch.store(1, Ordering::Release);
+
+        // Task A acquires token for epoch 1.
+        let guard_a = state
+            .try_acquire_auto_reconnect(1, 1, "网络中断".to_string())
+            .expect("Task A should acquire epoch 1");
+        let token_a = guard_a.token();
+        assert_ne!(token_a, 0);
+        assert!(state.is_auto_reconnect_active());
+
+        // Same-epoch duplicate acquisition must be rejected.
+        assert!(state
+            .try_acquire_auto_reconnect(1, 1, "重复".to_string())
+            .is_none());
+
+        // Epoch advances to 2 (e.g. user reconnected or switched mode) while Task A is still unwinding.
+        state.session_open_epoch.store(2, Ordering::Release);
+        assert!(
+            !state.is_auto_reconnect_active(),
+            "old epoch token must not report active for new epoch 2"
+        );
+
+        // Task B for epoch 2 takes over cleanly even before Task A drops.
+        let guard_b = state
+            .try_acquire_auto_reconnect(2, 1, "新会话断开".to_string())
+            .expect("Task B should take over stale token");
+        let token_b = guard_b.token();
+        assert!(token_b > token_a);
+        assert_eq!(state.auto_reconnect_active.load(Ordering::Acquire), token_b);
+        assert!(state.is_auto_reconnect_active());
+
+        // Task A finally exits and drops its guard: CAS(token_a -> 0) must NOT clobber Task B.
+        drop(guard_a);
+        assert_eq!(
+            state.auto_reconnect_active.load(Ordering::Acquire),
+            token_b,
+            "stale Task A drop must not clear Task B token"
+        );
+        assert!(state.is_auto_reconnect_active());
+
+        // Task B exits and drops its guard: CAS(token_b -> 0) clears cleanly.
+        drop(guard_b);
+        assert_eq!(state.auto_reconnect_active.load(Ordering::Acquire), 0);
+        assert!(!state.is_auto_reconnect_active());
+    }
+
+    #[test]
+    fn active_session_info_reports_connecting_during_signaling_negotiation() {
+        let state = AppState::new_for_test();
+        let epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
+        let headless_meta = ActiveSessionMeta {
+            target: "604928235".to_string(),
+            device_key: "604928235".to_string(),
+            device_name: "Studio Mac".to_string(),
+            tools_only: true,
+            media_active: false,
+            phase: "connecting".to_string(),
+            connection_mode: ConnectionMode::Auto,
+            ..Default::default()
+        };
+        *state.last_session_params.lock().unwrap() = Some((false, headless_meta));
+        assert!(!state.active_session_info().active);
+
+        // Entering signaling negotiation sets connecting_epoch = current epoch.
+        state.connecting_epoch.store(epoch, Ordering::Release);
+        let info = state.active_session_info();
+        assert!(info.active);
+        assert!(!info.connected);
+        assert_eq!(info.phase, "connecting");
+        assert!(
+            !info.media_active,
+            "tools_only=true must yield media_active=false"
+        );
+        assert_eq!(info.target.as_deref(), Some("604928235"));
+        assert_eq!(info.device_key.as_deref(), Some("604928235"));
+        assert_eq!(info.device_name.as_deref(), Some("Studio Mac"));
+        assert_eq!(info.connection_mode, ConnectionMode::Auto);
+
+        // Desktop meta sets media_active=true.
+        state
+            .last_session_params
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .1
+            .tools_only = false;
+        let desktop_info = state.active_session_info();
+        assert!(desktop_info.active);
+        assert!(desktop_info.media_active);
+        assert_eq!(desktop_info.phase, "connecting");
+
+        // Clearing connecting_epoch restores inactive when slot is None.
+        state.clear_connecting_epoch(epoch);
+        assert!(!state.active_session_info().active);
     }
 }

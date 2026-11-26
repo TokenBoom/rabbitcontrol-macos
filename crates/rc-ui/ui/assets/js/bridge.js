@@ -312,6 +312,18 @@
     setSessionRelayMode: function (forceRelay) {
       return invoke("set_session_relay_mode", { forceRelay: Boolean(forceRelay) });
     },
+    setSessionConnectionMode: function (mode) {
+      return invoke("set_session_connection_mode", { mode: String(mode || "auto") });
+    },
+    getUpnpStatus: function () {
+      return invoke("get_upnp_status");
+    },
+    saveUpnpEnabled: function (enabled) {
+      return invoke("save_upnp_enabled", { enabled: Boolean(enabled) });
+    },
+    triggerReconnectNow: function () {
+      return invoke("trigger_reconnect_now");
+    },
     setSessionWatchOnly: function (enabled) {
       return invoke("set_session_watch_only", { enabled: Boolean(enabled) });
     },

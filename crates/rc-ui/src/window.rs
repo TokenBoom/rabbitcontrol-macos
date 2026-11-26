@@ -6,7 +6,8 @@
 //! 窗口已存在时只聚焦、不重建（`WebviewWindowBuilder` 对同 label 重复创建会报错）。
 
 use tauri::{
-    AppHandle, LogicalSize, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 
 use crate::state::{self, AppState};
@@ -539,19 +540,119 @@ pub fn focus_session_window(app: AppHandle) -> Result<(), String> {
         win.set_focus().map_err(|e| e.to_string())?;
         return Ok(());
     }
-    // 先读出窗口构造元数据，待 `ensure_session_window` 成功后再推进 `begin_attach`，
-    // 防止窗口创建失败导致 `layer_state` 永久滞留在 `Attaching`。
-    let (watch_only, device_name, video_size) = {
+    // 先读出窗口构造元数据，待 `ensure_session_window` 成功后再推进 `begin_attach` 或原地热升级，
+    // 防止窗口创建失败导致 `layer_state` 永久滞留在 `Attaching` 或状态错乱。
+    enum FocusTarget {
+        Active {
+            sid: u64,
+            watch_only: bool,
+            device_name: String,
+            video_size: Option<(u32, u32)>,
+            needs_upgrade: bool,
+            prefer_hardware: bool,
+        },
+        Pending {
+            is_reconnecting: bool,
+            watch_only: bool,
+            device_name: String,
+            active_info: state::ActiveSessionInfo,
+        },
+    }
+
+    let focus_target = {
         let slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(active) = slot.as_ref() else {
-            return Err("会话窗口未打开".to_string());
-        };
-        (
-            active.watch_only,
-            active.meta.device_name.clone(),
-            active.video_size,
-        )
+        if let Some(active) = slot.as_ref() {
+            if active.disconnecting {
+                return Err("会话窗口未打开".to_string());
+            }
+            FocusTarget::Active {
+                sid: active.id,
+                watch_only: active.watch_only,
+                device_name: active.meta.device_name.clone(),
+                video_size: active.video_size,
+                needs_upgrade: !active.meta.media_active,
+                prefer_hardware: active.meta.prefer_hardware,
+            }
+        } else {
+            drop(slot);
+            let is_reconnecting = st.is_auto_reconnect_active();
+            let is_connecting = !is_reconnecting && st.is_connecting_current_epoch();
+            if !(is_reconnecting || is_connecting) {
+                return Err("会话窗口未打开".to_string());
+            }
+            let mut saved = st
+                .last_session_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some((watch_only, ref mut meta)) = *saved else {
+                return Err("会话窗口未打开".to_string());
+            };
+            meta.tools_only = false;
+            meta.media_active = true;
+            let active_info = if is_reconnecting {
+                state::ActiveSessionInfo::reconnecting_from_meta(watch_only, meta)
+            } else {
+                state::ActiveSessionInfo::connecting_from_meta(watch_only, meta)
+            };
+            FocusTarget::Pending {
+                is_reconnecting,
+                watch_only,
+                device_name: meta.device_name.clone(),
+                active_info,
+            }
+        }
     };
+
+    let (sid, watch_only, device_name, video_size, needs_upgrade, prefer_hardware) =
+        match focus_target {
+            FocusTarget::Active {
+                sid,
+                watch_only,
+                device_name,
+                video_size,
+                needs_upgrade,
+                prefer_hardware,
+            } => (
+                sid,
+                watch_only,
+                device_name,
+                video_size,
+                needs_upgrade,
+                prefer_hardware,
+            ),
+            FocusTarget::Pending {
+                is_reconnecting,
+                watch_only,
+                device_name,
+                active_info,
+            } => {
+                ensure_session_window(&app, &st, watch_only)?;
+                set_session_window_title(&app, &device_name);
+                let _ = app.emit("session://active-state", &active_info);
+                if is_reconnecting {
+                    let max_attempts = crate::commands::AUTO_RECONNECT_MAX_ATTEMPTS;
+                    let (attempt, reason) = st.current_auto_reconnect_status(max_attempts);
+                    let _ = app.emit(
+                        "session://update",
+                        &rc_ui::session_bridge::SessionUpdate::Reconnecting {
+                            attempt,
+                            max_attempts,
+                            reason,
+                        },
+                    );
+                    st.wake_auto_reconnect();
+                } else {
+                    let _ = app.emit(
+                        "session://update",
+                        &rc_ui::session_bridge::SessionUpdate::Connecting {
+                            phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+                            watch_only,
+                        },
+                    );
+                }
+                return Ok(());
+            }
+        };
     ensure_session_window(&app, &st, watch_only)?;
     set_session_window_title(&app, &device_name);
     if let Some((vw, vh)) = video_size {
@@ -559,9 +660,26 @@ pub fn focus_session_window(app: AppHandle) -> Result<(), String> {
             let _ = fit_session_window_to_video(&app, vw, vh, false);
         }
     }
-    let attach_req = {
+    let preallocated_surface = if needs_upgrade {
+        crate::commands::preallocate_metal_layer_for_session(&app, prefer_hardware)
+            .map(rc_ui::metal_attach::MainThreadMetalLayer::into_render_surface)
+    } else {
+        None
+    };
+    let (attach_req, emitted_info) = {
         let mut slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(active) = slot.as_mut() {
+        if let Some(active) = slot.as_mut().filter(|a| a.id == sid && !a.disconnecting) {
+            let mut info_to_emit = None;
+            if needs_upgrade && !active.meta.media_active {
+                active.handle.upgrade_to_desktop(preallocated_surface);
+                active.meta.media_active = true;
+                active.meta.tools_only = false;
+                *st.last_session_params
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
+                    Some((active.watch_only, active.meta.clone()));
+                info_to_emit = Some(active.info());
+            }
             // 从无头工具会话升级为 S1 远控窗口：恢复远端音频播放、同步最新显示器列表。
             if active.meta.audio_enabled {
                 active.handle.send(
@@ -577,14 +695,18 @@ pub fn focus_session_window(app: AppHandle) -> Result<(), String> {
                 width: f64::from(active.meta.width.max(1)),
                 height: f64::from(active.meta.height.max(1)),
             };
-            active
+            let req = active
                 .handle
                 .layer_lease()
-                .and_then(|lease| active.begin_attach(lease, fallback))
+                .and_then(|lease| active.begin_attach(lease, fallback));
+            (req, info_to_emit)
         } else {
-            None
+            (None, None)
         }
     };
+    if let Some(info) = emitted_info {
+        let _ = app.emit("session://active-state", &info);
+    }
     if let Some((sid, lease, frame)) = attach_req {
         crate::attach_layer_on_main_thread(&app, sid, lease, frame);
     }

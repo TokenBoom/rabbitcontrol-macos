@@ -63,6 +63,9 @@ pub struct AgentSnapshot {
     pub degraded_permissions: bool,
     /// 后台 Agent 实测系统权限快照。
     pub permissions: PermissionSnapshot,
+    /// 后台信令当前 UPnP / NAT-PMP 自动端口映射状态（旧版本快照缺省为 `None`）。
+    #[serde(default)]
+    pub upnp_status: Option<rc_client_core::upnp::UpnpStatus>,
 }
 
 /// 前台 GUI 或状态栏发往后台服务的请求消息。
@@ -723,6 +726,7 @@ mod tests {
                     session_type: ServiceSessionType::Aqua,
                     degraded_permissions: false,
                     permissions: PermissionSnapshot::from_flags(true, true, true, true, None),
+                    upnp_status: Some(rc_client_core::upnp::UpnpStatus::Disabled),
                 }))
             }
             _ => ServiceResponse::Ok,
@@ -1023,5 +1027,45 @@ mod tests {
                 force_relay: true
             } if target_id == "604928235"
         ));
+    }
+
+    #[test]
+    fn agent_snapshot_upnp_status_defaults_none_and_roundtrips() {
+        let base = AgentSnapshot {
+            enabled: true,
+            host_running: true,
+            listen_addr: Some("0.0.0.0:9901".to_string()),
+            display_addr: Some("192.168.1.10:9901".to_string()),
+            password: "ABCD2345".to_string(),
+            custom_password: false,
+            backend: "sck+videotoolbox".to_string(),
+            connected_peer: None,
+            pending_approval: None,
+            device_id: Some("604928235".to_string()),
+            signal_online: true,
+            session_type: ServiceSessionType::Aqua,
+            degraded_permissions: false,
+            permissions: PermissionSnapshot::from_flags(true, true, true, true, None),
+            upnp_status: Some(rc_client_core::upnp::UpnpStatus::Mapped {
+                external_addr: "203.0.113.5:54321".to_string(),
+                protocol: "upnp_igd_v2".to_string(),
+            }),
+        };
+
+        // 1) 移除 upnpStatus 模拟旧版本快照 JSON，反序列化必须兼容默认 None。
+        let mut legacy_val = serde_json::to_value(&base).expect("serialize AgentSnapshot to value");
+        let obj = legacy_val
+            .as_object_mut()
+            .expect("AgentSnapshot must serialize as JSON object");
+        assert!(obj.remove("upnpStatus").is_some());
+        let legacy: AgentSnapshot =
+            serde_json::from_value(legacy_val).expect("legacy AgentSnapshot without upnpStatus");
+        assert_eq!(legacy.upnp_status, None);
+
+        // 2) 携带 upnpStatus 完整序列化与反序列化往返一致。
+        let encoded = serde_json::to_string(&base).expect("serialize AgentSnapshot with upnp");
+        let decoded: AgentSnapshot =
+            serde_json::from_str(&encoded).expect("deserialize AgentSnapshot with upnp");
+        assert_eq!(decoded.upnp_status, base.upnp_status);
     }
 }

@@ -150,9 +150,37 @@
       </button>
     </header>
 
-    <!-- 内容区：STAGE_BG 铺满 + 等待/连接中提示 -->
+    <!-- 内容区：STAGE_BG 铺满 + 连接中 / 自动重连 / 失败常驻交互面板 -->
     <main class="sn-stage" id="session-stage">
-      <p class="sn-stage__hint">正在连接远端画面…</p>
+      <div class="sn-stage__overlay" id="stage-overlay" data-state="connecting">
+        <div class="sn-stage__card" id="stage-card">
+          <div class="sn-stage__spinner" id="stage-spinner" aria-hidden="true"></div>
+          <p class="sn-stage__title" id="stage-title">正在连接远端画面…</p>
+          <p class="sn-stage__desc" id="stage-desc" hidden></p>
+
+          <!-- 自动重连中操作区 -->
+          <div class="sn-stage__actions" id="stage-reconnecting-actions" hidden>
+            <button type="button" class="sn-stage__btn sn-stage__btn--primary" id="btn-stage-retry-now">立即重试</button>
+            <button type="button" class="sn-stage__btn sn-stage__btn--ghost" id="btn-stage-disconnect">断开</button>
+          </div>
+
+          <!-- 连接失败 / 异常断开常驻面板（永不自动关窗） -->
+          <div class="sn-stage__ended-panel" id="stage-ended-panel" hidden>
+            <div class="sn-stage__mode-wrap">
+              <span class="sn-stage__mode-label">连接模式</span>
+              <div class="sn-seg sn-seg--dark" id="stage-conn-mode-seg" role="radiogroup" aria-label="连接模式">
+                <button type="button" class="sn-seg__btn is-active" role="radio" aria-checked="true" data-conn-mode="auto">自动</button>
+                <button type="button" class="sn-seg__btn" role="radio" aria-checked="false" data-conn-mode="p2p_only">仅 P2P</button>
+                <button type="button" class="sn-seg__btn" role="radio" aria-checked="false" data-conn-mode="tcp_relay">TCP 中继</button>
+              </div>
+            </div>
+            <div class="sn-stage__actions">
+              <button type="button" class="sn-stage__btn sn-stage__btn--primary" id="btn-stage-reconnect">重新连接</button>
+              <button type="button" class="sn-stage__btn sn-stage__btn--ghost" id="btn-stage-close">关闭窗口</button>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- 观看模式变体：画面区左上 16px 常驻灰 Pill -->
       <span class="sn-pill sn-pill--watch sn-stage__watch" id="watch-pill" hidden>观看模式</span>
@@ -396,14 +424,15 @@
     </button>
     <p class="sn-submenu__hint sn-submenu__hint--warn" id="quality-advisory-hint" hidden></p>
     <div class="sn-menu__sep" role="separator" aria-hidden="true"></div>
-    <div class="sn-submenu__row">
-      <span>使用安全中转连接</span>
-      <label class="sn-switch">
-        <input type="checkbox" id="opt-relay" aria-label="使用安全中转连接" />
-        <span class="sn-switch__knob"></span>
-      </label>
+    <div class="sn-submenu__block">
+      <div class="sn-submenu__block-label">连接模式</div>
+      <div class="sn-seg" id="conn-mode-seg" role="radiogroup" aria-label="连接模式">
+        <button type="button" class="sn-seg__btn is-active" role="radio" aria-checked="true" data-conn-mode="auto">自动</button>
+        <button type="button" class="sn-seg__btn" role="radio" aria-checked="false" data-conn-mode="p2p_only">仅 P2P</button>
+        <button type="button" class="sn-seg__btn" role="radio" aria-checked="false" data-conn-mode="tcp_relay">TCP 中继</button>
+      </div>
+      <p class="sn-submenu__hint">持久化保存，切换后立即按新模式连接。</p>
     </div>
-    <p class="sn-submenu__hint">画面卡顿时，可提升流畅度，仅本次远控生效。</p>
   </section>
 
   <!-- ── S3 显示屏1分辨率子菜单 ── -->

@@ -268,6 +268,7 @@ fn start_background_poller(app: AppHandle) {
                 let mut restore_portmaps_req: Option<(u64, String)> = None;
                 let mut wallpaper_updates: Vec<(String, String, String)> = Vec::new();
                 let mut ended_session = None;
+                let mut auto_reconnect_req: Option<(u64, String)> = None;
 
                 {
                     let st = app.state::<AppState>();
@@ -282,6 +283,7 @@ fn start_background_poller(app: AppHandle) {
                                     ref mut watch_only, ..
                                 } => {
                                     *watch_only = active.watch_only;
+                                    active.meta.phase = "connecting".to_string();
                                 }
                                 SessionUpdate::Negotiated {
                                     width,
@@ -296,12 +298,18 @@ fn start_background_poller(app: AppHandle) {
                                     active.set_video_size(width, height);
                                     active.meta.width = width;
                                     active.meta.height = height;
-                                    auto_fit_req = Some((width, height));
                                     active.meta.connected = true;
+                                    active.meta.phase = "connected".to_string();
                                     active.meta.transport = Some(transport.clone());
                                     active.meta.mtls_active = mtls_active;
                                     active.meta.peer_cert_fingerprint =
                                         peer_cert_fingerprint.clone();
+                                    st.auto_reconnect_attempts
+                                        .store(0, std::sync::atomic::Ordering::Release);
+                                    *st.auto_reconnect_status
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = None;
+                                    st.clear_terminal_error();
                                     emit_active_state = true;
                                     if !active.meta.device_key.is_empty() {
                                         negotiated_record = Some((
@@ -321,11 +329,62 @@ fn start_background_poller(app: AppHandle) {
                                             restore_portmaps_req = Some((sid, restore_key));
                                         }
                                     }
+                                    if !active.meta.tools_only {
+                                        auto_fit_req = Some((width, height));
+                                        let fallback = Frame {
+                                            x: 0.0,
+                                            y: 0.0,
+                                            width: f64::from(width),
+                                            height: f64::from(height),
+                                        };
+                                        let eff = active.effective_layer_frame(fallback);
+                                        let eff_w = eff.width.round() as u32;
+                                        let eff_h = eff.height.round() as u32;
+                                        if eff_w > 0 && eff_h > 0 {
+                                            active.handle.send(
+                                                rc_ui::session_bridge::SessionCommand::StageRect {
+                                                    width: eff_w,
+                                                    height: eff_h,
+                                                },
+                                            );
+                                        }
+                                        if let Some(lease) = active.handle.layer_lease() {
+                                            if let Some(req) = active.begin_attach(lease, fallback)
+                                            {
+                                                attach_req = Some(req);
+                                            }
+                                        }
+                                    }
+                                }
+                                SessionUpdate::MediaResumed { width, height, .. } => {
+                                    active.meta.media_active = true;
+                                    active.meta.tools_only = false;
+                                    if width > 0 && height > 0 {
+                                        active.set_video_size(width, height);
+                                        active.meta.width = width;
+                                        active.meta.height = height;
+                                        auto_fit_req = Some((width, height));
+                                    }
+                                    *st.last_session_params
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        Some((active.watch_only, active.meta.clone()));
+                                    emit_active_state = true;
+                                    let fallback_w = if width > 0 {
+                                        width
+                                    } else {
+                                        active.meta.width.max(1)
+                                    };
+                                    let fallback_h = if height > 0 {
+                                        height
+                                    } else {
+                                        active.meta.height.max(1)
+                                    };
                                     let fallback = Frame {
                                         x: 0.0,
                                         y: 0.0,
-                                        width: f64::from(width),
-                                        height: f64::from(height),
+                                        width: f64::from(fallback_w),
+                                        height: f64::from(fallback_h),
                                     };
                                     let eff = active.effective_layer_frame(fallback);
                                     let eff_w = eff.width.round() as u32;
@@ -343,6 +402,16 @@ fn start_background_poller(app: AppHandle) {
                                             attach_req = Some(req);
                                         }
                                     }
+                                }
+                                SessionUpdate::MediaState { paused } => {
+                                    active.meta.media_active = !paused;
+                                    active.meta.tools_only = paused;
+                                    emit_active_state = true;
+                                }
+                                SessionUpdate::Reconnecting { .. } => {
+                                    active.meta.phase = "reconnecting".to_string();
+                                    active.meta.connected = false;
+                                    emit_active_state = true;
                                 }
                                 SessionUpdate::DisplayConfig { width, height, .. }
                                     if width > 0 && height > 0 =>
@@ -398,11 +467,35 @@ fn start_background_poller(app: AppHandle) {
                                 } => {
                                     active.host_screen_state = Some((locked, capture_suspended));
                                 }
+                                SessionUpdate::Ended {
+                                    ref reason,
+                                    recoverable,
+                                } => {
+                                    saw_ended = true;
+                                    let should_auto_reconnect = recoverable
+                                        && !active.disconnecting
+                                        && !st.is_quitting()
+                                        && st.gate_state() == AppGateState::Authenticated
+                                        && commands::has_any_session_or_tool_window(&app);
+                                    if should_auto_reconnect {
+                                        let cur_epoch = st
+                                            .session_open_epoch
+                                            .load(std::sync::atomic::Ordering::Acquire);
+                                        auto_reconnect_req = Some((cur_epoch, reason.clone()));
+                                        continue;
+                                    }
+                                    if !active.disconnecting && !recoverable {
+                                        let cur_epoch = st
+                                            .session_open_epoch
+                                            .load(std::sync::atomic::Ordering::Acquire);
+                                        st.record_terminal_error_if_epoch(
+                                            cur_epoch,
+                                            reason.clone(),
+                                        );
+                                    }
+                                    emit_active_state = true;
+                                }
                                 _ => {}
-                            }
-                            if matches!(upd, SessionUpdate::Ended { .. }) {
-                                saw_ended = true;
-                                emit_active_state = true;
                             }
                             updates.push(upd);
                         }
@@ -434,6 +527,7 @@ fn start_background_poller(app: AppHandle) {
                                     | SessionUpdate::HostVersion(_)
                                     | SessionUpdate::RemoteUpdateStatus(_)
                                     | SessionUpdate::HostScreenState { .. }
+                                    | SessionUpdate::MediaState { .. }
                             )
                         }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。
@@ -580,6 +674,9 @@ fn start_background_poller(app: AppHandle) {
 
                 if let Some(old) = ended_session {
                     commands::teardown_session(&app, old);
+                }
+                if let Some((epoch, reason)) = auto_reconnect_req {
+                    commands::spawn_auto_reconnect_task(app.clone(), epoch, reason);
                 }
 
                 // ── 2) 本机被控端状态更新 ──
@@ -1181,7 +1278,41 @@ fn main() {
                     }
                 });
 
-            // 4) 启动后台轮询线程（会话更新 + 被控端更新 + 信令状态/中继分发）。
+            // 4) 启动网络路由切换监测器：切网时在独立模式触发信令快重连与局域网刷新，并在全模式下触发活动会话快检与唤醒自动重连。
+            let app_net = app.handle().clone();
+            let net_monitor = rc_ui::network_monitor::NetworkMonitorHandle::spawn(move |_ev| {
+                let st = app_net.state::<AppState>();
+                if !st.is_service_proxy() {
+                    let sig = st
+                        .server
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .signal_client
+                        .as_ref()
+                        .cloned();
+                    if let Some(client) = sig {
+                        client.trigger_reconnect("network_route_changed");
+                    }
+                    if let Some(lan) = st.lan.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        lan.clear_and_refresh();
+                    }
+                }
+                {
+                    let slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(active) = slot.as_ref().filter(|a| !a.disconnecting) {
+                        active
+                            .handle
+                            .send(rc_ui::session_bridge::SessionCommand::ProbeNow);
+                    }
+                }
+                st.wake_auto_reconnect();
+            });
+            *state
+                .network_monitor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(net_monitor);
+
+            // 5) 启动后台轮询线程（会话更新 + 被控端更新 + 信令状态/中继分发）。
             start_background_poller(app.handle().clone());
             Ok(())
         })
@@ -1209,12 +1340,13 @@ fn main() {
                     let ah = win.app_handle();
                     let st = ah.state::<AppState>();
                     commands::stop_shortcut_tap_runtime(&st);
+                    st.clear_terminal_error();
                     let has_open_tools = ah.get_webview_window("terminal").is_some()
                         || ah.get_webview_window("transfer").is_some()
                         || ah.get_webview_window("portmap").is_some();
                     if has_open_tools {
-                        // 仍有终端/文件传输/端口映射窗口在使用同一会话：降级回无头模式（摘除 Metal 图层并静音），不断开底层连接。
-                        let detach_lease = {
+                        // 仍有终端/文件传输/端口映射窗口在使用同一会话：降级回纯工具无头模式（摘除 Metal 图层、静音并暂停远端视频推流），不断开底层连接。
+                        let (detach_lease, emitted_info) = {
                             let mut slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(active) = slot.as_mut() {
                                 active.handle.send(
@@ -1222,11 +1354,48 @@ fn main() {
                                         muted: true,
                                     },
                                 );
-                                active.reset_layer_for_headless()
+                                active.handle.send(
+                                    rc_client_core::session_bridge::SessionCommand::SetMediaPaused {
+                                        paused: true,
+                                    },
+                                );
+                                active.meta.media_active = false;
+                                active.meta.tools_only = true;
+                                *st.last_session_params
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) =
+                                    Some((active.watch_only, active.meta.clone()));
+                                let info = active.info();
+                                (active.reset_layer_for_headless(), Some(info))
                             } else {
-                                None
+                                drop(slot);
+                                let mut saved = st
+                                    .last_session_params
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let info = if let Some((watch_only, ref mut meta)) = *saved {
+                                    meta.media_active = false;
+                                    meta.tools_only = true;
+                                    if st.is_auto_reconnect_active() {
+                                        Some(state::ActiveSessionInfo::reconnecting_from_meta(
+                                            watch_only, meta,
+                                        ))
+                                    } else if st.is_connecting_current_epoch() {
+                                        Some(state::ActiveSessionInfo::connecting_from_meta(
+                                            watch_only, meta,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                (None, info)
                             }
                         };
+                        if let Some(info) = emitted_info {
+                            let _ = ah.emit("session://active-state", &info);
+                        }
                         if let Some(lease) = detach_lease {
                             let _ = ah.run_on_main_thread(move || {
                                 metal_attach::detach_leased_layer(&lease);
@@ -1245,7 +1414,9 @@ fn main() {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .is_some();
-                        if has_session || cur_epoch != prog_epoch {
+                        let reconnecting = st.is_auto_reconnect_active();
+                        let connecting = st.is_connecting_current_epoch();
+                        if has_session || reconnecting || connecting || cur_epoch != prog_epoch {
                             commands::disconnect_active_session(ah);
                         }
                     }
@@ -1306,8 +1477,12 @@ fn main() {
             commands::parse_connect_target,
             commands::open_session,
             commands::set_session_relay_mode,
+            commands::set_session_connection_mode,
             commands::set_session_watch_only,
             commands::set_session_mtls_mode,
+            commands::get_upnp_status,
+            commands::save_upnp_enabled,
+            commands::trigger_reconnect_now,
             commands::session_command,
             commands::session_snapshot,
             commands::get_app_prefs,

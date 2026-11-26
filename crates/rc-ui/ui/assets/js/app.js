@@ -148,9 +148,13 @@
     activeSession: {
       active: false,
       target: "",
+      deviceKey: "",
       deviceName: "",
       watchOnly: false,
       connected: false,
+      mediaActive: false,
+      phase: "",
+      connectionMode: "auto",
       transport: null
     },
     /* P3 折叠状态 */
@@ -407,7 +411,7 @@
     sidebarAssist.textContent = "";
 
     var appendControlledBadge = function (row, d) {
-      if (!isDeviceControlled(d)) return;
+      if (!hasActiveSessionForDevice(d)) return;
       var ctrlBadge = el("span", "sidebar__ctrl-badge");
       ctrlBadge.setAttribute("aria-label", "正在远程控制");
       ctrlBadge.title = "正在远程控制";
@@ -631,37 +635,54 @@
     return null;
   }
 
-  function isDeviceControlled(device) {
+  function hasActiveSessionForDevice(device) {
     if (!device || !state.activeSession || !state.activeSession.active) return false;
     var target = state.activeSession.target;
+    var deviceKey = state.activeSession.deviceKey;
     var deviceName = state.activeSession.deviceName;
     if (target && device.addr && device.addr === target) return true;
-    if (target && device.deviceId) {
-      if (device.deviceId === target) return true;
-      var strippedA = stripDeviceIdSep(device.deviceId);
-      var strippedB = stripDeviceIdSep(target);
-      if (strippedA && strippedA === strippedB) return true;
+    if (deviceKey && device.addr && device.addr === deviceKey) return true;
+    var devId = device.deviceId || device.id;
+    if (devId) {
+      if (target && devId === target) return true;
+      if (deviceKey && devId === deviceKey) return true;
+      var strippedDev = stripDeviceIdSep(devId);
+      if (strippedDev) {
+        if (target && strippedDev === stripDeviceIdSep(target)) return true;
+        if (deviceKey && strippedDev === stripDeviceIdSep(deviceKey)) return true;
+      }
     }
     if (deviceName && device.name && device.name === deviceName) return true;
     return false;
   }
 
-  var pendingToolAfterConnect = null;
+  function isDesktopControlled(device) {
+    return hasActiveSessionForDevice(device) && Boolean(state.activeSession && state.activeSession.mediaActive);
+  }
 
-  function matchesPendingDevice(pending, info) {
-    if (!pending || !pending.deviceKey) return true;
-    var keyA = stripDeviceIdSep(pending.deviceKey);
-    var tB = stripDeviceIdSep(info.target || "");
-    var kB = stripDeviceIdSep(info.deviceKey || "");
-    if (pending.deviceKey === info.target || pending.deviceKey === info.deviceKey) return true;
-    if (keyA && (keyA === tB || keyA === kB)) return true;
-    return false;
+  var lastActiveWasDesktop = false;
+  var lastFailureToastAt = 0;
+
+  function markFailureToastShown() {
+    lastFailureToastAt = Date.now();
+  }
+
+  function hasRecentFailureToast() {
+    return lastFailureToastAt > 0 && Date.now() - lastFailureToastAt < 1500;
   }
 
   function applyActiveSessionState(raw) {
     var s = raw && typeof raw === "object" ? raw : {};
+    var prev = state.activeSession;
+    var nextActive = Boolean(s.active);
+    var nextMediaActive = Boolean(s.mediaActive !== undefined ? s.mediaActive : s.media_active);
+    if (nextActive) {
+      lastActiveWasDesktop = nextMediaActive;
+    } else if (prev && prev.active) {
+      lastActiveWasDesktop = Boolean(prev.mediaActive);
+    }
     state.activeSession = {
-      active: Boolean(s.active),
+      active: nextActive,
       target: s.target ? String(s.target) : "",
       deviceKey: s.deviceKey
         ? String(s.deviceKey)
@@ -675,26 +696,15 @@
           : "",
       watchOnly: Boolean(s.watchOnly !== undefined ? s.watchOnly : s.watch_only),
       connected: Boolean(s.connected),
+      mediaActive: nextMediaActive,
+      phase: s.phase ? String(s.phase) : "",
+      connectionMode: s.connectionMode
+        ? String(s.connectionMode)
+        : s.connection_mode
+          ? String(s.connection_mode)
+          : "auto",
       transport: s.transport ? String(s.transport) : null
     };
-    if (pendingToolAfterConnect) {
-      if (Date.now() > pendingToolAfterConnect.expiresAt) {
-        pendingToolAfterConnect = null;
-      } else if (state.activeSession.active) {
-        if (matchesPendingDevice(pendingToolAfterConnect, state.activeSession)) {
-          pendingToolAfterConnect.sawTargetActive = true;
-          if (state.activeSession.connected) {
-            var readyTool = pendingToolAfterConnect;
-            pendingToolAfterConnect = null;
-            if (!state.activeSession.watchOnly) {
-              openWindow(readyTool.tool);
-            }
-          }
-        }
-      } else if (pendingToolAfterConnect.sawTargetActive) {
-        pendingToolAfterConnect = null;
-      }
-    }
     paintSidebarRows();
     if (state.route === "p1") renderP1();
     renderP2SessionBar();
@@ -790,14 +800,15 @@
       }
     }
 
-    var controlling = isDeviceControlled(device);
-    p1Card.classList.toggle("is-controlling", controlling);
+    var hasSession = hasActiveSessionForDevice(device);
+    var desktopControlled = isDesktopControlled(device);
+    p1Card.classList.toggle("is-controlling", desktopControlled);
     p1Card.setAttribute(
       "aria-label",
-      (controlling ? "显示远控窗口：" : "进入桌面：") + device.name
+      (desktopControlled ? "显示远控窗口：" : "进入桌面：") + device.name
     );
-    if (p1SessionBanner) p1SessionBanner.hidden = !controlling;
-    if (p1ActiveOverlay) p1ActiveOverlay.hidden = !controlling;
+    if (p1SessionBanner) p1SessionBanner.hidden = !hasSession;
+    if (p1ActiveOverlay) p1ActiveOverlay.hidden = !desktopControlled;
   }
 
   function openSession(watchOnly, targetDevice, extraOpts) {
@@ -807,11 +818,35 @@
       toast("设备「" + device.name + "」未开启允许远程控制，请先在设备端开启");
       return;
     }
-    if (!extra.headless && device && isDeviceControlled(device)) {
+    if (!extra.headless && device && isDesktopControlled(device)) {
       focusSessionWindow();
       return;
     }
     if (IS_TAURI) {
+      if (
+        !extra.headless &&
+        device &&
+        hasActiveSessionForDevice(device) &&
+        !(state.activeSession && state.activeSession.mediaActive)
+      ) {
+        var hotTarget =
+          (device.isMine && device.deviceId) ||
+          (device.isLan && device.addr) ||
+          (state.activeSession && state.activeSession.target) ||
+          device.deviceId ||
+          device.addr ||
+          "";
+        if (hotTarget) {
+          launchSessionWithTarget(
+            hotTarget,
+            Boolean(watchOnly),
+            null,
+            device.name || (state.activeSession && state.activeSession.deviceName) || null,
+            false
+          );
+          return;
+        }
+      }
       if (device && device.isMine) {
         if (device.isLocal) {
           toast("当前为本机设备，请选择其他在线设备连接");
@@ -832,10 +867,14 @@
       if (device && device.isLan && device.addr) {
         connectToTarget(device.addr, {
           watchOnly: Boolean(watchOnly),
-          promptPassword: Boolean(device.requiresPassword),
+          promptPassword: Boolean(device.requiresPassword && !hasActiveSessionForDevice(device)),
           displayName: device.name,
           headless: Boolean(extra.headless)
         });
+        return;
+      }
+      if (!extra.headless && !watchOnly && device && hasActiveSessionForDevice(device)) {
+        focusSessionWindow();
         return;
       }
       toast("请先选择在线设备或在「远程协助」输入 9 位设备码连接");
@@ -858,14 +897,12 @@
     if (tool === "transfer" || tool === "terminal" || tool === "portmap") {
       if (!IS_TAURI) return openWindow(tool);
       var active = state.activeSession;
-      if (active && active.active && active.connected) {
-        if (!device || isDeviceControlled(device)) {
-          if (active.watchOnly) {
-            toast("观看模式为只读，请切换完整控制模式后再使用工具");
-            return;
-          }
-          return openWindow(tool);
+      if (active && active.active && (!device || hasActiveSessionForDevice(device))) {
+        if (active.watchOnly) {
+          toast("观看模式为只读，请切换完整控制模式后再使用工具");
+          return;
         }
+        return openWindow(tool);
       }
       if (!device) {
         toast("请先选择在线设备或在「远程协助」连接后再打开工具");
@@ -880,15 +917,8 @@
         toast("设备「" + device.name + "」当前离线");
         return;
       }
-      var devKey = device.deviceId || device.addr || device.id || "";
-      pendingToolAfterConnect = {
-        tool: tool,
-        deviceKey: devKey,
-        sawTargetActive: false,
-        expiresAt: Date.now() + 20000
-      };
-      toast("正在后台连接「" + device.name + "」，建连后自动打开工具…");
       openSession(false, device, { headless: true });
+      openWindow(tool);
       return;
     }
     toast("功能开发中");
@@ -1172,15 +1202,30 @@
       headless: Boolean(headless)
     };
     var isDeviceCode = Boolean(parseDeviceIdInput(addr));
+    var isHotUpgrade = Boolean(
+      !headless &&
+        state.activeSession &&
+        state.activeSession.active &&
+        state.activeSession.connected &&
+        !state.activeSession.mediaActive &&
+        hasActiveSessionForDevice({ deviceId: addr, addr: addr, name: deviceName })
+    );
+    lastActiveWasDesktop = !cfg.headless;
+    lastFailureToastAt = 0;
     sessionLaunching = true;
     updateConnectState();
-    if (isDeviceCode && !headless) {
+    if (isDeviceCode && !headless && !isHotUpgrade) {
       toast("正在连接目标设备…");
     }
     return Bridge.openSession(cfg)
       .catch(function (err) {
-        pendingToolAfterConnect = null;
-        toast("发起连接失败：" + err);
+        if (state.activeSession && state.activeSession.active) {
+          lastActiveWasDesktop = Boolean(state.activeSession.mediaActive);
+        }
+        if (!hasRecentFailureToast()) {
+          markFailureToastShown();
+          toast("发起连接失败：" + err);
+        }
       })
       .then(function () {
         sessionLaunching = false;
@@ -1219,7 +1264,6 @@
     };
 
     cancelBtn.addEventListener("click", function () {
-      pendingToolAfterConnect = null;
       closeModal();
     });
     okBtn.addEventListener("click", submit);
@@ -1238,10 +1282,7 @@
       title: title,
       content: field.wrap,
       actions: actions,
-      focusEl: input,
-      onCancel: function () {
-        pendingToolAfterConnect = null;
-      }
+      focusEl: input
     });
   }
 
@@ -1249,26 +1290,48 @@
     var options = opts || {};
     var trimmed = String(rawTarget || "").trim();
     if (!trimmed) {
-      pendingToolAfterConnect = null;
       toast("请输入 9 位设备码或 IP:端口");
       return;
     }
     var deviceId = parseDeviceIdInput(trimmed);
     if (deviceId) {
+      var ownDev = findMyDeviceById(deviceId);
+      var targetProbe = ownDev || {
+        deviceId: deviceId,
+        id: deviceId,
+        name: options.displayName || ""
+      };
+      if (
+        !options.headless &&
+        hasActiveSessionForDevice(targetProbe) &&
+        !(state.activeSession && state.activeSession.mediaActive)
+      ) {
+        if (ownDev && !ownDev.allowRemoteControl) {
+          toast("设备「" + ownDev.name + "」未开启允许远程控制，请先在设备端开启");
+          return;
+        }
+        launchSessionWithTarget(
+          deviceId,
+          Boolean(options.watchOnly),
+          null,
+          options.displayName ||
+            (ownDev && ownDev.name) ||
+            (state.activeSession && state.activeSession.deviceName) ||
+            null,
+          false
+        );
+        return;
+      }
       if (!state.serverStatus || state.serverStatus.state !== "connected") {
-        pendingToolAfterConnect = null;
         toast("请先在「设置 → 网络」配置并连接服务器");
         return;
       }
-      var ownDev = findMyDeviceById(deviceId);
       if (ownDev) {
         if (ownDev.isLocal) {
-          pendingToolAfterConnect = null;
           toast("当前为本机设备，请选择其他在线设备连接");
           return;
         }
         if (!ownDev.allowRemoteControl) {
-          pendingToolAfterConnect = null;
           toast("设备「" + ownDev.name + "」未开启允许远程控制，请先在设备端开启");
           return;
         }
@@ -1284,10 +1347,29 @@
     }
     Bridge.parseConnectTarget(trimmed)
       .then(function (addr) {
+        if (
+          !options.headless &&
+          hasActiveSessionForDevice({
+            addr: addr,
+            deviceId: addr,
+            name: options.displayName || ""
+          }) &&
+          !(state.activeSession && state.activeSession.mediaActive)
+        ) {
+          launchSessionWithTarget(
+            addr,
+            Boolean(options.watchOnly),
+            null,
+            options.displayName ||
+              (state.activeSession && state.activeSession.deviceName) ||
+              null,
+            false
+          );
+          return;
+        }
         promptAndLaunchSession(addr, addr, "目标地址", options);
       })
       .catch(function (err) {
-        pendingToolAfterConnect = null;
         var msg = String(err || "");
         if (!msg || msg.indexOf("暂仅支持 IP:端口直连") !== -1) {
           msg = "请输入 9 位设备码（如 604 928 235）或 IP:端口（如 192.168.1.20:9901）";
@@ -1964,7 +2046,7 @@
       ctx.launchSeq === sessionLaunchSeq &&
       state.activeSession &&
       state.activeSession.active &&
-      isDeviceControlled(ctx.device) &&
+      hasActiveSessionForDevice(ctx.device) &&
       IS_TAURI &&
       typeof Bridge.sessionCommand === "function"
     ) {
@@ -1996,7 +2078,7 @@
       toast("设备「" + device.name + "」当前离线，无法远程更新");
       return;
     }
-    if (state.activeSession && state.activeSession.active && !isDeviceControlled(device)) {
+    if (state.activeSession && state.activeSession.active && !hasActiveSessionForDevice(device)) {
       toast("当前正在远程控制其他设备，请先断开当前会话后再在后台升级「" + device.name + "」");
       return;
     }
@@ -2132,7 +2214,7 @@
         showErr("设备「" + latestDevice.name + "」已关闭允许远程控制，请先在设备端开启");
         return;
       }
-      if (state.activeSession && state.activeSession.active && !isDeviceControlled(device)) {
+      if (state.activeSession && state.activeSession.active && !hasActiveSessionForDevice(device)) {
         showErr("当前正在远程控制其他设备，请先断开当前会话后再升级此设备");
         return;
       }
@@ -2147,7 +2229,7 @@
       cancelBtn.textContent = "取消升级";
 
       var targetVer = String(resolvedRelease.version);
-      var alreadyConnected = isDeviceControlled(device);
+      var alreadyConnected = hasActiveSessionForDevice(device);
       var ctx = {
         deviceId: device.id,
         device: device,
@@ -2287,7 +2369,7 @@
                 if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) {
                   if (
                     sessionLaunchSeq === myLaunchSeq &&
-                    (!state.activeSession || !state.activeSession.active || isDeviceControlled(device)) &&
+                    (!state.activeSession || !state.activeSession.active || hasActiveSessionForDevice(device)) &&
                     typeof Bridge.sessionCommand === "function"
                   ) {
                     Bridge.sessionCommand({ kind: "disconnect" }).catch(function () {});
@@ -2636,9 +2718,15 @@
     if (!active) return;
     var label = state.activeSession.deviceName || state.activeSession.target || "远端设备";
     if (p2SessionText) {
-      p2SessionText.textContent = "正在远控 " + label;
+      if (state.activeSession.phase === "reconnecting") {
+        p2SessionText.textContent = "正在自动重连 " + label + "…";
+      } else if (!state.activeSession.connected) {
+        p2SessionText.textContent = "正在连接 " + label + "…";
+      } else {
+        p2SessionText.textContent = "正在远控 " + label;
+      }
     }
-    var canTools = Boolean(state.activeSession.connected && !state.activeSession.watchOnly);
+    var canTools = Boolean(state.activeSession.active && !state.activeSession.watchOnly);
     [p2OpenTransfer, p2OpenTerminal, p2OpenPortmap].forEach(function (btn) {
       if (!btn) return;
       btn.hidden = !canTools;
@@ -3944,6 +4032,29 @@
       if (typeof Bridge.onActiveSessionState === "function") {
         Bridge.onActiveSessionState(applyActiveSessionState);
       }
+      if (typeof Bridge.onSessionUpdate === "function") {
+        Bridge.onSessionUpdate(function (upd) {
+          if (!upd || upd.kind !== "ended") return;
+          if (activeMainRemoteUpdate) return;
+          var data = upd.data || {};
+          var reason = data.reason ? String(data.reason) : "";
+          var recoverable = Boolean(data.recoverable);
+          var isDesktopSession = Boolean(
+            (state.activeSession && state.activeSession.mediaActive) || lastActiveWasDesktop
+          );
+          if (
+            !recoverable &&
+            !isDesktopSession &&
+            !hasRecentFailureToast() &&
+            reason &&
+            reason !== "用户主动断开" &&
+            reason !== "已主动断开远控会话"
+          ) {
+            markFailureToastShown();
+            toast("连接失败：" + reason);
+          }
+        });
+      }
       if (typeof Bridge.onDeviceStatusChanged === "function") {
         Bridge.onDeviceStatusChanged(applyDeviceStatusChanged);
       }
@@ -3960,13 +4071,23 @@
           if (!payload || !payload.target) return;
           var target = String(payload.target);
           var name = payload.name ? String(payload.name) : "";
-          var alreadyControlling = isDeviceControlled({
+          var alreadyActive = hasActiveSessionForDevice({
             addr: target,
             deviceId: target,
             name: name
           });
-          if (alreadyControlling) {
-            focusSessionWindow();
+          if (alreadyActive) {
+            if (state.activeSession && state.activeSession.mediaActive) {
+              focusSessionWindow();
+            } else {
+              launchSessionWithTarget(
+                target,
+                false,
+                null,
+                name || (state.activeSession && state.activeSession.deviceName) || null,
+                false
+              );
+            }
             return;
           }
           connectToTarget(target, {

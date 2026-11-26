@@ -294,7 +294,7 @@ fn real_hardware_sustained_120fps() {
         while let Some(u) = session.try_recv_update() {
             match u {
                 SessionUpdate::Hud(h) if h.elapsed != "00:00:00" => hud_samples.push(h.fps),
-                SessionUpdate::Ended { reason } => panic!("稳态压测中途结束：{reason}"),
+                SessionUpdate::Ended { reason, .. } => panic!("稳态压测中途结束：{reason}"),
                 _ => {}
             }
         }

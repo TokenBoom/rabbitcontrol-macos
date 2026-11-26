@@ -583,6 +583,14 @@ impl CaptureShared {
         }
     }
 
+    /// 返回采集流是否已停止（含系统回调 `stream:didStopWithError:` 与主动 `stop()`）。
+    fn is_stopped(&self) -> bool {
+        self.chunker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped
+    }
+
     /// 阻塞等待直到至少一帧就绪、超时或采集停止（供低抖动唤醒路径使用）。
     #[cfg_attr(not(test), allow(dead_code))]
     fn recv_frame_timeout(&self, timeout: Duration) -> Option<PcmFrame> {
@@ -673,8 +681,12 @@ define_class!(
     unsafe impl SCStreamDelegate for RcAudioSckStreamHandler {
         #[allow(non_snake_case)]
         #[unsafe(method(stream:didStopWithError:))]
-        unsafe fn stream_didStopWithError(&self, _stream: &SCStream, _error: &NSError) {
+        unsafe fn stream_didStopWithError(&self, _stream: &SCStream, error: &NSError) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                eprintln!(
+                    "[rc-audio-macos] SCStream audio capture stopped with error: {}",
+                    nserror_message(error)
+                );
                 let mut guard = self
                     .ivars()
                     .shared
@@ -916,6 +928,10 @@ impl AudioCapture for MacOsAudioCapture {
 
     fn channels(&self) -> u8 {
         self.channels
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.handles.stopped || self.shared.is_stopped()
     }
 
     fn stop(&mut self) {
@@ -1212,5 +1228,16 @@ mod tests {
         for (idx, ts) in timestamps.iter().enumerate() {
             assert_eq!(*ts, (idx as u32) * 20_000);
         }
+    }
+
+    #[test]
+    fn capture_shared_is_stopped_transitions_after_mark_stopped() {
+        let shared = CaptureShared::new(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
+        assert!(!shared.is_stopped());
+        {
+            let mut guard = shared.chunker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.mark_stopped();
+        }
+        assert!(shared.is_stopped());
     }
 }
