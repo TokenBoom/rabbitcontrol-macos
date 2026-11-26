@@ -59,7 +59,11 @@ use objc2_screen_capture_kit::{
     SCStreamOutputType, SCWindow,
 };
 
-use rc_types::Resolution;
+use rc_types::{Rect, Resolution};
+
+/// 单帧及邮箱合并保留的真实脏区矩形上限；超过上限时自动收敛为精确包围盒，
+/// 兼顾 Tile 级静帧无损补帧精度与回调零膨胀约束。
+pub(crate) const MAX_DIRTY_RECTS: usize = 16;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // C 函数声明（权限三件套，M1/M2/M3）
@@ -1105,6 +1109,9 @@ pub(crate) struct FramePayload<B = PixelBufferHandle> {
     pub(crate) pts_us: u64,
     /// 本帧 `SCStreamFrameInfoDirtyRects` 累计脏区面积占比（`0.0..=1.0`，无法解析时为 `None` 按全帧处理）。
     pub(crate) dirty_ratio: Option<f32>,
+    /// 本帧经坐标映射与边界裁剪后的真实脏区列表（上限 [`MAX_DIRTY_RECTS`]，超限时收敛为精确包围盒；
+    /// 缺失或存在无法解析元素时为 `None`，供上层保守按全帧失效处理）。
+    pub(crate) dirty_rects: Option<Vec<Rect>>,
     /// 帧回调入口采样时刻（微秒，与 PTS 同域；仅 `bench-metrics` 启用）。
     #[cfg(feature = "bench-metrics")]
     pub(crate) callback_us: u64,
@@ -1174,17 +1181,19 @@ impl<B> FrameMailbox<B> {
         )))
     }
 
-    /// 投递最新视频帧：合并被覆写旧帧的脏区占比（防止大场景切换帧被后续微小闪烁帧覆盖导致漏升码率），
-    /// 随后直接覆写 `latest_frame`、在锁外立即 Drop 旧帧并唤醒等待者。
+    /// 投递最新视频帧：合并被覆写旧帧的脏区占比（防止大场景切换帧被后续微小闪烁帧覆盖导致漏升码率）
+    /// 与真实脏区坐标列表（防止首帧局部变化被覆盖丢失），随后直接覆写 `latest_frame`、
+    /// 在锁外立即 Drop 旧帧并唤醒等待者。
     pub(crate) fn push_frame(&self, mut frame: FramePayload<B>) {
         let (lock, cvar) = &*self.0;
         let displaced = {
             let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(prev) = inner.latest_frame.as_ref() {
+            if let Some(prev) = inner.latest_frame.as_mut() {
                 frame.dirty_ratio = match (prev.dirty_ratio, frame.dirty_ratio) {
                     (Some(a), Some(b)) => Some((a + b).min(1.0)),
                     _ => None,
                 };
+                frame.dirty_rects = merge_dirty_rects(prev.dirty_rects.take(), frame.dirty_rects);
             }
             let old = inner.latest_frame.replace(frame);
             #[cfg(feature = "bench-metrics")]
@@ -1421,9 +1430,17 @@ struct DirtyRectStats {
     total_area: Option<f64>,
     /// 所有可解析正面积脏区的最大右/下边界（用于自动识别脏区坐标是输出像素还是 Retina backing 像素）。
     max_extent: (f64, f64),
+    /// 所有可解析正面积脏区的精确包围盒 `(min_x, min_y, max_x, max_y)`。
+    union_bbox: Option<(f64, f64, f64, f64)>,
+    /// 有界原始脏区坐标缓存（`[0..raw_rect_count]` 有效；`overflowed == true` 时收敛为 `union_bbox`）。
+    raw_rects: [(f64, f64, f64, f64); MAX_DIRTY_RECTS],
+    /// 已记录的有效原始脏区数量（`0..=MAX_DIRTY_RECTS`）。
+    raw_rect_count: usize,
+    /// 是否超出 [`MAX_DIRTY_RECTS`] 上限（为 `true` 时收敛为精确包围盒）。
+    overflowed: bool,
 }
 
-/// 从样本附件字典解析 `SCStreamFrameInfoDirtyRects` 统计信息：
+/// 从样本附件字典解析 `SCStreamFrameInfoDirtyRects` 统计信息与有界真实脏区列表：
 /// - `None`：附件缺失或不是数组（无法证明无变化，调用方保守放行并按全帧处理）；
 /// - `Some(stats)`：`stats.has_change == false` 表示空数组或全零面积（静屏微扰动，可跳过）。
 fn dirty_rect_stats_from_dict(dict: &CFDictionary) -> Option<DirtyRectStats> {
@@ -1442,6 +1459,10 @@ fn dirty_rect_stats_from_dict(dict: &CFDictionary) -> Option<DirtyRectStats> {
             has_change: false,
             total_area: Some(0.0),
             max_extent: (0.0, 0.0),
+            union_bbox: None,
+            raw_rects: [(0.0, 0.0, 0.0, 0.0); MAX_DIRTY_RECTS],
+            raw_rect_count: 0,
+            overflowed: false,
         });
     }
     let mut total_area = 0.0f64;
@@ -1451,6 +1472,9 @@ fn dirty_rect_stats_from_dict(dict: &CFDictionary) -> Option<DirtyRectStats> {
     let mut max_y = 0.0f64;
     let mut has_change = false;
     let mut has_unknown = false;
+    let mut raw_rects = [(0.0, 0.0, 0.0, 0.0); MAX_DIRTY_RECTS];
+    let mut raw_rect_count = 0usize;
+    let mut overflowed = false;
     for i in 0..count {
         // SAFETY: `0 <= i < count`，元素指针在 `rects` 存活期内有效。
         let raw_elem = unsafe { rects.value_at_index(i) };
@@ -1481,42 +1505,149 @@ fn dirty_rect_stats_from_dict(dict: &CFDictionary) -> Option<DirtyRectStats> {
                 min_y = min_y.min(y0);
                 max_x = max_x.max(x1);
                 max_y = max_y.max(y1);
+                if !overflowed {
+                    let candidate = (x0, y0, x1, y1);
+                    if !raw_rects[..raw_rect_count].contains(&candidate) {
+                        if raw_rect_count < MAX_DIRTY_RECTS {
+                            raw_rects[raw_rect_count] = candidate;
+                            raw_rect_count += 1;
+                        } else {
+                            overflowed = true;
+                        }
+                    }
+                }
             }
         }
     }
-    if min_x.is_finite() && min_y.is_finite() && max_x > min_x && max_y > min_y {
+    let union_bbox = if min_x.is_finite() && min_y.is_finite() && max_x > min_x && max_y > min_y {
         let union_bbox_area = (max_x - min_x) * (max_y - min_y);
         if union_bbox_area.is_finite() {
             total_area = total_area.min(union_bbox_area);
         }
-    }
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    };
     Some(DirtyRectStats {
         has_change,
         total_area: (!has_unknown).then_some(total_area),
         max_extent: (max_x, max_y),
+        union_bbox,
+        raw_rects,
+        raw_rect_count,
+        overflowed,
     })
 }
 
-/// 将 `DirtyRectStats` 换算为当前输出画幅上的脏区面积占比（`0.0..=1.0`）。
+/// 将单个原始浮点脏区 `(x0, y0, x1, y1)` 从源坐标系 `src_res` 映射到输出像素坐标系 `out_res`，
+/// 采用保守外扩取整（左/上 `floor`、右/下 `ceil`）并严格裁剪到 `[0, out_res]` 边界内。
+///
+/// 映射后宽高任一为 0（如完全越界）或输入非法时返回 `None`。
+pub(crate) fn map_raw_rect_to_output(
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    src_res: Resolution,
+    out_res: Resolution,
+) -> Option<Rect> {
+    if src_res.width == 0
+        || src_res.height == 0
+        || out_res.width == 0
+        || out_res.height == 0
+        || !x0.is_finite()
+        || !y0.is_finite()
+        || !x1.is_finite()
+        || !y1.is_finite()
+        || x1 <= x0
+        || y1 <= y0
+    {
+        return None;
+    }
+    let sx = f64::from(out_res.width) / f64::from(src_res.width);
+    let sy = f64::from(out_res.height) / f64::from(src_res.height);
+    let out_w = f64::from(out_res.width);
+    let out_h = f64::from(out_res.height);
+    let ox0 = (x0 * sx).floor().clamp(0.0, out_w) as u32;
+    let oy0 = (y0 * sy).floor().clamp(0.0, out_h) as u32;
+    let ox1 = (x1 * sx).ceil().clamp(0.0, out_w) as u32;
+    let oy1 = (y1 * sy).ceil().clamp(0.0, out_h) as u32;
+    if ox1 > ox0 && oy1 > oy0 {
+        Some(Rect::new(ox0, oy0, ox1 - ox0, oy1 - oy0))
+    } else {
+        None
+    }
+}
+
+/// 邮箱覆写旧帧时合并两帧的真实脏区列表（不丢失首帧脏区）：
+/// - 任一帧脏区未知（`None` 或为空）时保守退回 `None`（按全帧失效处理）；
+/// - 两帧均有精确脏区时去重并集；若总数不超过 [`MAX_DIRTY_RECTS`] 则逐项保留，
+///   超限时收敛为包含全部脏区的精确最小包围盒，绝不退回 `(0, 0)` 假矩形。
+pub(crate) fn merge_dirty_rects(
+    prev: Option<Vec<Rect>>,
+    next: Option<Vec<Rect>>,
+) -> Option<Vec<Rect>> {
+    let (prev, next) = match (prev, next) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => (a, b),
+        _ => return None,
+    };
+    let mut merged = Vec::with_capacity(prev.len().saturating_add(next.len()).min(MAX_DIRTY_RECTS));
+    let mut overflowed = false;
+    let mut bbox: Option<Rect> = None;
+    for r in prev.into_iter().chain(next) {
+        if r.is_empty() {
+            continue;
+        }
+        bbox = Some(match bbox {
+            Some(acc) => acc.union(&r),
+            None => r,
+        });
+        if !overflowed && !merged.contains(&r) {
+            if merged.len() < MAX_DIRTY_RECTS {
+                merged.push(r);
+            } else {
+                overflowed = true;
+            }
+        }
+    }
+    if overflowed {
+        bbox.map(|b| vec![b])
+    } else if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// 将 `DirtyRectStats` 统一换算为：
+/// 1. 供码控使用的脏区面积占比 `dirty_ratio`（`0.0..=1.0`，保持原有算法零改动）；
+/// 2. 经 backing-space / 输出分辨率统一坐标映射与裁剪后的有界真实脏区列表（上限 [`MAX_DIRTY_RECTS`]，
+///    超限时收敛为精确最小包围盒）。
 ///
 /// 通过流级锁存标志 `dirty_in_backing_space` 记住本流是否以 Retina 物理像素坐标上报脏区
 /// （一旦首帧或任意帧观测到 `max_extent` 超出输出尺寸即锁存为 `true`），消除左上象限 4× 高估与中线抖动；
-/// 若分母不可用或存在未知元素，返回 `None`（保守按全帧处理）。
-fn compute_dirty_ratio(
+/// 若分母不可用或存在未知元素，返回 `(None, None)`（保守按全帧处理）。
+fn compute_dirty_info(
     stats: Option<DirtyRectStats>,
     output_res: Resolution,
     backing_res: Resolution,
     dirty_in_backing_space: &AtomicBool,
-) -> Option<f32> {
-    let stats = stats?;
-    let area = stats.total_area?;
-    if !area.is_finite() || area <= 0.0 {
-        return None;
+) -> (Option<f32>, Option<Vec<Rect>>) {
+    let Some(stats) = stats else {
+        return (None, None);
+    };
+    let Some(area) = stats.total_area else {
+        return (None, None);
+    };
+    if !area.is_finite() || area <= 0.0 || output_res.width == 0 || output_res.height == 0 {
+        return (None, None);
     }
-    let out_w = f64::from(output_res.width.max(1));
-    let out_h = f64::from(output_res.height.max(1));
-    let back_w = f64::from(backing_res.width.max(output_res.width).max(1));
-    let back_h = f64::from(backing_res.height.max(output_res.height).max(1));
+    let out_w = f64::from(output_res.width);
+    let out_h = f64::from(output_res.height);
+    let back_w_u32 = backing_res.width.max(output_res.width).max(1);
+    let back_h_u32 = backing_res.height.max(output_res.height).max(1);
+    let back_w = f64::from(back_w_u32);
+    let back_h = f64::from(back_h_u32);
     let has_larger_backing = back_w > out_w || back_h > out_h;
     if has_larger_backing
         && (stats.max_extent.0 > out_w * 1.05 || stats.max_extent.1 > out_h * 1.05)
@@ -1530,9 +1661,45 @@ fn compute_dirty_ratio(
         out_w * out_h
     };
     if denom <= 0.0 {
-        return None;
+        return (None, None);
     }
-    Some((area / denom).clamp(0.0, 1.0) as f32)
+    let ratio = Some((area / denom).clamp(0.0, 1.0) as f32);
+
+    let src_res = if in_backing_space {
+        Resolution::new(back_w_u32, back_h_u32)
+    } else {
+        output_res
+    };
+    let dirty_rects = if stats.overflowed {
+        stats
+            .union_bbox
+            .and_then(|(x0, y0, x1, y1)| {
+                map_raw_rect_to_output(x0, y0, x1, y1, src_res, output_res)
+            })
+            .map(|bbox| vec![bbox])
+    } else {
+        let mut rects = Vec::with_capacity(stats.raw_rect_count);
+        for &(x0, y0, x1, y1) in &stats.raw_rects[..stats.raw_rect_count] {
+            if let Some(mapped) = map_raw_rect_to_output(x0, y0, x1, y1, src_res, output_res) {
+                if !rects.contains(&mapped) {
+                    rects.push(mapped);
+                }
+            }
+        }
+        (!rects.is_empty()).then_some(rects)
+    };
+    (ratio, dirty_rects)
+}
+
+/// 兼容既有单测：仅返回 `dirty_ratio`。
+#[cfg(test)]
+fn compute_dirty_ratio(
+    stats: Option<DirtyRectStats>,
+    output_res: Resolution,
+    backing_res: Resolution,
+    dirty_in_backing_space: &AtomicBool,
+) -> Option<f32> {
+    compute_dirty_info(stats, output_res, backing_res, dirty_in_backing_space).0
 }
 
 /// 检查样本附件字典中的 `SCStreamFrameInfoDirtyRects` 是否表明有真实画面变动：
@@ -1750,7 +1917,7 @@ define_class!(
                 return;
             };
             let ivars = self.ivars();
-            let dirty_ratio = compute_dirty_ratio(
+            let (dirty_ratio, dirty_rects) = compute_dirty_info(
                 dirty_stats,
                 ivars.output_res,
                 ivars.backing_res,
@@ -1762,6 +1929,7 @@ define_class!(
                 buffer,
                 pts_us: pts,
                 dirty_ratio,
+                dirty_rects,
                 #[cfg(feature = "bench-metrics")]
                 callback_us,
             });
@@ -2516,6 +2684,7 @@ mod tests {
                 },
                 pts_us,
                 dirty_ratio: Some(0.25),
+                dirty_rects: None,
                 #[cfg(feature = "bench-metrics")]
                 callback_us: pts_us + 50,
             });
@@ -2563,6 +2732,7 @@ mod tests {
                 },
                 pts_us: 400,
                 dirty_ratio: None,
+                dirty_rects: None,
                 #[cfg(feature = "bench-metrics")]
                 callback_us: 450,
             });
@@ -2594,6 +2764,7 @@ mod tests {
             buffer: 1,
             pts_us: 100,
             dirty_ratio: None,
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 110,
         });
@@ -2602,6 +2773,7 @@ mod tests {
             buffer: 2,
             pts_us: 200,
             dirty_ratio: None,
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 210,
         });
@@ -2609,6 +2781,7 @@ mod tests {
             buffer: 3,
             pts_us: 300,
             dirty_ratio: Some(0.1),
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 310,
         });
@@ -2640,6 +2813,7 @@ mod tests {
             buffer: 4,
             pts_us: 400,
             dirty_ratio: None,
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 410,
         });
@@ -2658,6 +2832,22 @@ mod tests {
         assert!(mailbox.recv_timeout(Duration::from_millis(10)).is_none());
     }
 
+    fn make_dirty_stats(
+        has_change: bool,
+        total_area: Option<f64>,
+        max_extent: (f64, f64),
+    ) -> DirtyRectStats {
+        DirtyRectStats {
+            has_change,
+            total_area,
+            max_extent,
+            union_bbox: None,
+            raw_rects: [(0.0, 0.0, 0.0, 0.0); MAX_DIRTY_RECTS],
+            raw_rect_count: 0,
+            overflowed: false,
+        }
+    }
+
     #[test]
     fn compute_dirty_ratio_handles_output_and_backing_coordinates() {
         let out = Resolution::new(1512, 982);
@@ -2665,11 +2855,7 @@ mod tests {
         let latched = AtomicBool::new(false);
         // 1) 输出像素空间下 151x98 ≈ 1% 脏区（未锁存 backing 前按输出尺寸）
         let small = compute_dirty_ratio(
-            Some(DirtyRectStats {
-                has_change: true,
-                total_area: Some(151.0 * 98.0),
-                max_extent: (200.0, 200.0),
-            }),
+            Some(make_dirty_stats(true, Some(151.0 * 98.0), (200.0, 200.0))),
             out,
             backing,
             &latched,
@@ -2680,11 +2866,11 @@ mod tests {
 
         // 2) 首帧或大帧出现 Retina backing 坐标（超出输出宽高）自动锁存 backing 坐标系
         let back_half = compute_dirty_ratio(
-            Some(DirtyRectStats {
-                has_change: true,
-                total_area: Some(1512.0 * 1964.0),
-                max_extent: (3024.0, 1964.0),
-            }),
+            Some(make_dirty_stats(
+                true,
+                Some(1512.0 * 1964.0),
+                (3024.0, 1964.0),
+            )),
             out,
             backing,
             &latched,
@@ -2698,11 +2884,11 @@ mod tests {
 
         // 3) 锁存后，即便后续局部脏区位于左上象限（max_extent <= out），仍稳定使用 backing 分母（无 4x 误判）
         let top_left_after_latch = compute_dirty_ratio(
-            Some(DirtyRectStats {
-                has_change: true,
-                total_area: Some(1200.0 * 600.0),
-                max_extent: (1400.0, 800.0),
-            }),
+            Some(make_dirty_stats(
+                true,
+                Some(1200.0 * 600.0),
+                (1400.0, 800.0),
+            )),
             out,
             backing,
             &latched,
@@ -2717,11 +2903,7 @@ mod tests {
         assert_eq!(compute_dirty_ratio(None, out, backing, &latched), None);
         assert_eq!(
             compute_dirty_ratio(
-                Some(DirtyRectStats {
-                    has_change: true,
-                    total_area: None,
-                    max_extent: (0.0, 0.0),
-                }),
+                Some(make_dirty_stats(true, None, (0.0, 0.0))),
                 out,
                 backing,
                 &latched,
@@ -2735,6 +2917,7 @@ mod tests {
             buffer: 1,
             pts_us: 100,
             dirty_ratio: Some(0.90),
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 100,
         });
@@ -2742,6 +2925,7 @@ mod tests {
             buffer: 2,
             pts_us: 200,
             dirty_ratio: Some(0.02),
+            dirty_rects: None,
             #[cfg(feature = "bench-metrics")]
             callback_us: 200,
         });
@@ -2755,6 +2939,231 @@ mod tests {
                 );
             }
             _ => panic!("expected frame 2"),
+        }
+    }
+
+    #[test]
+    fn dirty_rect_coordinate_mapping_and_boundary_clipping() {
+        let logical = Resolution::new(1512, 982);
+        let physical = Resolution::new(3024, 1964);
+
+        // 1) 逻辑坐标 → 物理输出坐标（2× 放大映射）
+        assert_eq!(
+            map_raw_rect_to_output(120.0, 80.0, 320.0, 180.0, logical, physical),
+            Some(Rect::new(240, 160, 400, 200))
+        );
+
+        // 2) 物理 backing 坐标 → 逻辑输出坐标（0.5× 下采样，奇数坐标采用保守 floor/ceil 外扩）
+        assert_eq!(
+            map_raw_rect_to_output(200.0, 400.0, 300.0, 460.0, physical, logical),
+            Some(Rect::new(100, 200, 50, 30))
+        );
+        assert_eq!(
+            map_raw_rect_to_output(101.0, 201.0, 111.0, 211.0, physical, logical),
+            Some(Rect::new(50, 100, 6, 6))
+        );
+
+        // 3) 边界裁剪：负起点、右侧/底部越界截断、完全越界返回 None
+        assert_eq!(
+            map_raw_rect_to_output(-20.0, -10.0, 80.0, 50.0, logical, logical),
+            Some(Rect::new(0, 0, 80, 50))
+        );
+        assert_eq!(
+            map_raw_rect_to_output(1480.0, 960.0, 1600.0, 1050.0, logical, logical),
+            Some(Rect::new(1480, 960, 32, 22))
+        );
+        assert_eq!(
+            map_raw_rect_to_output(2000.0, 1200.0, 2100.0, 1300.0, logical, logical),
+            None
+        );
+        assert_eq!(
+            map_raw_rect_to_output(-100.0, -100.0, -10.0, -10.0, logical, logical),
+            None
+        );
+        assert_eq!(
+            map_raw_rect_to_output(10.0, 10.0, 10.0, 50.0, logical, logical),
+            None
+        );
+        assert_eq!(
+            map_raw_rect_to_output(f64::NAN, 0.0, 50.0, 50.0, logical, logical),
+            None
+        );
+    }
+
+    #[test]
+    fn dirty_rects_from_dict_maps_backing_coords_and_collapses_over_limit_to_exact_bbox() {
+        use objc2_core_foundation::{CGPoint, CGSize};
+
+        let out = Resolution::new(1512, 982);
+        let backing = Resolution::new(3024, 1964);
+        let latched = AtomicBool::new(false);
+
+        let sb = make_empty_sample_buffer();
+        // SAFETY: sb 有效，create_if_necessary = true 创建样本附件数组与字典。
+        let attachments = unsafe { sb.sample_attachments_array(true) }
+            .expect("create_if_necessary=true 必须返回 CFArray");
+        // SAFETY: count == 1，索引 0 为可变字典。
+        let raw_dict = unsafe { attachments.value_at_index(0) };
+        let dict_ptr = NonNull::new(raw_dict.cast_mut()).expect("附件字典非空");
+        // SAFETY: 附件数组元素为 CFMutableDictionary，存活期受 attachments 保护。
+        let dict: &CFMutableDictionary = unsafe { dict_ptr.cast::<CFMutableDictionary>().as_ref() };
+        // SAFETY: SCStreamFrameInfoDirtyRects 为系统导出的 &'static NSString。
+        let dirty_key: *const c_void =
+            unsafe { std::ptr::addr_of!(*SCStreamFrameInfoDirtyRects) }.cast();
+
+        // 1) Retina backing 坐标脏区自动锁存并映射至输出像素坐标系（不改变 dirty_ratio）
+        let backing_rects = [
+            NSValue::new(CGRect::new(
+                CGPoint::new(1600.0, 1000.0),
+                CGSize::new(400.0, 200.0),
+            )),
+            NSValue::new(CGRect::new(
+                CGPoint::new(200.0, 300.0),
+                CGSize::new(100.0, 80.0),
+            )),
+        ];
+        let arr = NSArray::from_retained_slice(&backing_rects);
+        let arr_ptr: *const c_void = Retained::as_ptr(&arr).cast();
+        // SAFETY: dict 与 arr_ptr 均为有效 CF/ObjC 对象。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, arr_ptr) };
+
+        let stats = dirty_rect_stats_from_dict(dict.as_ref());
+        let (ratio, rects) = compute_dirty_info(stats, out, backing, &latched);
+        assert!(latched.load(Ordering::Relaxed));
+        assert!(ratio.is_some_and(|r| r > 0.0 && r < 0.05));
+        assert_eq!(
+            rects,
+            Some(vec![
+                Rect::new(800, 500, 200, 100),
+                Rect::new(100, 150, 50, 40),
+            ])
+        );
+
+        // 2) 锁存后左上象限局部脏区（max_extent <= out）仍按 backing 映射为输出坐标
+        let top_left = [NSValue::new(CGRect::new(
+            CGPoint::new(200.0, 300.0),
+            CGSize::new(100.0, 80.0),
+        ))];
+        let arr_tl = NSArray::from_retained_slice(&top_left);
+        let arr_tl_ptr: *const c_void = Retained::as_ptr(&arr_tl).cast();
+        // SAFETY: dict 与 arr_tl_ptr 均为有效 CF/ObjC 对象。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, arr_tl_ptr) };
+        let (_, rects_tl) = compute_dirty_info(
+            dirty_rect_stats_from_dict(dict.as_ref()),
+            out,
+            backing,
+            &latched,
+        );
+        assert_eq!(rects_tl, Some(vec![Rect::new(100, 150, 50, 40)]));
+
+        // 3) 超过 MAX_DIRTY_RECTS (16) 个不重合脏区且远离 (0,0)：必须收敛为精确包围盒，绝不回落 (0,0) 假矩形
+        let many_rects: Vec<Retained<NSValue>> = (0..20)
+            .map(|i| {
+                let x = 800.0 + f64::from(i) * 20.0;
+                let y = 600.0 + f64::from(i) * 10.0;
+                NSValue::new(CGRect::new(CGPoint::new(x, y), CGSize::new(20.0, 20.0)))
+            })
+            .collect();
+        let many_arr = NSArray::from_retained_slice(&many_rects);
+        let many_ptr: *const c_void = Retained::as_ptr(&many_arr).cast();
+        // SAFETY: dict 与 many_ptr 均为有效 CF/ObjC 对象。
+        unsafe { CFMutableDictionary::set_value(Some(dict), dirty_key, many_ptr) };
+        let many_stats = dirty_rect_stats_from_dict(dict.as_ref()).expect("20 rects stats");
+        assert!(many_stats.overflowed);
+        let (_, collapsed) = compute_dirty_info(Some(many_stats), out, backing, &latched);
+        // backing 包围盒: x in [800, 800+19*20+20 = 1200], y in [600, 600+19*10+20 = 810]
+        // 映射到 out (0.5x): x in [400, 600] (w=200), y in [300, 405] (h=105)
+        let collapsed = collapsed.expect("over-limit dirty rects must collapse to exact bbox");
+        assert_eq!(collapsed, vec![Rect::new(400, 300, 200, 105)]);
+        assert!(collapsed[0].x > 0 && collapsed[0].y > 0);
+    }
+
+    #[test]
+    fn frame_mailbox_merges_real_dirty_rects_and_collapses_over_limit_without_losing_first_frame() {
+        let mb = FrameMailbox::<u64>::new();
+
+        // 1) 两帧局部不重合脏区覆写合并：首帧与次帧真实脏区均完整保留
+        let r1 = Rect::new(120, 140, 80, 60);
+        let r2 = Rect::new(900, 520, 160, 100);
+        mb.push_frame(FramePayload {
+            buffer: 1,
+            pts_us: 100,
+            dirty_ratio: Some(0.05),
+            dirty_rects: Some(vec![r1]),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 100,
+        });
+        mb.push_frame(FramePayload {
+            buffer: 2,
+            pts_us: 200,
+            dirty_ratio: Some(0.08),
+            dirty_rects: Some(vec![r2]),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 200,
+        });
+        match mb.recv_timeout(Duration::from_millis(20)) {
+            Some(FrameEvent::Frame(p)) => {
+                assert_eq!(p.buffer, 2);
+                assert_eq!(p.dirty_rects, Some(vec![r1, r2]));
+            }
+            _ => panic!("expected merged frame 2"),
+        }
+
+        // 2) 两帧合计超过 MAX_DIRTY_RECTS (16) 个远离 (0,0) 的脏区：合并为覆盖两帧全部脏区的精确包围盒
+        let frame1_rects: Vec<Rect> = (0..10)
+            .map(|i| Rect::new(300 + i * 20, 200 + i * 10, 15, 15))
+            .collect();
+        let frame2_rects: Vec<Rect> = (0..10)
+            .map(|i| Rect::new(600 + i * 20, 400 + i * 10, 25, 20))
+            .collect();
+        mb.push_frame(FramePayload {
+            buffer: 3,
+            pts_us: 300,
+            dirty_ratio: Some(0.05),
+            dirty_rects: Some(frame1_rects),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 300,
+        });
+        mb.push_frame(FramePayload {
+            buffer: 4,
+            pts_us: 400,
+            dirty_ratio: Some(0.05),
+            dirty_rects: Some(frame2_rects),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 400,
+        });
+        match mb.recv_timeout(Duration::from_millis(20)) {
+            Some(FrameEvent::Frame(p)) => {
+                assert_eq!(p.buffer, 4);
+                // min=(300,200), max=(600+9*20+25=805, 400+9*10+20=510) => w=505, h=310
+                assert_eq!(p.dirty_rects, Some(vec![Rect::new(300, 200, 505, 310)]));
+            }
+            _ => panic!("expected collapsed frame 4"),
+        }
+
+        // 3) 首帧未知/全屏（None）被次帧局部脏区覆写：保守保留 None（全帧失效，绝不丢失首帧变化）
+        mb.push_frame(FramePayload {
+            buffer: 5,
+            pts_us: 500,
+            dirty_ratio: None,
+            dirty_rects: None,
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 500,
+        });
+        mb.push_frame(FramePayload {
+            buffer: 6,
+            pts_us: 600,
+            dirty_ratio: Some(0.02),
+            dirty_rects: Some(vec![Rect::new(10, 10, 20, 20)]),
+            #[cfg(feature = "bench-metrics")]
+            callback_us: 600,
+        });
+        match mb.recv_timeout(Duration::from_millis(20)) {
+            Some(FrameEvent::Frame(p)) => {
+                assert_eq!(p.buffer, 6);
+                assert_eq!(p.dirty_rects, None);
+            }
+            _ => panic!("expected conservative full-frame fallback on frame 6"),
         }
     }
 

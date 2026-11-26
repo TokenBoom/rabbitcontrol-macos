@@ -802,6 +802,26 @@ pub(crate) fn preallocate_metal_layer_for_session(
     }
 }
 
+/// 根据 `AppPrefs.still_refinement_enabled` 计算开启/升级桌面会话时是否需要下发关闭补帧指令。
+///
+/// - 仅在桌面会话（`!tools_only`）且用户显式关闭（`still_refinement_enabled == false`）时返回
+///   `Some(SessionCommand::SetStillRefinementEnabled { enabled: false })`；
+/// - 纯工具无头会话（`tools_only == true`）或保持默认开启（`true`）时返回 `None`。
+pub(crate) fn still_refinement_command_for_desktop_open(
+    state: &AppState,
+    tools_only: bool,
+) -> Option<SessionCommand> {
+    if tools_only {
+        return None;
+    }
+    let enabled = state
+        .prefs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .still_refinement_enabled;
+    (!enabled).then_some(SessionCommand::SetStillRefinementEnabled { enabled: false })
+}
+
 fn activate_session_with_cfg(
     app: &AppHandle,
     state: &AppState,
@@ -815,6 +835,9 @@ fn activate_session_with_cfg(
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Ok(());
     }
+
+    // 锁顺序约定：在获取 `state.session` 锁之前读取 `state.prefs`，杜绝锁顺序反转。
+    let still_refine_cmd = still_refinement_command_for_desktop_open(state, ui_cfg.tools_only);
 
     let preallocated_layer = match preallocated_override {
         Some(layer) => layer,
@@ -845,6 +868,9 @@ fn activate_session_with_cfg(
             ui_cfg,
             preallocated_layer.map(metal_attach::MainThreadMetalLayer::into_render_surface),
         );
+        if let Some(cmd) = still_refine_cmd {
+            handle.send(cmd);
+        }
         let sid = state.next_session_id();
         let mut active = ActiveSession::new(sid, handle, watch_only);
         active.set_meta(meta);
@@ -1405,6 +1431,7 @@ pub async fn open_session(
             }
             let preallocated = preallocate_metal_layer_for_session(&app, prefer_hardware)
                 .map(metal_attach::MainThreadMetalLayer::into_render_surface);
+            let still_refine_cmd = still_refinement_command_for_desktop_open(&state, false);
             let upgrade_result = {
                 let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(active) = slot
@@ -1416,6 +1443,9 @@ pub async fn open_session(
                         active.handle.set_watch_only(cfg.watch_only);
                     }
                     let tools_to_detach = cfg.watch_only.then(|| active.handle.tools());
+                    if let Some(cmd) = still_refine_cmd {
+                        active.handle.send(cmd);
+                    }
                     active.handle.upgrade_to_desktop(preallocated);
                     if active.meta.audio_enabled {
                         active
@@ -8704,6 +8734,49 @@ mod tests {
             SessionCommand::SetCodec {
                 codec: rc_ui::display_ctrl::StreamCodec::Av1
             }
+        );
+
+        let k: SessionCommandArg =
+            serde_json::from_str(r#"{"type":"set_still_refinement_enabled","enabled":false}"#)
+                .unwrap();
+        assert_eq!(
+            k.0,
+            SessionCommand::SetStillRefinementEnabled { enabled: false }
+        );
+
+        let l: SessionCommandArg =
+            serde_json::from_str(r#"{"kind":"set_still_refinement_enabled","enabled":true}"#)
+                .unwrap();
+        assert_eq!(
+            l.0,
+            SessionCommand::SetStillRefinementEnabled { enabled: true }
+        );
+    }
+
+    #[test]
+    fn still_refinement_command_respects_app_prefs_and_tools_only_mode() {
+        let state = AppState::new_for_test();
+        // 默认偏好为 true：开启桌面会话时不下发关闭指令。
+        assert!(state.prefs.lock().unwrap().still_refinement_enabled);
+        assert_eq!(
+            still_refinement_command_for_desktop_open(&state, false),
+            None
+        );
+        assert_eq!(
+            still_refinement_command_for_desktop_open(&state, true),
+            None
+        );
+
+        // 用户偏好关闭时：开启/升级桌面会话下发 SetStillRefinementEnabled { enabled: false }；
+        // 纯工具无头会话保持 None（待后续升级桌面时再下发）。
+        state.prefs.lock().unwrap().still_refinement_enabled = false;
+        assert_eq!(
+            still_refinement_command_for_desktop_open(&state, false),
+            Some(SessionCommand::SetStillRefinementEnabled { enabled: false })
+        );
+        assert_eq!(
+            still_refinement_command_for_desktop_open(&state, true),
+            None
         );
     }
 

@@ -117,6 +117,9 @@ pub struct SckBackend {
     /// 消费方，消费/丢弃后即刻 `CFRelease` 归还 SCK IOSurface 池，零悬垂、零占池。
     #[cfg_attr(not(test), allow(dead_code))]
     last_buffer_info: Option<(u32, u32, u32, u32)>,
+    /// 最近一帧采集到的真实脏区坐标列表（已映射并裁剪至输出分辨率；
+    /// 无法解析或缺失时为空，供 [`CaptureBackend::last_dirty_rects`] 上报）。
+    last_dirty_rects: Vec<Rect>,
     /// 待上报的失效原因（重建前持续上报，C4/C5）。
     invalidation: Option<InvalidationReason>,
     /// 失效原因的可读描述。
@@ -183,6 +186,7 @@ impl SckBackend {
             origin_pts_us: None,
             seq: CaptureSeq(0),
             last_buffer_info: None,
+            last_dirty_rects: Vec::new(),
             invalidation: None,
             invalidation_msg: String::new(),
             post_lock_grace_retries: 0,
@@ -215,6 +219,7 @@ impl SckBackend {
     fn enter_suspended_state(&mut self, msg: impl Into<String>) {
         self.live = None;
         self.last_buffer_info = None;
+        self.last_dirty_rects.clear();
         self.invalidation = Some(InvalidationReason::SessionLocked);
         self.invalidation_msg = msg.into();
         self.post_lock_grace_retries = 0;
@@ -267,6 +272,7 @@ impl SckBackend {
         self.live = Some((handles, mailbox));
         self.origin_pts_us = None;
         self.last_buffer_info = None;
+        self.last_dirty_rects.clear();
         self.post_lock_grace_retries = 0;
         self.first_frame_checked = false;
         Ok(())
@@ -276,6 +282,7 @@ impl SckBackend {
     fn invalidate(&mut self, reason: InvalidationReason, msg: impl Into<String>) -> Error {
         self.live = None;
         self.last_buffer_info = None;
+        self.last_dirty_rects.clear();
         self.invalidation = Some(reason);
         self.invalidation_msg = msg.into();
         reason.to_capture_error(self.invalidation_msg.clone())
@@ -315,6 +322,7 @@ impl CaptureBackend for SckBackend {
                     buffer,
                     pts_us,
                     dirty_ratio,
+                    dirty_rects,
                     callback_us,
                 } = payload;
                 #[cfg(not(feature = "bench-metrics"))]
@@ -322,6 +330,7 @@ impl CaptureBackend for SckBackend {
                     buffer,
                     pts_us,
                     dirty_ratio,
+                    dirty_rects,
                 } = payload;
 
                 // C2：优先使用调用方注入的会话时钟原点（与管线同域同零点）；
@@ -374,6 +383,8 @@ impl CaptureBackend for SckBackend {
                 // 无法解析或接近全屏（>= 99.5%）时返回 None（按全帧处理）。SCK 不会重复交同一帧：is_repeat 恒 false。
                 let dirty =
                     dirty_ratio.and_then(|r| dirty_ratio_to_rect(r, self.display.resolution));
+                // 同步缓存映射并裁剪后的真实脏区坐标列表供 CaptureBackend::last_dirty_rects 上报。
+                self.last_dirty_rects = dirty_rects.unwrap_or_default();
                 Ok(Some(CapturedFrame {
                     texture,
                     timestamp,
@@ -417,6 +428,7 @@ impl CaptureBackend for SckBackend {
         self.invalidation = None;
         self.invalidation_msg.clear();
         self.last_buffer_info = None;
+        self.last_dirty_rects.clear();
 
         if let Err(err) = self.establish() {
             let asleep = ffi::is_display_asleep(self.config.display_id);
@@ -447,6 +459,10 @@ impl CaptureBackend for SckBackend {
             // （HdrToggled）在启用 HDR 采集的后续卡里处理。
             hdr: false,
         }
+    }
+
+    fn last_dirty_rects(&self) -> &[Rect] {
+        &self.last_dirty_rects
     }
 }
 
@@ -916,6 +932,7 @@ mod tests {
             origin_pts_us: None,
             seq: CaptureSeq(0),
             last_buffer_info: None,
+            last_dirty_rects: Vec::new(),
             invalidation: None,
             invalidation_msg: String::new(),
             post_lock_grace_retries: 0,
@@ -1111,6 +1128,7 @@ mod tests {
             origin_pts_us: None,
             seq: CaptureSeq(0),
             last_buffer_info: None,
+            last_dirty_rects: Vec::new(),
             invalidation: None,
             invalidation_msg: String::new(),
             post_lock_grace_retries: 0,
@@ -1150,5 +1168,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn sck_backend_last_dirty_rects_exposes_real_coords_and_clears_on_invalidation() {
+        let mut backend = make_test_backend(SckConfig {
+            resolution: Some(Resolution::new(1512, 982)),
+            ..SckConfig::default()
+        });
+        // 初始状态为空切片（保守按全帧失效处理）。
+        let backend_ref: &dyn CaptureBackend = &backend;
+        assert!(backend_ref.last_dirty_rects().is_empty());
+
+        // 写入真实非 (0,0) 脏区坐标，通过 CaptureBackend trait 原样返回。
+        let expected = vec![Rect::new(420, 310, 180, 96), Rect::new(1100, 700, 220, 140)];
+        backend.last_dirty_rects = expected.clone();
+        let backend_ref: &dyn CaptureBackend = &backend;
+        assert_eq!(backend_ref.last_dirty_rects(), expected.as_slice());
+
+        // 锁屏挂起与失效均应清空 last_dirty_rects，防止残留旧帧脏区污染重建后的首帧。
+        backend.enter_suspended_state("locked");
+        assert!(backend.last_dirty_rects().is_empty());
+
+        backend.last_dirty_rects = expected;
+        let _ = backend.invalidate(InvalidationReason::AccessLost, "revoked");
+        assert!(backend.last_dirty_rects().is_empty());
     }
 }

@@ -666,11 +666,17 @@ pub fn focus_session_window(app: AppHandle) -> Result<(), String> {
     } else {
         None
     };
+    let still_refine_cmd = needs_upgrade
+        .then(|| crate::commands::still_refinement_command_for_desktop_open(&st, false))
+        .flatten();
     let (attach_req, emitted_info) = {
         let mut slot = st.session.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = slot.as_mut().filter(|a| a.id == sid && !a.disconnecting) {
             let mut info_to_emit = None;
             if needs_upgrade && !active.meta.media_active {
+                if let Some(cmd) = still_refine_cmd {
+                    active.handle.send(cmd);
+                }
                 active.handle.upgrade_to_desktop(preallocated_surface);
                 active.meta.media_active = true;
                 active.meta.tools_only = false;

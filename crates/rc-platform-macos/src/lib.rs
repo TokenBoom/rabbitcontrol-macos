@@ -21,6 +21,7 @@ use rc_encode::{BitstreamFormat, Codec, Encoder};
 use rc_input::InputInjector;
 use rc_pipeline::{
     ChromaSubsampling, CodecCapability, LatencyTier, PipelineConfig, PlatformMediaProvider,
+    RefinementCapability,
 };
 use rc_render::Renderer;
 use rc_types::{Resolution, Result};
@@ -204,6 +205,18 @@ impl PlatformMediaProvider for MacosMediaProvider {
         #[cfg(not(target_os = "macos"))]
         {
             Vec::new()
+        }
+    }
+
+    fn refinement_capability(&self) -> RefinementCapability {
+        // 如实上报当前 macOS 侧静帧无损补帧能力状态：
+        // 协议层与 QOI 解码格式已对齐，但当前仍维持 SCK(NV12/420v)→VideoToolbox 主视频零拷贝热路径；
+        // 待真机按 `BENCHMARK_MACOS.md` 实测 `SCK(BGRA)→VT` 与 Metal 叠加色差达标后再翻开
+        // `supported: true`，绝不虚报未就绪能力。
+        RefinementCapability {
+            supported: false,
+            true_rgb_capture: false,
+            formats: vec!["qoi".into()],
         }
     }
 
@@ -676,5 +689,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refinement_capability_reports_honest_unready_status() {
+        let provider = MacosMediaProvider;
+        let cap = provider.refinement_capability();
+        assert!(
+            !cap.supported,
+            "真机实测 SCK(BGRA)→VT 与 Metal 叠加色差达标前绝不得虚报 supported = true"
+        );
+        assert!(
+            !cap.true_rgb_capture,
+            "当前仍走 NV12/420v 零拷贝主路径，不得虚报 true_rgb_capture = true"
+        );
+        assert_eq!(cap.formats, vec!["qoi".to_string()]);
     }
 }
