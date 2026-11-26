@@ -366,6 +366,18 @@
     saveGeneralPrefs: function (patch) {
       return invoke("save_general_prefs", { patch: patch || {} });
     },
+    pickTransferStorageDir: function () {
+      if (!isTauri) {
+        return Promise.resolve(null);
+      }
+      return invoke("pick_transfer_storage_dir");
+    },
+    openTransferStorageDir: function () {
+      if (!isTauri) {
+        return Promise.resolve();
+      }
+      return invoke("open_transfer_storage_dir");
+    },
     getServiceStatus: function () {
       return invoke("get_service_status");
     },

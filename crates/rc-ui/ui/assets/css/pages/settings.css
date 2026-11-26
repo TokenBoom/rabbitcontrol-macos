@@ -179,15 +179,6 @@ body[data-page="settings"] {
   gap: 8px;
 }
 
-.rc-setting-row__static {
-  flex: none;
-  color: var(--text-secondary);
-  font-size: var(--size-secondary);
-  line-height: 20px;
-  cursor: default;
-  user-select: none;
-}
-
 .rc-setting-row--note {
   align-items: flex-start;
 }

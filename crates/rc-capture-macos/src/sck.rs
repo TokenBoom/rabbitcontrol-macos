@@ -94,6 +94,10 @@ impl CaptureFrameTiming {
     }
 }
 
+/// 刚从 `SessionLocked`（熄屏/锁屏）退出时，WindowServer / SCShareableContent 就绪前的宽限重建重试上限
+/// （配合上层 500ms 退避约 4 秒），避免解锁/唤醒瞬态失败误杀整个会话。
+const MAX_POST_LOCK_GRACE_RETRIES: u8 = 8;
+
 /// ScreenCaptureKit 采集后端（实现 [`CaptureBackend`]）。
 ///
 /// 用 [`SckBackend::new`] 创建；失败（无显示器、无权限等）返回
@@ -117,6 +121,8 @@ pub struct SckBackend {
     invalidation: Option<InvalidationReason>,
     /// 失效原因的可读描述。
     invalidation_msg: String,
+    /// 从 `SessionLocked` 退出后的瞬态宽限重建已用次数（建流成功或再次熄屏/锁屏时清零）。
+    post_lock_grace_retries: u8,
     /// 首帧校验是否已完成（格式 / 分辨率核对）。
     first_frame_checked: bool,
     /// 是否在 `SCContentFilter` 中排除当前进程窗口（仅 `bench-metrics` 启用）。
@@ -169,27 +175,49 @@ impl SckBackend {
         validate_config(&config)?;
         #[cfg(not(feature = "bench-metrics"))]
         let _ = exclude_current_process;
+        let fallback_display = fallback_display_summary(&config);
         let mut backend = Self {
             config,
             live: None,
-            display: DisplaySummary {
-                id: DisplayId(0),
-                resolution: Resolution::default(),
-                scale: 1.0,
-            },
+            display: fallback_display,
             origin_pts_us: None,
             seq: CaptureSeq(0),
             last_buffer_info: None,
             invalidation: None,
             invalidation_msg: String::new(),
+            post_lock_grace_retries: 0,
             first_frame_checked: false,
             #[cfg(feature = "bench-metrics")]
             exclude_current_process,
             #[cfg(feature = "bench-metrics")]
             last_frame_timing: None,
         };
-        backend.establish()?;
+        if let Err(err) = backend.establish() {
+            let asleep = ffi::is_display_asleep(backend.config.display_id);
+            let locked = ffi::is_screen_locked();
+            if asleep || locked {
+                tracing::warn!(
+                    display_asleep = asleep,
+                    screen_locked = locked,
+                    error = %err,
+                    "SCK 冷启动建流失败且屏幕处于熄屏/锁屏状态，进入挂起待重建模式"
+                );
+                backend.enter_suspended_state(format!("屏幕熄屏或锁屏，采集挂起待重建: {err}"));
+                return Ok(backend);
+            }
+            return Err(err);
+        }
         Ok(backend)
+    }
+
+    /// 将后端置入「挂起待重建」态（`live: None`, `invalidation: Some(SessionLocked)`），
+    /// 避免冷启动遇熄屏/锁屏时降级至假后端。
+    fn enter_suspended_state(&mut self, msg: impl Into<String>) {
+        self.live = None;
+        self.last_buffer_info = None;
+        self.invalidation = Some(InvalidationReason::SessionLocked);
+        self.invalidation_msg = msg.into();
+        self.post_lock_grace_retries = 0;
     }
 
     /// 枚举显示器并构建一条全新的 SCStream（`new` 与 `rebuild` 共用，M8）。
@@ -239,6 +267,7 @@ impl SckBackend {
         self.live = Some((handles, mailbox));
         self.origin_pts_us = None;
         self.last_buffer_info = None;
+        self.post_lock_grace_retries = 0;
         self.first_frame_checked = false;
         Ok(())
     }
@@ -358,10 +387,13 @@ impl CaptureBackend for SckBackend {
                 InvalidationReason::SessionLocked,
                 "SCStream 挂起（锁屏 / 会话切换），解锁后请 rebuild",
             )),
-            Some(FrameEvent::Stopped { message }) => Err(self.invalidation_wrap(
-                InvalidationReason::AccessLost,
-                format!("SCStream 已停止: {message}"),
-            )),
+            Some(FrameEvent::Stopped { message }) => {
+                let reason = classify_stop_reason(
+                    ffi::is_display_asleep(self.config.display_id),
+                    ffi::is_screen_locked(),
+                );
+                Err(self.invalidation_wrap(reason, format!("SCStream 已停止: {message}")))
+            }
             None => {
                 // C1：超时即无变化，返回 None 而不是错误 / 重复帧。
                 Ok(None)
@@ -377,11 +409,33 @@ impl CaptureBackend for SckBackend {
         // C5 幂等 + M8：SCStream 停止后不可复用 —— 直接丢弃旧流
         // （StreamHandles::drop 会显式 stop），然后构建全新实例。
         // 连续调用只是多建几条新流，无叠加副作用。
+        // 注意：不在采集线程同步调用 `wake_display_if_asleep`（亮屏唤醒与冷却退避由上层
+        // `host_bridge` 统一编排），避免锁屏期间反复唤醒或在停机 `join` 时卡顿。
+        let was_session_locked =
+            matches!(self.invalidation, Some(InvalidationReason::SessionLocked));
         self.live = None;
         self.invalidation = None;
         self.invalidation_msg.clear();
         self.last_buffer_info = None;
-        self.establish()
+
+        if let Err(err) = self.establish() {
+            let asleep = ffi::is_display_asleep(self.config.display_id);
+            let locked = ffi::is_screen_locked();
+            let has_access = if was_session_locked && !asleep && !locked {
+                ffi::preflight_screen_capture_access()
+            } else {
+                false
+            };
+            return Err(self.handle_rebuild_failure(
+                err,
+                was_session_locked,
+                asleep,
+                locked,
+                has_access,
+            ));
+        }
+        self.post_lock_grace_retries = 0;
+        Ok(())
     }
 
     fn display_info(&self) -> DisplayInfo {
@@ -400,6 +454,46 @@ impl SckBackend {
     /// [`invalidate`](SckBackend::invalidate) 的内部变体：返回错误而不是只记录。
     fn invalidation_wrap(&mut self, reason: InvalidationReason, msg: impl Into<String>) -> Error {
         self.invalidate(reason, msg)
+    }
+
+    /// 处理 `rebuild()` 中的 `establish()` 失败（维持 `live.is_none() => invalidation.is_some()` 不变量）。
+    ///
+    /// - 仍处于熄屏/锁屏：清零宽限计数并返回可恢复 `SessionLocked`；
+    /// - 刚从 `SessionLocked` 恢复且仍有 TCC 屏幕录制权限、宽限未超 `MAX_POST_LOCK_GRACE_RETRIES`：
+    ///   递增宽限计数并返回可恢复 `SessionLocked`，等待 WindowServer 完成唤醒/解锁过渡；
+    /// - 其余情况（权限撤销、宽限耗尽或非锁屏路径失败）：写入 `InvalidationReason::Unknown` 并返回致命错误。
+    fn handle_rebuild_failure(
+        &mut self,
+        err: Error,
+        was_session_locked: bool,
+        display_asleep: bool,
+        screen_locked: bool,
+        has_screen_capture_access: bool,
+    ) -> Error {
+        if display_asleep || screen_locked {
+            self.post_lock_grace_retries = 0;
+            let msg = format!("屏幕熄屏或锁屏，重建推迟: {err}");
+            return self.invalidate(InvalidationReason::SessionLocked, msg);
+        }
+        if was_session_locked
+            && self.post_lock_grace_retries < MAX_POST_LOCK_GRACE_RETRIES
+            && has_screen_capture_access
+        {
+            self.post_lock_grace_retries = self.post_lock_grace_retries.saturating_add(1);
+            let retry_no = self.post_lock_grace_retries;
+            tracing::warn!(
+                retry = retry_no,
+                max_retries = MAX_POST_LOCK_GRACE_RETRIES,
+                error = %err,
+                "SCK 解锁/唤醒过渡期重建暂未就绪，按可恢复 SessionLocked 宽限重试"
+            );
+            let msg = format!(
+                "屏幕刚唤醒/解锁，SCK 过渡期宽限重试 ({retry_no}/{MAX_POST_LOCK_GRACE_RETRIES}): {err}"
+            );
+            return self.invalidate(InvalidationReason::SessionLocked, msg);
+        }
+        self.post_lock_grace_retries = 0;
+        self.invalidate(InvalidationReason::Unknown, err.to_string())
     }
 }
 
@@ -448,6 +542,56 @@ pub(crate) fn resolve_target_resolution(
 /// 把建流期的未知失败映射为致命采集错误（原因不明时不盲目重试）。
 fn unknown_capture_error(msg: impl Into<String>) -> Error {
     InvalidationReason::Unknown.to_capture_error(msg)
+}
+
+/// 根据屏幕熄屏/锁屏状态将 `SCStream` 停止回调分类为 `SessionLocked`（可恢复）或 `AccessLost`。
+pub(crate) fn classify_stop_reason(
+    display_asleep: bool,
+    screen_locked: bool,
+) -> InvalidationReason {
+    if screen_locked || display_asleep {
+        InvalidationReason::SessionLocked
+    } else {
+        InvalidationReason::AccessLost
+    }
+}
+
+/// 构造冷启动挂起态下的兜底显示器摘要（纯逻辑可单测），保证 `display_info()` 始终返回有效非零偶分辨率。
+fn fallback_display_summary_with(
+    config: &SckConfig,
+    logical_res: Option<Resolution>,
+    backing_res: Option<Resolution>,
+) -> DisplaySummary {
+    let resolution = config
+        .resolution
+        .map(|r| r.to_even())
+        .filter(|r| r.width >= 2 && r.height >= 2)
+        .or_else(|| logical_res.filter(|r| r.width >= 2 && r.height >= 2))
+        .unwrap_or_else(|| Resolution::new(1920, 1080));
+    let scale = backing_res
+        .and_then(|backing| {
+            if resolution.width > 0 && backing.width >= resolution.width {
+                Some(backing.width as f32 / resolution.width as f32)
+            } else {
+                None
+            }
+        })
+        .filter(|s| s.is_finite() && *s >= 1.0)
+        .unwrap_or(1.0);
+    DisplaySummary {
+        id: DisplayId(config.display),
+        resolution,
+        scale,
+    }
+}
+
+/// 结合系统主屏边界查询构造冷启动挂起态兜底显示器摘要。
+fn fallback_display_summary(config: &SckConfig) -> DisplaySummary {
+    fallback_display_summary_with(
+        config,
+        ffi::main_display_logical_resolution(),
+        ffi::main_display_backing_resolution(),
+    )
 }
 
 /// 按配置挑选显示器：优先精确匹配 `display_id`，其次 `index == 0` 匹配主显示器，否则取第 `index` 个。
@@ -761,5 +905,250 @@ mod tests {
         assert_eq!(dirty_ratio_to_rect(0.0, res), None);
         assert_eq!(dirty_ratio_to_rect(1.0, res), None);
         assert_eq!(dirty_ratio_to_rect(f32::NAN, res), None);
+    }
+
+    fn make_test_backend(cfg: SckConfig) -> SckBackend {
+        let display = fallback_display_summary_with(&cfg, None, None);
+        SckBackend {
+            config: cfg,
+            live: None,
+            display,
+            origin_pts_us: None,
+            seq: CaptureSeq(0),
+            last_buffer_info: None,
+            invalidation: None,
+            invalidation_msg: String::new(),
+            post_lock_grace_retries: 0,
+            first_frame_checked: false,
+            #[cfg(feature = "bench-metrics")]
+            exclude_current_process: false,
+            #[cfg(feature = "bench-metrics")]
+            last_frame_timing: None,
+        }
+    }
+
+    #[test]
+    fn classify_stop_reason_for_sleep_and_lock() {
+        // 熄屏或锁屏时停止回调归类为可恢复 SessionLocked；亮屏且解锁时归类为 AccessLost。
+        assert_eq!(
+            classify_stop_reason(true, false),
+            InvalidationReason::SessionLocked
+        );
+        assert_eq!(
+            classify_stop_reason(false, true),
+            InvalidationReason::SessionLocked
+        );
+        assert_eq!(
+            classify_stop_reason(true, true),
+            InvalidationReason::SessionLocked
+        );
+        assert_eq!(
+            classify_stop_reason(false, false),
+            InvalidationReason::AccessLost
+        );
+    }
+
+    #[test]
+    fn rebuild_failure_post_unlock_grace_budget_and_fatal_invariants() {
+        // 1. 刚从 SessionLocked 解锁且具备 TCC 权限：允许最多 MAX_POST_LOCK_GRACE_RETRIES 次可恢复重试，
+        //    超限后升级为致命 Unknown，且始终满足 live.is_none() => invalidation.is_some()。
+        let mut backend = make_test_backend(SckConfig::default());
+        backend.enter_suspended_state("locked");
+
+        for expected_retry in 1..=MAX_POST_LOCK_GRACE_RETRIES {
+            let was_locked = matches!(
+                backend.poll_invalidation(),
+                Some(InvalidationReason::SessionLocked)
+            );
+            assert!(was_locked);
+            backend.invalidation = None;
+            let err = backend.handle_rebuild_failure(
+                unknown_capture_error("WindowServer warming up"),
+                was_locked,
+                false,
+                false,
+                true,
+            );
+            assert!(
+                !err.is_fatal(),
+                "第 {expected_retry} 次解锁过渡期宽限重试应可恢复"
+            );
+            assert_eq!(backend.post_lock_grace_retries, expected_retry);
+            assert_eq!(
+                backend.poll_invalidation(),
+                Some(InvalidationReason::SessionLocked)
+            );
+        }
+
+        // 宽限耗尽后的下一次失败必须转为致命 Unknown，并保留 invalidation == Some(Unknown)。
+        let was_locked = matches!(
+            backend.poll_invalidation(),
+            Some(InvalidationReason::SessionLocked)
+        );
+        backend.invalidation = None;
+        let fatal = backend.handle_rebuild_failure(
+            unknown_capture_error("persistent SCK failure"),
+            was_locked,
+            false,
+            false,
+            true,
+        );
+        assert!(fatal.is_fatal(), "宽限重试耗尽后必须升级为致命错误");
+        assert_eq!(
+            backend.poll_invalidation(),
+            Some(InvalidationReason::Unknown),
+            "致命失败后必须保留 invalidation == Some(Unknown) 不变量"
+        );
+        assert_eq!(backend.post_lock_grace_retries, 0);
+
+        // 2. 宽限中途若再次锁屏/熄屏，应清零宽限计数并保持可恢复 SessionLocked。
+        backend.enter_suspended_state("locked again");
+        let _ = backend.handle_rebuild_failure(
+            unknown_capture_error("transient"),
+            true,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(backend.post_lock_grace_retries, 1);
+        let asleep_err = backend.handle_rebuild_failure(
+            unknown_capture_error("display went back to sleep"),
+            true,
+            true,
+            false,
+            true,
+        );
+        assert!(!asleep_err.is_fatal());
+        assert_eq!(backend.post_lock_grace_retries, 0);
+        assert_eq!(
+            backend.poll_invalidation(),
+            Some(InvalidationReason::SessionLocked)
+        );
+
+        // 3. TCC 屏幕录制权限丢失时，即使刚从 SessionLocked 恢复也立即致命，不消耗宽限预算。
+        let mut no_perm = make_test_backend(SckConfig::default());
+        no_perm.enter_suspended_state("locked");
+        no_perm.invalidation = None;
+        let denied = no_perm.handle_rebuild_failure(
+            unknown_capture_error("permission denied"),
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(denied.is_fatal(), "缺少屏幕录制权限时必须立即返回致命错误");
+        assert_eq!(
+            no_perm.poll_invalidation(),
+            Some(InvalidationReason::Unknown)
+        );
+        assert_eq!(no_perm.post_lock_grace_retries, 0);
+
+        // 4. 非 SessionLocked 路径（如 AccessLost 或正常建流）下失败：立即致命且写入 Unknown。
+        let mut non_locked = make_test_backend(SckConfig::default());
+        let err = non_locked.handle_rebuild_failure(
+            unknown_capture_error("fatal error"),
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(err.is_fatal());
+        assert_eq!(
+            non_locked.poll_invalidation(),
+            Some(InvalidationReason::Unknown)
+        );
+    }
+
+    #[test]
+    fn fallback_display_summary_produces_valid_even_resolution() {
+        // 1. 显式配置分辨率优先（奇数向下取偶）。
+        let cfg = SckConfig {
+            display: 2,
+            resolution: Some(Resolution::new(1921, 1081)),
+            ..SckConfig::default()
+        };
+        let summary = fallback_display_summary_with(
+            &cfg,
+            Some(Resolution::new(1512, 982)),
+            Some(Resolution::new(3840, 2160)),
+        );
+        assert_eq!(summary.id, DisplayId(2));
+        assert_eq!(summary.resolution, Resolution::new(1920, 1080));
+        assert!((summary.scale - 2.0).abs() < 0.01);
+
+        // 2. 未配置分辨率时回退到逻辑分辨率，并结合物理分辨率推算 scale。
+        let summary = fallback_display_summary_with(
+            &SckConfig::default(),
+            Some(Resolution::new(1512, 982)),
+            Some(Resolution::new(3024, 1964)),
+        );
+        assert_eq!(summary.resolution, Resolution::new(1512, 982));
+        assert!((summary.scale - 2.0).abs() < 0.01);
+
+        // 3. 退化配置（1x1）与空查询回退到 1920x1080 @ 1.0x，绝不返回 0 尺寸。
+        let degenerate = SckConfig {
+            resolution: Some(Resolution::new(1, 1)),
+            ..SckConfig::default()
+        };
+        let summary = fallback_display_summary_with(&degenerate, None, None);
+        assert_eq!(summary.resolution, Resolution::new(1920, 1080));
+        assert!((summary.scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn suspended_sck_backend_exposes_valid_display_info_and_recoverable_invalidation() {
+        let cfg = SckConfig {
+            display: 0,
+            resolution: Some(Resolution::new(1600, 900)),
+            fps: 60,
+            ..SckConfig::default()
+        };
+        let display = fallback_display_summary_with(&cfg, None, None);
+        let mut backend = SckBackend {
+            config: cfg,
+            live: None,
+            display,
+            origin_pts_us: None,
+            seq: CaptureSeq(0),
+            last_buffer_info: None,
+            invalidation: None,
+            invalidation_msg: String::new(),
+            post_lock_grace_retries: 0,
+            first_frame_checked: false,
+            #[cfg(feature = "bench-metrics")]
+            exclude_current_process: false,
+            #[cfg(feature = "bench-metrics")]
+            last_frame_timing: None,
+        };
+        backend.enter_suspended_state("display asleep at cold start");
+
+        // display_info() 返回有效非零偶分辨率，供 HostPipeline / VideoToolbox 初始化。
+        let info = backend.display_info();
+        assert_eq!(info.id, DisplayId(0));
+        assert_eq!(info.resolution, Resolution::new(1600, 900));
+        assert!(info.scale >= 1.0);
+
+        // poll_invalidation() 持续上报 SessionLocked。
+        assert_eq!(
+            backend.poll_invalidation(),
+            Some(InvalidationReason::SessionLocked)
+        );
+        assert_eq!(
+            backend.poll_invalidation(),
+            Some(InvalidationReason::SessionLocked)
+        );
+
+        // next_frame() 返回可恢复的 Error::Capture（非致命，避免触发退化或断开）。
+        let err = backend
+            .next_frame(Duration::from_millis(10))
+            .expect_err("挂起态 next_frame 应返回可恢复错误以驱动上层重建");
+        assert!(!err.is_fatal());
+        assert!(matches!(
+            err,
+            Error::Capture {
+                recoverable: true,
+                ..
+            }
+        ));
     }
 }

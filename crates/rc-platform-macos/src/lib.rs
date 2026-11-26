@@ -255,6 +255,43 @@ impl ClientPlatformHooks for MacosClientPlatformHooks {
         }
     }
 
+    fn wake_display_if_asleep(&self) -> std::result::Result<Option<Box<dyn Any + Send>>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::wake_display_if_asleep(
+                "RabbitControl 被控会话唤醒显示器",
+                std::time::Duration::from_millis(2500),
+            )
+            .map(|opt| opt.map(|guard| Box::new(guard) as Box<dyn Any + Send>))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(None)
+        }
+    }
+
+    fn is_display_asleep(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::is_display_asleep(None)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    fn is_screen_locked(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::is_screen_locked()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     fn set_privacy_curtain(
         &self,
         mode: &str,

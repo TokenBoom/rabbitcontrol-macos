@@ -103,6 +103,8 @@ commands.allow = [
   "renew_device_cert",
   "get_general_prefs",
   "save_general_prefs",
+  "pick_transfer_storage_dir",
+  "open_transfer_storage_dir",
   "get_service_status",
   "install_system_service",
   "uninstall_system_service",

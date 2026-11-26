@@ -269,6 +269,74 @@ pub fn lock_screen_now() -> bool {
     }
 }
 
+/// 查询指定显示器或当前在线主显示器是否处于熄屏/休眠状态。
+///
+/// - `Some(id)`：查询指定 `CGDirectDisplayID`；
+/// - `None`：通过 `CGGetOnlineDisplayList` 检查在线显示器，若主显示器休眠或全部在线显示器休眠则返回 `true`；
+/// - 非 macOS 平台固定返回 `false`。
+pub fn is_display_asleep(display_id: Option<u32>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::is_display_asleep(display_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = display_id;
+        false
+    }
+}
+
+/// 查询当前 macOS 图形会话是否处于锁屏状态（`CGSSessionScreenIsLocked`）。
+///
+/// 非 macOS 平台固定返回 `false`。
+pub fn is_screen_locked() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::is_screen_locked()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// macOS IOKit 显示器唤醒用户活动声明的 RAII 守卫（`IOPMAssertionDeclareUserActivity`）。
+///
+/// 持有期间维持唤醒声明，`Drop` 时自动调用 `IOPMAssertionRelease` 释放，确保断开后系统可恢复正常熄屏策略。
+/// 非 macOS 平台为零开销空操作。
+#[derive(Debug)]
+pub struct DisplayWakeAssertion {
+    #[cfg(target_os = "macos")]
+    _inner: ffi::DisplayWakeAssertion,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for DisplayWakeAssertion {
+    fn drop(&mut self) {}
+}
+
+/// 若显示器处于熄屏/休眠状态，通过 IOKit `IOPMAssertionDeclareUserActivity` 唤醒亮屏并有界等待生效。
+///
+/// - 若显示器已唤醒（`!is_display_asleep(None)`），零延迟立即返回 `Ok(None)`；
+/// - 若已触发唤醒，返回 `Ok(Some(DisplayWakeAssertion))`（调用方在会话结束或不再需要时 Drop 释放）；
+/// - `max_wait` 会在内部封顶在安全上限（5 秒）内，按 50ms 步进轮询直至亮屏或超时；
+/// - 非 macOS 平台固定返回 `Ok(None)`。
+pub fn wake_display_if_asleep(
+    reason: &str,
+    max_wait: std::time::Duration,
+) -> Result<Option<DisplayWakeAssertion>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::wake_display_if_asleep(reason, max_wait)
+            .map(|opt| opt.map(|inner| DisplayWakeAssertion { _inner: inner }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (reason, max_wait);
+        Ok(None)
+    }
+}
+
 /// 在线显示器描述（物理屏或虚拟屏）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnlineDisplayInfo {
@@ -425,6 +493,37 @@ mod tests {
         promote_current_thread_qos();
         let activity = LatencyCriticalActivity::begin("RabbitControl Unit Test\0Check", true);
         drop(activity);
+    }
+
+    #[test]
+    fn display_wake_assertion_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<DisplayWakeAssertion>();
+    }
+
+    #[test]
+    fn display_sleep_and_lock_queries_are_safe_under_repeated_calls() {
+        for _ in 0..100 {
+            let _ = is_display_asleep(None);
+            let _ = is_screen_locked();
+        }
+    }
+
+    #[test]
+    fn wake_display_if_asleep_fast_path_when_awake() {
+        if !is_display_asleep(None) {
+            let start = std::time::Instant::now();
+            let guard = wake_display_if_asleep(
+                "RabbitControl Unit Test",
+                std::time::Duration::from_millis(500),
+            )
+            .expect("唤醒快路径不应返回错误");
+            assert!(guard.is_none(), "显示器已亮屏时应零延迟返回 Ok(None)");
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(100),
+                "亮屏快路径不应等待轮询"
+            );
+        }
     }
     use std::collections::HashSet;
 

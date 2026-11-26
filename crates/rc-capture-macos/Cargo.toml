@@ -34,3 +34,4 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-foundation = "0.3"
 objc2-screen-capture-kit = "0.3"
+tracing = { version = "0.1", default-features = false, features = ["std"] }

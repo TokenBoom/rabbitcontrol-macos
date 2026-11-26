@@ -197,6 +197,8 @@ pub struct ActiveSession<H = SessionHandle> {
     pub video_size: Option<(u32, u32)>,
     /// 当前活动会话是否已触发过 W4 持久化端口映射自动恢复。
     pub portmaps_restored: bool,
+    /// 最近一次收到的被控端锁屏与采集挂起状态 `(locked, capture_suspended)`（供晚挂载 S1 窗口同步）。
+    pub host_screen_state: Option<(bool, bool)>,
     /// 会话控制端元数据。
     pub meta: ActiveSessionMeta,
 }
@@ -213,6 +215,7 @@ impl<H> ActiveSession<H> {
             last_stage_frame: None,
             video_size: None,
             portmaps_restored: false,
+            host_screen_state: None,
             meta: ActiveSessionMeta::default(),
         }
     }
@@ -439,6 +442,7 @@ pub fn clear_session_snapshot_if_idle<H>(
 /// 读取当前活动会话的状态快照（U-H2 / U-H3）：
 /// - 若 `session_slot` 为 `None`，始终返回 `None`（绝不向新窗口返回旧会话的 `Ended`）；
 /// - 若存在活动会话，仅当快照代际号与当前 `active.id` 匹配时返回。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn current_session_snapshot<H>(
     session_slot: &Mutex<Option<ActiveSession<H>>>,
     snapshot_slot: &Mutex<Option<(u64, SessionUpdate)>>,
@@ -449,6 +453,32 @@ pub fn current_session_snapshot<H>(
     snap.as_ref()
         .filter(|(snap_sid, _)| *snap_sid == active.id)
         .map(|(_, upd)| upd.clone())
+}
+
+/// 在单次 `session -> last_session_update` 锁内原子读取当前活动会话的状态快照与缓存的被控端锁屏/挂起状态。
+///
+/// 若当前无活动会话或会话已进入 `disconnecting`，返回 `(None, None)`，避免双锁竞态或向已断开会话重放陈旧状态。
+pub fn current_session_snapshot_and_screen_state<H>(
+    session_slot: &Mutex<Option<ActiveSession<H>>>,
+    snapshot_slot: &Mutex<Option<(u64, SessionUpdate)>>,
+) -> (Option<SessionUpdate>, Option<(bool, bool)>) {
+    let guard = session_slot.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_ref() else {
+        return (None, None);
+    };
+    if active.disconnecting {
+        return (None, None);
+    }
+    let snap = snapshot_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(snap_sid, _)| *snap_sid == active.id)
+        .map(|(_, upd)| upd.clone());
+    let screen_state = active
+        .host_screen_state
+        .filter(|(locked, suspended)| *locked || *suspended);
+    (snap, screen_state)
 }
 
 /// 轮询器发射 `"session://update"` 与 W2/W3/W4 工具事件前复核代际号（U-H3 + H11）：
@@ -1760,6 +1790,48 @@ mod tests {
         assert!(
             should_emit_session_updates(&session_slot, 42, true),
             "槽位已清空且 saw_ended=true 时应允许发射本批次终态事件"
+        );
+    }
+
+    #[test]
+    fn current_session_snapshot_and_screen_state_atomic_guards() {
+        let session_slot: Mutex<Option<ActiveSession<FakeSessionHandle>>> = Mutex::new(None);
+        let snap_slot: Mutex<Option<(u64, SessionUpdate)>> = Mutex::new(None);
+
+        assert_eq!(
+            current_session_snapshot_and_screen_state(&session_slot, &snap_slot),
+            (None, None)
+        );
+
+        let mut active = ActiveSession::new(7, FakeSessionHandle::default(), false);
+        active.host_screen_state = Some((true, true));
+        *session_slot.lock().unwrap() = Some(active);
+
+        let connecting = SessionUpdate::Connecting {
+            phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+            watch_only: false,
+        };
+        record_session_update_locked(&snap_slot, 7, connecting.clone());
+        assert_eq!(
+            current_session_snapshot_and_screen_state(&session_slot, &snap_slot),
+            (Some(connecting.clone()), Some((true, true)))
+        );
+
+        // Once disconnecting=true, both snapshot and screen_state must be suppressed atomically.
+        session_slot.lock().unwrap().as_mut().unwrap().disconnecting = true;
+        assert_eq!(
+            current_session_snapshot_and_screen_state(&session_slot, &snap_slot),
+            (None, None)
+        );
+
+        // Non-locked & non-suspended state returns None for replay screen_state.
+        let mut active2 = ActiveSession::new(8, FakeSessionHandle::default(), false);
+        active2.host_screen_state = Some((false, false));
+        *session_slot.lock().unwrap() = Some(active2);
+        record_session_update_locked(&snap_slot, 8, connecting.clone());
+        assert_eq!(
+            current_session_snapshot_and_screen_state(&session_slot, &snap_slot),
+            (Some(connecting), None)
         );
     }
 }

@@ -328,6 +328,13 @@ body.is-tauri.has-video .sn-window.is-fullscreen .sn-stage {
   font-size: var(--size-secondary);
   line-height: 20px;
   text-align: center;
+  pointer-events: none;
+}
+
+body.is-tauri.has-video .sn-stage__hint:not([hidden]),
+body.is-tauri .sn-stage.has-video .sn-stage__hint:not([hidden]) {
+  background: var(--stage-scrim-offline);
+  color: var(--stage-fg);
 }
 
 .sn-stage__hint[hidden] {

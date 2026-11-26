@@ -9,7 +9,7 @@
 #![deny(unsafe_code)]
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1304,10 +1304,25 @@ pub async fn set_session_mtls_mode(
 }
 
 /// IPC 命令：拉取最近一次会话状态快照（Review M8 + U-H2 / U-H3：
-/// 无活动会话时恒返回 `None`，有活动会话时仅返回匹配当前代际号的快照）。
+/// 在单次 `session` 锁内校验 `!disconnecting` 与匹配 `sid`，同时原子取出缓存的被控端锁屏/挂起状态；
+/// 若处于锁屏或采集挂起态，则向 S1 窗口补发一次 `host_screen_state`）。
 #[tauri::command]
-pub fn session_snapshot(state: State<'_, AppState>) -> Option<SessionUpdate> {
-    state::current_session_snapshot(&state.session, &state.last_session_update)
+pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<SessionUpdate> {
+    let (snap, cached_screen_state) = state::current_session_snapshot_and_screen_state(
+        &state.session,
+        &state.last_session_update,
+    );
+    if let Some((locked, capture_suspended)) = cached_screen_state {
+        let _ = app.emit_to(
+            "session",
+            "session://update",
+            &SessionUpdate::HostScreenState {
+                locked,
+                capture_suspended,
+            },
+        );
+    }
+    snap
 }
 
 /// 兼容 `{ "type": "..." }`（规范）与 `{ "kind": "..." }`（历史别名）的会话控制命令反序列化包装。
@@ -1604,11 +1619,13 @@ pub(crate) fn start_host_service_with_policy(
             other => Err(format!("后台服务返回异常响应: {other:?}")),
         };
     }
-    let default_encrypt = state
-        .prefs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .default_encrypt_connection;
+    let (default_encrypt, file_transfer_dir) = {
+        let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            prefs.default_encrypt_connection,
+            prefs.resolved_file_transfer_dir(),
+        )
+    };
     let owner_verifier = build_owner_verifier(state);
     let mtls_config = build_session_mtls_bundle(state, None, None);
     let accept_mtls_lan = default_encrypt;
@@ -1618,6 +1635,7 @@ pub(crate) fn start_host_service_with_policy(
         handle.set_allow_remote_assist(allow_remote_assist);
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_config, accept_mtls_lan);
+        handle.set_file_transfer_dir(Some(file_transfer_dir));
         host.allow_remote_assist = allow_remote_assist;
     } else {
         let password = (!host.password.is_empty()).then(|| host.password.clone());
@@ -1636,6 +1654,7 @@ pub(crate) fn start_host_service_with_policy(
             mtls_config,
             accept_mtls_lan,
             forbid_passwordless_auto_approve: false,
+            file_transfer_dir: Some(file_transfer_dir),
         })?;
         host.allow_remote_assist = allow_remote_assist;
         let actual = handle.listen_addr();
@@ -3940,10 +3959,32 @@ fn active_session_tools(state: &AppState) -> Result<ToolClientHandle, String> {
 }
 
 /// 列举本机目录的纯同步实现（在 `spawn_blocking` 中执行，避免阻塞 UI 主线程）。
-fn file_list_local_inner(path: Option<String>) -> Result<LocalDirSnapshot, String> {
+///
+/// 当 `path` 为空时优先使用已配置的文件传输存储目录：
+/// - 若为默认目录且尚未创建，自动 `create_dir_all`；
+/// - 若存在且为目录则列举；
+/// - 若自定义目录已被外部删除或失效，优雅回退至 `rc_tools::default_home_dir()`。
+fn file_list_local_inner(
+    path: Option<String>,
+    configured_dir: Option<(&Path, bool)>,
+) -> Result<LocalDirSnapshot, String> {
     let target = match path {
         Some(p) if !p.trim().is_empty() => p,
-        _ => rc_tools::default_home_dir().to_string_lossy().into_owned(),
+        _ => {
+            let mut chosen: Option<PathBuf> = None;
+            if let Some((dir, is_default)) = configured_dir {
+                if is_default && !dir.exists() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if dir.is_dir() {
+                    chosen = Some(dir.to_path_buf());
+                }
+            }
+            chosen
+                .unwrap_or_else(rc_tools::default_home_dir)
+                .to_string_lossy()
+                .into_owned()
+        }
     };
     let (resolved, entries) = rc_tools::list_local_dir(&target)?;
     Ok(LocalDirSnapshot {
@@ -3965,9 +4006,14 @@ pub async fn file_list_local(
 ) -> Result<LocalDirSnapshot, String> {
     state.require_unlocked()?;
     state.require_authenticated()?;
-    tauri::async_runtime::spawn_blocking(move || file_list_local_inner(path))
-        .await
-        .map_err(|e| format!("列举本地目录任务异常：{e}"))?
+    let prefs = sync_prefs_from_disk_if_proxy(&state);
+    let transfer_dir = prefs.resolved_file_transfer_dir();
+    let is_default = prefs.is_default_file_transfer_dir();
+    tauri::async_runtime::spawn_blocking(move || {
+        file_list_local_inner(path, Some((&transfer_dir, is_default)))
+    })
+    .await
+    .map_err(|e| format!("列举本地目录任务异常：{e}"))?
 }
 
 /// IPC 命令：异步在本机指定父目录下创建新目录（`spawn_blocking`，无需活动远控会话即可工作）。
@@ -4109,9 +4155,55 @@ pub async fn file_download(
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
     let tools = active_session_tools(&state)?;
-    tauri::async_runtime::spawn_blocking(move || tools.file_download(&remote_path, &local_dir))
-        .await
-        .map_err(|e| format!("发起文件下载任务异常：{e}"))?
+    let fallback_dir = if local_dir.trim().is_empty() {
+        let prefs = sync_prefs_from_disk_if_proxy(&state);
+        Some((
+            prefs.resolved_file_transfer_dir(),
+            prefs.is_default_file_transfer_dir(),
+        ))
+    } else {
+        None
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let effective_dir = match fallback_dir {
+            Some((dir, is_default)) => {
+                if is_macos_package_bundle(&dir) {
+                    return Err(format!(
+                        "不能使用应用程序包或系统软件包作为存储路径：{}",
+                        dir.display()
+                    ));
+                }
+                if !dir.exists() {
+                    if is_default {
+                        std::fs::create_dir_all(&dir).map_err(|e| {
+                            format!("无法创建默认存储目录：{}（{e}）", dir.display())
+                        })?;
+                    } else {
+                        return Err("存储目录不存在或尚未挂载，请重新选择路径".to_string());
+                    }
+                }
+                let canonical = std::fs::canonicalize(&dir)
+                    .map_err(|e| format!("无法访问传输文件存储目录：{}（{e}）", dir.display()))?;
+                if is_macos_package_bundle(&canonical) {
+                    return Err(format!(
+                        "不能使用应用程序包或系统软件包作为存储路径：{}",
+                        canonical.display()
+                    ));
+                }
+                if !canonical.is_dir() {
+                    return Err(format!(
+                        "文件传输存储路径不是有效文件夹：{}",
+                        canonical.display()
+                    ));
+                }
+                canonical.to_string_lossy().into_owned()
+            }
+            None => local_dir,
+        };
+        tools.file_download(&remote_path, &effective_dir)
+    })
+    .await
+    .map_err(|e| format!("发起文件下载任务异常：{e}"))?
 }
 
 /// IPC 命令：取消进行中的文件传输任务（H12）。
@@ -4488,12 +4580,16 @@ pub fn portmap_delete(id: u64, state: State<'_, AppState>) -> Result<(), String>
 // 常规偏好、系统级后台服务托管与菜单栏整体退出 IPC 命令
 // ─────────────────────────────────────────────────────────────────
 
-/// 常规窗口行为偏好快照（IPC `camelCase`）。
+/// 常规窗口行为与文件存储路径偏好快照（IPC `camelCase`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneralPrefsSnapshot {
     /// 关闭主窗口时是否隐藏到顶部菜单栏而非退出程序。
     pub close_to_tray: bool,
+    /// 当前生效的 W2 文件传输存储目录路径。
+    pub file_transfer_dir: String,
+    /// 当前文件传输存储路径是否为平台默认目录。
+    pub file_transfer_dir_is_default: bool,
 }
 
 /// 常规偏好增量更新补丁（IPC `camelCase`）。
@@ -4502,13 +4598,178 @@ pub struct GeneralPrefsSnapshot {
 pub struct GeneralPrefsPatch {
     /// 关闭主窗口时是否隐藏到顶部菜单栏。
     pub close_to_tray: Option<bool>,
+    /// W2 文件传输存储目录（`Some("")` 表示恢复默认目录）。
+    pub file_transfer_dir: Option<String>,
 }
 
-/// IPC 命令：读取常规偏好（关闭窗口行为等）。
+fn general_prefs_snapshot_from_prefs(prefs: &AppPrefs) -> GeneralPrefsSnapshot {
+    GeneralPrefsSnapshot {
+        close_to_tray: prefs.close_to_tray,
+        file_transfer_dir: prefs
+            .resolved_file_transfer_dir()
+            .to_string_lossy()
+            .into_owned(),
+        file_transfer_dir_is_default: prefs.is_default_file_transfer_dir(),
+    }
+}
+
+/// macOS 软件包/应用包扩展名黑名单：禁止作为传输文件存储路径或被 `/usr/bin/open` 意外执行。
+const MACOS_PACKAGE_BUNDLE_EXTS: &[&str] = &[
+    "app",
+    "bundle",
+    "pkg",
+    "mpkg",
+    "scptd",
+    "workflow",
+    "action",
+    "prefpane",
+    "saver",
+    "framework",
+    "plugin",
+    "appex",
+    "xpc",
+    "kext",
+];
+
+/// 判断给定路径是否具有 macOS 应用程序包或系统软件包扩展名（大小写不敏感）。
+fn is_macos_package_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            MACOS_PACKAGE_BUNDLE_EXTS
+                .iter()
+                .any(|blocked| ext.eq_ignore_ascii_case(blocked))
+        })
+}
+
+/// 校验文件传输存储目录存在、为普通目录（非 macOS 软件包/符号链接指向包）且具备实际写入权限
+/// （不覆盖既有文件，自动清理探针文件）。
+fn validate_transfer_dir_writable(dir: &Path, create_if_missing: bool) -> Result<(), String> {
+    if is_macos_package_bundle(dir) {
+        return Err(format!(
+            "不能选择应用程序包或系统软件包作为存储路径：{}",
+            dir.display()
+        ));
+    }
+    if !dir.exists() {
+        if create_if_missing {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("无法创建默认存储目录：{}（{e}）", dir.display()))?;
+        } else {
+            return Err(format!("所选目录不存在：{}", dir.display()));
+        }
+    }
+    let canonical = std::fs::canonicalize(dir)
+        .map_err(|e| format!("无法访问所选目录：{}（{e}）", dir.display()))?;
+    if is_macos_package_bundle(&canonical) {
+        return Err(format!(
+            "不能选择应用程序包或系统软件包作为存储路径：{}",
+            canonical.display()
+        ));
+    }
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| format!("无法访问所选目录：{}（{e}）", canonical.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("所选路径不是有效文件夹：{}", canonical.display()));
+    }
+
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe_path = canonical.join(format!(
+        ".rc-write-probe-{}-{nanos}-{seq}",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe_path);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "所选文件夹不可写，请检查目录权限：{}（{e}）",
+            canonical.display()
+        )),
+    }
+}
+
+/// 判断 `/usr/bin/osascript` 的失败输出是否属于用户主动取消对话框。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn is_osascript_user_canceled(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    stderr.contains("(-128)") || lower.contains("user canceled") || lower.contains("user cancelled")
+}
+
+/// 规范化文件夹选择器返回的 POSIX 路径（去除首尾换行及除根 `/` 外的多余末尾斜杠）。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn normalize_picked_dir_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_end_matches(&['\r', '\n'][..]).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    if stripped.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+fn save_general_prefs_to_path(
+    state: &AppState,
+    patch: GeneralPrefsPatch,
+    prefs_path: &Path,
+) -> Result<GeneralPrefsSnapshot, String> {
+    let _io = state
+        .prefs_io_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _file_lock = config_paths::acquire_file_lock(prefs_path, Duration::from_secs(3));
+    let mut next = {
+        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(prefs_path);
+        }
+        prefs.clone()
+    };
+
+    if let Some(close_to_tray) = patch.close_to_tray {
+        next.close_to_tray = close_to_tray;
+    }
+
+    let mut updated_transfer_dir: Option<PathBuf> = None;
+    if let Some(raw_dir) = patch.file_transfer_dir {
+        let resolved = next.apply_file_transfer_dir(Some(raw_dir))?;
+        let is_default = next.is_default_file_transfer_dir();
+        validate_transfer_dir_writable(&resolved, is_default)?;
+        updated_transfer_dir = Some(resolved);
+    }
+
+    app_prefs::save_to_path(prefs_path, &next)?;
+    *state.prefs.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
+
+    if let Some(resolved) = updated_transfer_dir {
+        let host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = host.handle.as_ref() {
+            handle.set_file_transfer_dir(Some(resolved));
+        }
+    }
+
+    Ok(general_prefs_snapshot_from_prefs(&next))
+}
+
+/// IPC 命令：读取常规偏好（关闭窗口行为、文件传输存储路径等）。
 #[tauri::command]
 pub fn get_general_prefs(state: State<'_, AppState>) -> GeneralPrefsSnapshot {
-    let close_to_tray = sync_prefs_from_disk_if_proxy(&state).close_to_tray;
-    GeneralPrefsSnapshot { close_to_tray }
+    let prefs = sync_prefs_from_disk_if_proxy(&state);
+    general_prefs_snapshot_from_prefs(&prefs)
 }
 
 /// IPC 命令：保存常规偏好至 `prefs.json`。
@@ -4518,31 +4779,134 @@ pub fn save_general_prefs(
     state: State<'_, AppState>,
 ) -> Result<GeneralPrefsSnapshot, String> {
     state.require_unlocked()?;
-    let prefs_path = app_prefs::default_prefs_path();
-    let _io = state
-        .prefs_io_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
-    let (prev, next) = {
-        let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = prefs.clone();
-        if state.is_service_proxy() && prefs_path.exists() {
-            *prefs = app_prefs::load_from_path(&prefs_path);
-        }
-        if let Some(close_to_tray) = patch.close_to_tray {
-            prefs.close_to_tray = close_to_tray;
-        }
-        (prev, prefs.clone())
-    };
-    if let Err(err) = app_prefs::save_to_path(&prefs_path, &next) {
-        *state.prefs.lock().unwrap_or_else(|e| e.into_inner()) = prev;
-        return Err(err);
-    }
+    let snap = save_general_prefs_to_path(&state, patch, &app_prefs::default_prefs_path())?;
     notify_background_services_reload(&state, false);
-    Ok(GeneralPrefsSnapshot {
-        close_to_tray: next.close_to_tray,
+    Ok(snap)
+}
+
+fn pick_transfer_storage_dir_blocking(current_dir: &Path) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"on run argv
+set defaultLoc to missing value
+if (count of argv) >= 1 then
+    try
+        set defaultLoc to (POSIX file (item 1 of argv)) as alias
+    on error
+        set defaultLoc to missing value
+    end try
+end if
+if defaultLoc is not missing value then
+    set chosenFolder to choose folder with prompt "选择传输文件存储路径" default location defaultLoc
+else
+    set chosenFolder to choose folder with prompt "选择传输文件存储路径"
+end if
+return POSIX path of chosenFolder
+end run"#;
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.arg("-e").arg(script);
+        if current_dir.is_dir() {
+            cmd.arg("--").arg(current_dir);
+        }
+        let output = cmd
+            .output()
+            .map_err(|e| format!("启动系统文件夹选择器失败：{e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_osascript_user_canceled(&stderr) {
+                return Ok(None);
+            }
+            let msg = stderr.trim();
+            return Err(if msg.is_empty() {
+                "打开系统文件夹选择器失败".to_string()
+            } else {
+                format!("打开系统文件夹选择器失败：{msg}")
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(normalize_picked_dir_path(&stdout))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = current_dir;
+        Err("当前平台暂不支持原生文件夹选择器".to_string())
+    }
+}
+
+/// IPC 命令：弹出系统原生文件夹选择框选择 W2 传输文件存储路径；取消时返回 `Ok(None)`。
+#[tauri::command]
+pub async fn pick_transfer_storage_dir(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    state.require_unlocked()?;
+    let current_dir = sync_prefs_from_disk_if_proxy(&state).resolved_file_transfer_dir();
+    tauri::async_runtime::spawn_blocking(move || pick_transfer_storage_dir_blocking(&current_dir))
+        .await
+        .map_err(|e| format!("打开文件夹选择器任务异常：{e}"))?
+}
+
+fn open_transfer_storage_dir_blocking(dir: &Path, is_default: bool) -> Result<(), String> {
+    if is_macos_package_bundle(dir) {
+        return Err(format!(
+            "不能打开应用程序包或系统软件包路径：{}",
+            dir.display()
+        ));
+    }
+    if !dir.exists() {
+        if is_default {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("无法创建默认存储目录：{}（{e}）", dir.display()))?;
+        } else {
+            return Err("存储目录不存在或尚未挂载，请重新选择路径".to_string());
+        }
+    }
+    let canonical = std::fs::canonicalize(dir)
+        .map_err(|e| format!("无法访问存储目录：{}（{e}）", dir.display()))?;
+    if is_macos_package_bundle(&canonical) {
+        return Err(format!(
+            "不能打开应用程序包或系统软件包路径：{}",
+            canonical.display()
+        ));
+    }
+    if !canonical.is_dir() {
+        return Err(format!("存储路径不是有效文件夹：{}", canonical.display()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/open")
+            .args(["-a", "Finder", "--"])
+            .arg(&canonical)
+            .status()
+            .map_err(|e| format!("在访达中打开文件夹失败：{e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "在访达中打开文件夹失败（退出码 {:?}）",
+                status.code()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = canonical;
+        Err("当前平台暂不支持打开系统文件夹".to_string())
+    }
+}
+
+/// IPC 命令：在访达中打开当前生效的 W2 传输文件存储目录（默认目录不存在时自动创建，自定义目录缺失时返回可读错误）。
+#[tauri::command]
+pub async fn open_transfer_storage_dir(state: State<'_, AppState>) -> Result<(), String> {
+    state.require_unlocked()?;
+    let prefs = sync_prefs_from_disk_if_proxy(&state);
+    let dir = prefs.resolved_file_transfer_dir();
+    let is_default = prefs.is_default_file_transfer_dir();
+    tauri::async_runtime::spawn_blocking(move || {
+        open_transfer_storage_dir_blocking(&dir, is_default)
     })
+    .await
+    .map_err(|e| format!("打开存储目录任务异常：{e}"))?
 }
 
 /// IPC 命令：查询后台系统服务（LaunchDaemon / LaunchAgent / FileVault）安装与运行状态。
@@ -6698,7 +7062,7 @@ mod tests {
             .expect("file_mkdir_local should succeed without active session");
         assert!(created.ends_with("sub_folder"));
 
-        let listed = file_list_local_inner(Some(parent))
+        let listed = file_list_local_inner(Some(parent), None)
             .expect("file_list_local should succeed without active session");
         assert!(listed
             .entries
@@ -7320,5 +7684,267 @@ mod tests {
                 build: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn general_prefs_file_transfer_dir_save_validate_and_fallback() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-general-transfer-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let custom_dir = base.join("custom_downloads");
+        let missing_dir = base.join("does_not_exist");
+        let regular_file = base.join("not_a_dir.txt");
+        let prefs_path = base.join("prefs.json");
+        std::fs::create_dir_all(&custom_dir).expect("create custom_dir");
+        std::fs::write(&regular_file, b"hello").expect("create regular_file");
+
+        let state = AppState::new_for_test();
+        let initial = general_prefs_snapshot_from_prefs(&state.prefs.lock().unwrap());
+        assert!(initial.file_transfer_dir_is_default);
+        assert!(!initial.file_transfer_dir.is_empty());
+
+        // 1) Custom writable directory persists cleanly.
+        let saved = save_general_prefs_to_path(
+            &state,
+            GeneralPrefsPatch {
+                close_to_tray: Some(false),
+                file_transfer_dir: Some(format!("{}/", custom_dir.display())),
+            },
+            &prefs_path,
+        )
+        .expect("saving writable custom dir should succeed");
+        assert!(!saved.close_to_tray);
+        assert!(!saved.file_transfer_dir_is_default);
+        assert_eq!(saved.file_transfer_dir, custom_dir.to_string_lossy());
+        let on_disk = app_prefs::load_from_path(&prefs_path);
+        assert_eq!(on_disk.resolved_file_transfer_dir(), custom_dir);
+        assert!(!on_disk.close_to_tray);
+
+        // 2) Missing custom directory is rejected without modifying prefs.json or state.prefs.
+        let err_missing = save_general_prefs_to_path(
+            &state,
+            GeneralPrefsPatch {
+                close_to_tray: Some(true),
+                file_transfer_dir: Some(missing_dir.to_string_lossy().into_owned()),
+            },
+            &prefs_path,
+        )
+        .unwrap_err();
+        assert!(
+            err_missing.contains("不存在"),
+            "unexpected error: {err_missing}"
+        );
+        assert_eq!(
+            state.prefs.lock().unwrap().resolved_file_transfer_dir(),
+            custom_dir
+        );
+        assert!(!app_prefs::load_from_path(&prefs_path).close_to_tray);
+
+        // 3) Regular file path is rejected without modifying prefs.json.
+        let err_file = save_general_prefs_to_path(
+            &state,
+            GeneralPrefsPatch {
+                close_to_tray: None,
+                file_transfer_dir: Some(regular_file.to_string_lossy().into_owned()),
+            },
+            &prefs_path,
+        )
+        .unwrap_err();
+        assert!(
+            err_file.contains("不是有效文件夹"),
+            "unexpected error: {err_file}"
+        );
+        assert_eq!(
+            app_prefs::load_from_path(&prefs_path).resolved_file_transfer_dir(),
+            custom_dir
+        );
+
+        // 4) Empty string resets back to default directory.
+        let reset = save_general_prefs_to_path(
+            &state,
+            GeneralPrefsPatch {
+                close_to_tray: None,
+                file_transfer_dir: Some(String::new()),
+            },
+            &prefs_path,
+        )
+        .expect("resetting file_transfer_dir to default should succeed");
+        assert!(reset.file_transfer_dir_is_default);
+        assert_eq!(
+            reset.file_transfer_dir,
+            app_prefs::default_file_transfer_dir().to_string_lossy()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_transfer_dir_writable_creates_default_and_cleans_probe() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-validate-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let auto_dir = base.join("default_nested/Download");
+        assert!(!auto_dir.exists());
+
+        // Missing non-default must fail without creating.
+        assert!(validate_transfer_dir_writable(&auto_dir, false).is_err());
+        assert!(!auto_dir.exists());
+
+        // Missing default auto-creates, verifies writability, and leaves no probe file behind.
+        validate_transfer_dir_writable(&auto_dir, true).expect("default dir should auto-create");
+        assert!(auto_dir.is_dir());
+        let leftover: Vec<_> = std::fs::read_dir(&auto_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "probe file must be cleaned up, found: {leftover:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn file_list_local_inner_resolves_configured_default_and_falls_back_when_deleted() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-list-local-default-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let default_dir = base.join("auto_default_download");
+        let custom_dir = base.join("custom_folder");
+        std::fs::create_dir_all(&custom_dir).expect("create custom_dir");
+        std::fs::write(custom_dir.join("sample.txt"), b"ok").expect("create sample file");
+
+        // 1) Default missing dir is auto-created and listed when path is None / whitespace.
+        let listed_default = file_list_local_inner(None, Some((&default_dir, true)))
+            .expect("missing default dir should be auto-created and listed");
+        assert!(default_dir.is_dir());
+        assert_eq!(
+            std::fs::canonicalize(&listed_default.path).unwrap(),
+            std::fs::canonicalize(&default_dir).unwrap()
+        );
+
+        // 2) Existing custom dir is listed when path is empty/whitespace.
+        let listed_custom =
+            file_list_local_inner(Some("   ".to_string()), Some((&custom_dir, false)))
+                .expect("existing custom dir should be listed");
+        assert!(listed_custom.entries.iter().any(|e| e.name == "sample.txt"));
+
+        // 3) Externally deleted custom dir gracefully falls back to default_home_dir().
+        let deleted_custom = base.join("deleted_custom");
+        let listed_fallback = file_list_local_inner(None, Some((&deleted_custom, false)))
+            .expect("deleted custom dir should fall back to home dir");
+        assert!(!deleted_custom.exists());
+        assert_eq!(
+            std::fs::canonicalize(&listed_fallback.path).unwrap(),
+            std::fs::canonicalize(rc_tools::default_home_dir()).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn osascript_cancel_detection_and_path_normalization_helpers() {
+        assert!(is_osascript_user_canceled(
+            "execution error: User canceled. (-128)"
+        ));
+        assert!(is_osascript_user_canceled("22:55: execution error: (-128)"));
+        assert!(is_osascript_user_canceled("User Cancelled by operator"));
+        assert!(!is_osascript_user_canceled(
+            "execution error: /Volumes/disk-128/Downloads wasn't found. (-43)"
+        ));
+        assert!(!is_osascript_user_canceled(
+            "execution error: File wasn't found. (-43)"
+        ));
+        assert!(!is_osascript_user_canceled(""));
+
+        assert_eq!(
+            normalize_picked_dir_path("/Users/demo/Downloads/\n"),
+            Some("/Users/demo/Downloads".to_string())
+        );
+        assert_eq!(
+            normalize_picked_dir_path("/Users/demo/My Folder///\r\n"),
+            Some("/Users/demo/My Folder".to_string())
+        );
+        assert_eq!(normalize_picked_dir_path("/\n"), Some("/".to_string()));
+        assert_eq!(normalize_picked_dir_path("///\n"), Some("/".to_string()));
+        assert_eq!(normalize_picked_dir_path("   \n"), None);
+    }
+
+    #[test]
+    fn macos_package_bundle_rejection_and_open_missing_custom_dir() {
+        assert!(is_macos_package_bundle(Path::new(
+            "/Applications/Safari.app"
+        )));
+        assert!(is_macos_package_bundle(Path::new("/Applications/Demo.APP")));
+        assert!(is_macos_package_bundle(Path::new("/tmp/Installer.Pkg")));
+        assert!(is_macos_package_bundle(Path::new("/tmp/My.workflow")));
+        assert!(is_macos_package_bundle(Path::new("/tmp/Test.scptd")));
+        assert!(is_macos_package_bundle(Path::new("/tmp/Ext.appex")));
+        assert!(!is_macos_package_bundle(Path::new("/Users/demo/Downloads")));
+        assert!(!is_macos_package_bundle(Path::new("/Users/demo/app")));
+
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-bundle-guard-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let fake_app = base.join("Fake.app");
+        let missing_custom = base.join("unmounted_volume");
+        std::fs::create_dir_all(&fake_app).expect("create fake .app dir");
+
+        let val_err = validate_transfer_dir_writable(&fake_app, false).unwrap_err();
+        assert!(val_err.contains("应用程序包"), "unexpected err: {val_err}");
+
+        let open_bundle_err = open_transfer_storage_dir_blocking(&fake_app, false).unwrap_err();
+        assert!(
+            open_bundle_err.contains("应用程序包"),
+            "unexpected err: {open_bundle_err}"
+        );
+
+        #[cfg(unix)]
+        {
+            let link_to_app = base.join("DownloadsLink");
+            std::os::unix::fs::symlink(&fake_app, &link_to_app).expect("create symlink to .app");
+            let sym_val_err = validate_transfer_dir_writable(&link_to_app, false).unwrap_err();
+            assert!(
+                sym_val_err.contains("应用程序包"),
+                "symlink to .app must be rejected: {sym_val_err}"
+            );
+            let sym_open_err = open_transfer_storage_dir_blocking(&link_to_app, false).unwrap_err();
+            assert!(
+                sym_open_err.contains("应用程序包"),
+                "symlink to .app must not be opened: {sym_open_err}"
+            );
+        }
+
+        // Missing custom directory must return error without creating it.
+        let open_missing_err =
+            open_transfer_storage_dir_blocking(&missing_custom, false).unwrap_err();
+        assert!(
+            open_missing_err.contains("不存在"),
+            "unexpected err: {open_missing_err}"
+        );
+        assert!(!missing_custom.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

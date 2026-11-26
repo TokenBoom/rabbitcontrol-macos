@@ -151,23 +151,11 @@
           <div class="rc-setting-row">
             <div class="rc-setting-row__main">
               <div class="rc-setting-row__title">移动设备传输文件存储路径</div>
-              <div class="rc-setting-row__path" id="opt-download-path">/Users/yii/Library/Application Support/RabbitControl/Download</div>
+              <div class="rc-setting-row__path" id="opt-download-path">正在加载…</div>
             </div>
             <div class="rc-setting-row__control">
-              <button type="button" class="rc-btn rc-btn--secondary" data-toast="功能开发中">修改路径</button>
-              <button type="button" class="rc-btn rc-btn--secondary" data-toast="功能开发中">打开文件夹</button>
-            </div>
-          </div>
-        </section>
-
-        <!-- G4 -->
-        <section class="rc-group" aria-label="账户">
-          <div class="rc-setting-row">
-            <div class="rc-setting-row__main">
-              <div class="rc-setting-row__title">实名认证</div>
-            </div>
-            <div class="rc-setting-row__control">
-              <span class="rc-setting-row__static">已通过账号实名认证</span>
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-change-download-path">修改路径</button>
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-open-download-path">打开文件夹</button>
             </div>
           </div>
         </section>
@@ -436,13 +424,24 @@
         document.getElementById(id).addEventListener("change", save);
       });
 
-      /* ── 常规：关闭窗口行为（Tauri 持久化 prefs.json）+ 系统后台服务托管 ── */
+      /* ── 常规：关闭窗口行为与文件传输存储路径（Tauri 持久化 prefs.json）+ 系统后台服务托管 ── */
       var optCloseWindow = document.getElementById("opt-close-window");
+      var optDownloadPath = document.getElementById("opt-download-path");
+      var btnChangeDownloadPath = document.getElementById("btn-change-download-path");
+      var btnOpenDownloadPath = document.getElementById("btn-open-download-path");
       var rowCloseWindowItem = document.getElementById("row-close-window-item");
       var descCloseWindow = document.getElementById("desc-close-window");
       var groupSystemService = document.getElementById("group-system-service");
       var serviceProxyLocked = false;
       var loadedCloseToTray = null;
+      var pickingDownloadPath = false;
+
+      function applyDownloadPathText(path) {
+        if (!optDownloadPath) return;
+        var text = typeof path === "string" && path.trim() ? path.trim() : "未配置";
+        optDownloadPath.textContent = text;
+        optDownloadPath.title = text;
+      }
 
       function syncCloseWindowAvailability(rep) {
         var unsupported = Boolean(rep && rep.supported === false);
@@ -471,33 +470,87 @@
         }
       }
 
-      if (IS_TAURI && optCloseWindow && typeof Bridge.getGeneralPrefs === "function") {
+      if (IS_TAURI && typeof Bridge.getGeneralPrefs === "function") {
         Bridge.getGeneralPrefs()
           .then(function (gp) {
-            if (gp && typeof gp.closeToTray === "boolean") {
+            if (gp && optCloseWindow && typeof gp.closeToTray === "boolean") {
               loadedCloseToTray = gp.closeToTray;
               if (!serviceProxyLocked) {
                 optCloseWindow.value = gp.closeToTray ? "tray" : "quit";
                 save();
               }
             }
+            if (gp && typeof gp.fileTransferDir === "string") {
+              applyDownloadPathText(gp.fileTransferDir);
+            }
           })
-          .catch(function () {});
-        optCloseWindow.addEventListener("change", function () {
-          if (serviceProxyLocked) {
-            optCloseWindow.value = "tray";
+          .catch(function () {
+            applyDownloadPathText("读取失败");
+          });
+        if (optCloseWindow) {
+          optCloseWindow.addEventListener("change", function () {
+            if (serviceProxyLocked) {
+              optCloseWindow.value = "tray";
+              return;
+            }
+            if (typeof Bridge.saveGeneralPrefs !== "function") return;
+            var closeToTray = optCloseWindow.value !== "quit";
+            Bridge.saveGeneralPrefs({ closeToTray: closeToTray })
+              .then(function () {
+                loadedCloseToTray = closeToTray;
+                toast(closeToTray ? "关闭主窗口时将隐藏到顶部菜单栏" : "关闭主窗口时将退出主程序");
+              })
+              .catch(function (err) {
+                toast("保存窗口行为失败：" + String(err));
+              });
+          });
+        }
+      } else {
+        applyDownloadPathText("~/Library/Application Support/RabbitControl/Download");
+      }
+
+      if (btnChangeDownloadPath) {
+        btnChangeDownloadPath.addEventListener("click", function () {
+          if (pickingDownloadPath) return;
+          if (
+            !IS_TAURI ||
+            typeof Bridge.pickTransferStorageDir !== "function" ||
+            typeof Bridge.saveGeneralPrefs !== "function"
+          ) {
+            toast("浏览器预览模式，请在桌面端修改存储路径");
             return;
           }
-          if (typeof Bridge.saveGeneralPrefs !== "function") return;
-          var closeToTray = optCloseWindow.value !== "quit";
-          Bridge.saveGeneralPrefs({ closeToTray: closeToTray })
-            .then(function () {
-              loadedCloseToTray = closeToTray;
-              toast(closeToTray ? "关闭主窗口时将隐藏到顶部菜单栏" : "关闭主窗口时将退出主程序");
+          pickingDownloadPath = true;
+          btnChangeDownloadPath.disabled = true;
+          Bridge.pickTransferStorageDir()
+            .then(function (picked) {
+              if (typeof picked !== "string" || !picked.trim()) {
+                return null;
+              }
+              return Bridge.saveGeneralPrefs({ fileTransferDir: picked }).then(function (saved) {
+                applyDownloadPathText((saved && saved.fileTransferDir) || picked);
+                toast("已更新传输文件存储路径");
+              });
             })
             .catch(function (err) {
-              toast("保存窗口行为失败：" + String(err));
+              toast("修改存储路径失败：" + String(err));
+            })
+            .then(function () {
+              pickingDownloadPath = false;
+              btnChangeDownloadPath.disabled = false;
             });
+        });
+      }
+
+      if (btnOpenDownloadPath) {
+        btnOpenDownloadPath.addEventListener("click", function () {
+          if (!IS_TAURI || typeof Bridge.openTransferStorageDir !== "function") {
+            toast("浏览器预览模式，请在桌面端打开文件夹");
+            return;
+          }
+          Bridge.openTransferStorageDir().catch(function (err) {
+            toast("打开文件夹失败：" + String(err));
+          });
         });
       }
 
@@ -1100,13 +1153,6 @@
           }
         });
       }
-
-      /* ── Toast 占位交互（修改路径 / 打开文件夹）────────────── */
-      Array.prototype.forEach.call(document.querySelectorAll("[data-toast]"), function (btn) {
-        btn.addEventListener("click", function () {
-          toast(btn.getAttribute("data-toast"));
-        });
-      });
 
       /* ── 交通灯关闭（浏览器预览时关闭本窗口；Tauri 下由原生按钮负责）── */
       var closeDot = document.querySelector("[data-rc-close]");

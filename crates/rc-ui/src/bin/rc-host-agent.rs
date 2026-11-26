@@ -609,6 +609,7 @@ impl AgentInner {
         self.degraded_permissions = false;
         let mtls_bundle = self.build_mtls_bundle();
         let accept_mtls_lan = self.prefs.default_encrypt_connection;
+        let file_transfer_dir = Some(self.prefs.resolved_file_transfer_dir());
 
         if let Some(ref host) = self.host {
             if !allow_remote_assist {
@@ -619,6 +620,7 @@ impl AgentInner {
             host.set_allow_remote_assist(allow_remote_assist);
             host.set_owner_verifier(owner_verifier);
             host.set_mtls_config(mtls_bundle, accept_mtls_lan);
+            host.set_file_transfer_dir(file_transfer_dir);
             self.sync_lan_advertising();
             return Ok(None);
         }
@@ -646,6 +648,7 @@ impl AgentInner {
             mtls_config: mtls_bundle,
             accept_mtls_lan,
             forbid_passwordless_auto_approve: self.session_type == ServiceSessionType::LoginWindow,
+            file_transfer_dir,
         };
 
         match HostHandle::spawn(cfg) {
@@ -774,6 +777,7 @@ impl AgentInner {
                 pw_opt,
                 self.session_type != ServiceSessionType::LoginWindow && !self.custom_password,
             );
+            running_host.set_file_transfer_dir(Some(self.prefs.resolved_file_transfer_dir()));
         }
         retired
     }

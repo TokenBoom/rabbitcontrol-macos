@@ -3494,6 +3494,37 @@
       var endedCloseTimer = 0;
       var sessionLifecycleState = 'idle'; /* idle | connecting | active | ended */
       var hasHardwareVideo = false;
+      var hostScreenLocked = false;
+      var hostCaptureSuspended = false;
+      var hostScreenStateReceivedWhilePending = false;
+      var degradedVideoNotice = false;
+      function syncStageHintForHostScreenState() {
+        if (!stageHintEl) return;
+        if (
+          sessionSwitchingPending ||
+          sessionLifecycleState === 'connecting' ||
+          sessionLifecycleState === 'ended'
+        ) {
+          return;
+        }
+        if (sessionLifecycleState !== 'active') return;
+        if (hostScreenLocked) {
+          stageHintEl.hidden = false;
+          stageHintEl.textContent = '被控端已锁屏，解锁后将自动恢复画面';
+          return;
+        }
+        if (hostCaptureSuspended) {
+          stageHintEl.hidden = false;
+          stageHintEl.textContent = '正在唤醒被控端显示器并恢复画面…';
+          return;
+        }
+        if (degradedVideoNotice) {
+          stageHintEl.hidden = false;
+          stageHintEl.textContent = '硬件视频渲染不可用（当前为降级模式）';
+          return;
+        }
+        stageHintEl.hidden = true;
+      }
       function setHasVideo(active) {
         var on = Boolean(active);
         document.body.classList.toggle('has-video', on);
@@ -3547,10 +3578,16 @@
       function isNormalEndReason(reason) {
         return isUserDisconnectReason(reason) || reason === '会话已结束';
       }
-      function resetSessionControlsForNewSession() {
+      function resetSessionControlsForNewSession(preserveHostScreenState) {
         remoteAudioMuted = false;
         displaysRequested = false;
         initialSessionPrefsApplied = false;
+        if (!preserveHostScreenState) {
+          hostScreenLocked = false;
+          hostCaptureSuspended = false;
+          hostScreenStateReceivedWhilePending = false;
+        }
+        degradedVideoNotice = false;
         displaysState = {
           displays: [],
           activeDisplayId: 0
@@ -3603,8 +3640,12 @@
         var data = upd.data || {};
         if (upd.kind === 'connecting') {
           if (sessionLifecycleState !== 'connecting') {
-            resetSessionControlsForNewSession();
+            resetSessionControlsForNewSession(false);
           }
+          hostScreenLocked = false;
+          hostCaptureSuspended = false;
+          hostScreenStateReceivedWhilePending = false;
+          degradedVideoNotice = false;
           sessionLifecycleState = 'connecting';
           cancelSessionSwitchTimer();
           seenNegotiated = false;
@@ -3626,8 +3667,9 @@
         }
         if (upd.kind === 'negotiated') {
           if (sessionLifecycleState === 'ended') {
-            resetSessionControlsForNewSession();
+            resetSessionControlsForNewSession(hostScreenStateReceivedWhilePending);
           }
+          hostScreenStateReceivedWhilePending = false;
           sessionLifecycleState = 'active';
           sessionSwitchingPending = false;
           sessionSwitchAttempts = 0;
@@ -3665,14 +3707,8 @@
           var backendStr = typeof data.backend === 'string' ? data.backend : '';
           hasHardwareVideo = backendStr.indexOf('metal') !== -1;
           setHasVideo(hasHardwareVideo);
-          if (stageHintEl) {
-            if (!hasHardwareVideo && backendStr.indexOf('降级') !== -1) {
-              stageHintEl.hidden = false;
-              stageHintEl.textContent = '硬件视频渲染不可用（当前为降级模式）';
-            } else {
-              stageHintEl.hidden = true;
-            }
-          }
+          degradedVideoNotice = !hasHardwareVideo && backendStr.indexOf('降级') !== -1;
+          syncStageHintForHostScreenState();
           var negW = Number(data.width);
           var negH = Number(data.height);
           var negFps = Number(data.fps);
@@ -3797,7 +3833,17 @@
           }
           return;
         }
+        if (upd.kind === 'host_screen_state') {
+          hostScreenLocked = Boolean(data.locked);
+          hostCaptureSuspended = Boolean(data.capture_suspended);
+          if (sessionLifecycleState !== 'active') {
+            hostScreenStateReceivedWhilePending = true;
+          }
+          syncStageHintForHostScreenState();
+          return;
+        }
         if (upd.kind === 'display_config') {
+          hostScreenStateReceivedWhilePending = false;
           sessionLifecycleState = 'active';
           cancelEndedCloseTimer();
           stopLocalTicker();
@@ -3806,9 +3852,7 @@
             setHasVideo(true);
             reportStageRect();
           }
-          if (stageHintEl && (hasHardwareVideo || !seenNegotiated)) {
-            stageHintEl.hidden = true;
-          }
+          syncStageHintForHostScreenState();
           var cfgW = Number(data.width);
           var cfgH = Number(data.height);
           var cfgFps = Number(data.fps);
@@ -3901,6 +3945,7 @@
           return;
         }
         if (upd.kind === 'hud') {
+          hostScreenStateReceivedWhilePending = false;
           sessionLifecycleState = 'active';
           cancelEndedCloseTimer();
           stopLocalTicker();
@@ -3912,9 +3957,7 @@
           } else if (hasHardwareVideo) {
             setHasVideo(true);
           }
-          if (stageHintEl && (hasHardwareVideo || !seenNegotiated)) {
-            stageHintEl.hidden = true;
-          }
+          syncStageHintForHostScreenState();
           if (
             streamState.width === 0 &&
             data.resolution &&
@@ -3951,6 +3994,10 @@
           sessionLifecycleState = 'ended';
           seenNegotiated = false;
           hasHardwareVideo = false;
+          hostScreenLocked = false;
+          hostCaptureSuspended = false;
+          hostScreenStateReceivedWhilePending = false;
+          degradedVideoNotice = false;
           setHasVideo(false);
           realSessionActive = false;
           if (relayEl) {

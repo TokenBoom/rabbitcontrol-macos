@@ -78,6 +78,13 @@ mod raw {
 
         pub fn CGPreflightScreenCaptureAccess() -> bool;
         pub fn CGRequestScreenCaptureAccess() -> bool;
+        pub fn CGGetOnlineDisplayList(
+            max_displays: u32,
+            online_displays: *mut u32,
+            display_count: *mut u32,
+        ) -> i32;
+        pub fn CGDisplayIsAsleep(display: u32) -> i32;
+        pub fn CGSessionCopyCurrentDictionary() -> *const CFDictionary;
 
         pub fn CGDisplayCopyAllDisplayModes(
             display: u32,
@@ -169,14 +176,34 @@ mod raw {
     //   IOHIDAccessType IOHIDCheckAccess(IOHIDRequestType requestType)
     // IOHIDRequestType: PostEvent=0, ListenEvent=1（输入监控是 ListenEvent）。
     // IOHIDAccessType:  Granted=0, Denied=1, Unknown=2。C enum 按 int 传。
+    //
+    // IOPMLib.h：
+    //   IOReturn IOPMAssertionDeclareUserActivity(CFStringRef AssertionName,
+    //                                             IOPMUserActiveType userType,
+    //                                             IOPMAssertionID *AssertionID)
+    //   IOReturn IOPMAssertionRelease(IOPMAssertionID AssertionID)
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
         pub fn IOHIDCheckAccess(request_type: i32) -> i32;
+        pub fn IOPMAssertionDeclareUserActivity(
+            assertion_name: *const CFString,
+            user_type: u32,
+            assertion_id: *mut u32,
+        ) -> i32;
+        pub fn IOPMAssertionRelease(assertion_id: u32) -> i32;
     }
 }
 
 const K_IOHID_REQUEST_TYPE_LISTEN_EVENT: i32 = 1;
 const K_IOHID_ACCESS_TYPE_GRANTED: i32 = 0;
+const K_CG_ERROR_SUCCESS: i32 = 0;
+const K_IO_RETURN_SUCCESS: i32 = 0;
+const K_IOPM_USER_ACTIVE_LOCAL: u32 = 0;
+const MAX_ONLINE_DISPLAYS: usize = 32;
+const MAX_DISPLAY_WAKE_WAIT: Duration = Duration::from_secs(5);
+const DISPLAY_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DEFAULT_WAKE_REASON: &str = "RabbitControl Display Wake";
+const MAX_WAKE_REASON_UTF16_LEN: usize = 128;
 
 /// M1：检测屏幕录制权限，**不弹窗**（`CGPreflightScreenCaptureAccess`）。
 pub(crate) fn preflight_screen_capture_access() -> bool {
@@ -847,6 +874,220 @@ pub(crate) fn lock_screen_now() -> bool {
         .arg("displaysleepnow")
         .status()
         .is_ok_and(|s| s.success())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 显示器休眠检测、锁屏检测与 IOKit 亮屏唤醒（TokenBoom/rabbitcontrol-macos#2）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 根据在线显示器休眠表、主屏 ID 与主屏兜底状态综合判定当前是否处于熄屏休眠。
+fn evaluate_displays_asleep(
+    online: &[(u32, bool)],
+    main_id: u32,
+    main_fallback_asleep: bool,
+) -> bool {
+    if online.is_empty() {
+        return main_fallback_asleep;
+    }
+    let main_asleep = online
+        .iter()
+        .find(|&&(id, _)| id == main_id)
+        .map(|&(_, asleep)| asleep)
+        .unwrap_or(false);
+    let all_asleep = online.iter().all(|&(_, asleep)| asleep);
+    main_asleep || all_asleep
+}
+
+/// 查询指定显示器或当前在线主显示器是否处于休眠/熄屏状态。
+pub(crate) fn is_display_asleep(display_id: Option<u32>) -> bool {
+    if let Some(id) = display_id {
+        // SAFETY: `CGDisplayIsAsleep` 为 CoreGraphics 纯只读查询函数，无副作用。
+        return unsafe { raw::CGDisplayIsAsleep(id) != 0 };
+    }
+
+    let main_id = main_display_id();
+    let mut ids = [0u32; MAX_ONLINE_DISPLAYS];
+    let mut count = 0u32;
+    // SAFETY: `ids` 容量为 `MAX_ONLINE_DISPLAYS`，`count` 为有效栈出参。
+    let status = unsafe {
+        raw::CGGetOnlineDisplayList(MAX_ONLINE_DISPLAYS as u32, ids.as_mut_ptr(), &mut count)
+    };
+    if status != K_CG_ERROR_SUCCESS || count == 0 {
+        // SAFETY: `CGDisplayIsAsleep` 为 CoreGraphics 纯只读查询函数。
+        return unsafe { raw::CGDisplayIsAsleep(main_id) != 0 };
+    }
+
+    let n = (count as usize).min(MAX_ONLINE_DISPLAYS);
+    let mut states = [(0u32, false); MAX_ONLINE_DISPLAYS];
+    for i in 0..n {
+        let id = ids[i];
+        // SAFETY: `id` 来自系统返回的在线显示器列表，`CGDisplayIsAsleep` 为纯只读查询。
+        let asleep = unsafe { raw::CGDisplayIsAsleep(id) != 0 };
+        states[i] = (id, asleep);
+    }
+    // SAFETY: `main_id` 为主显示器 ID，`CGDisplayIsAsleep` 为纯只读查询。
+    let main_fallback = unsafe { raw::CGDisplayIsAsleep(main_id) != 0 };
+    evaluate_displays_asleep(&states[..n], main_id, main_fallback)
+}
+
+/// 从 `CFDictionary` 安全读取布尔标志键（兼容 `CFBoolean` 与 `CFNumber != 0`）。
+fn dict_bool_flag(dict: &CFDictionary, key_name: &str) -> bool {
+    let key = CFString::from_str(key_name);
+    let key_ptr: *const c_void = CFRetained::as_ptr(&key).as_ptr().cast();
+    // SAFETY: `dict` 为有效 `CFDictionary`，`key_ptr` 为有效 `CFString` 键，返回值由 `dict` 持有。
+    let raw_val = unsafe { dict.value(key_ptr) };
+    let Some(val_ptr) = NonNull::new(raw_val.cast_mut()) else {
+        return false;
+    };
+    // SAFETY: 非空字典值是合法 CF 对象且存活期受 `dict` 保护；以下 downcast 经 CFGetTypeID 校验。
+    let cf_val: &CFType = unsafe { val_ptr.cast::<CFType>().as_ref() };
+    if let Some(b) = cf_val.downcast_ref::<CFBoolean>() {
+        return b.as_bool();
+    }
+    if let Some(n) = cf_val.downcast_ref::<CFNumber>() {
+        return n
+            .as_i64()
+            .map(|v| v != 0)
+            .or_else(|| n.as_f64().map(|v| v != 0.0))
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// 查询当前 macOS 图形会话是否处于锁屏状态（`CGSessionCopyCurrentDictionary` → `CGSSessionScreenIsLocked`）。
+pub(crate) fn is_screen_locked() -> bool {
+    // SAFETY: 无参纯查询函数，遵循 CoreFoundation Copy Rule（非空时拥有 +1 引用）。
+    let raw_dict = unsafe { raw::CGSessionCopyCurrentDictionary() };
+    let Some(dict_ptr) = NonNull::new(raw_dict.cast_mut()) else {
+        return false;
+    };
+    // SAFETY: `raw_dict` 非空且遵循 Copy Rule，交由 `CFRetained` 保证任何路径退出均执行 `CFRelease`。
+    let dict: CFRetained<CFDictionary> = unsafe { CFRetained::from_raw(dict_ptr) };
+    dict_bool_flag(&dict, "CGSSessionScreenIsLocked")
+}
+
+/// 清洗并截断唤醒声明原因字符串（替换 NUL/控制字符，按 UTF-16 长度 ≤ 128 截断，空串回退默认值）。
+pub(crate) fn sanitize_wake_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .map(|c| if c == '\0' || c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_WAKE_REASON.to_string();
+    }
+    let mut out = String::new();
+    let mut utf16_len = 0usize;
+    for ch in trimmed.chars() {
+        let ch_len = ch.len_utf16();
+        if utf16_len + ch_len > MAX_WAKE_REASON_UTF16_LEN {
+            break;
+        }
+        out.push(ch);
+        utf16_len += ch_len;
+    }
+    if out.is_empty() {
+        DEFAULT_WAKE_REASON.to_string()
+    } else {
+        out
+    }
+}
+
+/// IOKit `IOPMAssertionDeclareUserActivity` RAII 守卫（`Send`，不可复制）。
+///
+/// `Drop` 时若 `assertion_id != 0` 自动调用 `IOPMAssertionRelease` 并将 ID 置零。
+#[derive(Debug)]
+pub(crate) struct DisplayWakeAssertion {
+    assertion_id: u32,
+}
+
+impl DisplayWakeAssertion {
+    /// 构造内部 RAII 守卫（`assertion_id == 0` 表示空操作）。
+    fn new(assertion_id: u32) -> Self {
+        Self { assertion_id }
+    }
+}
+
+impl Drop for DisplayWakeAssertion {
+    fn drop(&mut self) {
+        let id = std::mem::replace(&mut self.assertion_id, 0);
+        if id != 0 {
+            // SAFETY: `id` 来自 `IOPMAssertionDeclareUserActivity` 成功返回的有效 `IOPMAssertionID`，
+            // 本结构独占其所有权并在 Drop 时至多释放一次。
+            let _ = unsafe { raw::IOPMAssertionRelease(id) };
+        }
+    }
+}
+
+/// 若显示器处于休眠态，通过 IOKit `IOPMAssertionDeclareUserActivity` 触发亮屏并按 50ms 步进有界等待。
+pub(crate) fn wake_display_if_asleep(
+    reason: &str,
+    max_wait: Duration,
+) -> Result<Option<DisplayWakeAssertion>, String> {
+    if !is_display_asleep(None) {
+        return Ok(None);
+    }
+
+    let sanitized = sanitize_wake_reason(reason);
+    let cf_reason = CFString::from_str(&sanitized);
+    let mut assertion_id: u32 = 0;
+
+    // SAFETY: `cf_reason` 为有效非空 `CFString`（长度 ≤ 128），`K_IOPM_USER_ACTIVE_LOCAL = 0` 为合法枚举，
+    // `assertion_id` 为有效栈出参；成功时由下方 `DisplayWakeAssertion` 立即接管释放责任。
+    let ret = unsafe {
+        raw::IOPMAssertionDeclareUserActivity(
+            &*cf_reason as *const CFString,
+            K_IOPM_USER_ACTIVE_LOCAL,
+            &mut assertion_id,
+        )
+    };
+    if ret != K_IO_RETURN_SUCCESS {
+        tracing::warn!(
+            io_return = ret,
+            reason = %sanitized,
+            "IOPMAssertionDeclareUserActivity 唤醒显示器失败"
+        );
+        return Err(format!(
+            "IOPMAssertionDeclareUserActivity 失败: IOReturn 0x{:08x} ({ret})",
+            ret as u32
+        ));
+    }
+
+    // 立即包装进 RAII 守卫，保证即便后续提前返回或 panic 也能正确释放 assertion。
+    let assertion = DisplayWakeAssertion::new(assertion_id);
+    let bounded_wait = max_wait.min(MAX_DISPLAY_WAKE_WAIT);
+    let start = Instant::now();
+    let mut awake = !is_display_asleep(None);
+    while !awake {
+        let Some(remaining) = bounded_wait.checked_sub(start.elapsed()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(DISPLAY_WAKE_POLL_INTERVAL));
+        awake = !is_display_asleep(None);
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    let locked = is_screen_locked();
+    if awake {
+        tracing::info!(
+            elapsed_ms,
+            screen_locked = locked,
+            assertion_id = assertion.assertion_id,
+            "macOS 显示器已唤醒"
+        );
+    } else {
+        tracing::warn!(
+            elapsed_ms,
+            max_wait_ms = bounded_wait.as_millis(),
+            screen_locked = locked,
+            assertion_id = assertion.assertion_id,
+            "等待 macOS 显示器唤醒超时（可能仍处于熄屏/合盖或锁屏状态）"
+        );
+    }
+    Ok(Some(assertion))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2514,6 +2755,148 @@ mod tests {
                 );
             }
             _ => panic!("expected frame 2"),
+        }
+    }
+
+    #[test]
+    fn display_asleep_evaluation_covers_single_multi_clamshell_and_fallback() {
+        // 空列表时回退主屏状态。
+        assert!(evaluate_displays_asleep(&[], 1, true));
+        assert!(!evaluate_displays_asleep(&[], 1, false));
+
+        // 单屏场景。
+        assert!(evaluate_displays_asleep(&[(1, true)], 1, true));
+        assert!(!evaluate_displays_asleep(&[(1, false)], 1, false));
+
+        // 多屏全休眠。
+        assert!(evaluate_displays_asleep(&[(1, true), (2, true)], 1, true));
+        // 多屏全亮屏。
+        assert!(!evaluate_displays_asleep(
+            &[(1, false), (2, false)],
+            1,
+            false
+        ));
+        // 合盖/外接屏场景：主屏（外接屏 id=2）亮屏，内建屏休眠 → 未休眠。
+        assert!(!evaluate_displays_asleep(
+            &[(1, true), (2, false)],
+            2,
+            false
+        ));
+        // 主屏休眠、副屏亮屏 → 判定为休眠以触发唤醒主屏。
+        assert!(evaluate_displays_asleep(&[(1, true), (2, false)], 1, true));
+        // 主屏 ID 不在在线列表中：全部在线屏休眠 → true；至少一屏亮屏 → false。
+        assert!(evaluate_displays_asleep(&[(1, true), (2, true)], 99, false));
+        assert!(!evaluate_displays_asleep(
+            &[(1, false), (2, true)],
+            99,
+            true
+        ));
+    }
+
+    #[test]
+    fn dict_bool_flag_handles_cfboolean_cfnumber_missing_and_wrong_type() {
+        // SAFETY: 创建空 CFMutableDictionary（使用标准 CFType 回调），返回 +1 所有权。
+        let dict = unsafe {
+            CFMutableDictionary::new(
+                None,
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .expect("CFMutableDictionary::new 应成功");
+
+        let key_name = "CGSSessionScreenIsLocked";
+        // 1. 键缺失 → false。
+        assert!(!dict_bool_flag(dict.as_ref(), key_name));
+
+        let key = CFString::from_str(key_name);
+        let key_ptr: *const c_void = CFRetained::as_ptr(&key).as_ptr().cast();
+
+        // 2. CFBoolean(true / false)。
+        let b_true = CFBoolean::new(true);
+        // SAFETY: dict、key_ptr、b_true 均为有效 CF 对象。
+        unsafe {
+            CFMutableDictionary::set_value(
+                Some(&dict),
+                key_ptr,
+                (b_true as *const CFBoolean).cast::<c_void>(),
+            );
+        }
+        assert!(dict_bool_flag(dict.as_ref(), key_name));
+
+        let b_false = CFBoolean::new(false);
+        // SAFETY: dict、key_ptr、b_false 均为有效 CF 对象。
+        unsafe {
+            CFMutableDictionary::set_value(
+                Some(&dict),
+                key_ptr,
+                (b_false as *const CFBoolean).cast::<c_void>(),
+            );
+        }
+        assert!(!dict_bool_flag(dict.as_ref(), key_name));
+
+        // 3. CFNumber(0 / 1 / 42)。
+        for (val, expected) in [(0i32, false), (1i32, true), (42i32, true)] {
+            let num = CFNumber::new_i32(val);
+            // SAFETY: dict、key_ptr、num 均为有效 CF 对象。
+            unsafe {
+                CFMutableDictionary::set_value(
+                    Some(&dict),
+                    key_ptr,
+                    CFRetained::as_ptr(&num).as_ptr().cast::<c_void>(),
+                );
+            }
+            assert_eq!(dict_bool_flag(dict.as_ref(), key_name), expected);
+        }
+
+        // 4. 非布尔/数值类型（CFString）→ false。
+        // SAFETY: key_ptr 本身为有效 CFString，验证类型不匹配安全返回 false。
+        unsafe {
+            CFMutableDictionary::set_value(Some(&dict), key_ptr, key_ptr);
+        }
+        assert!(!dict_bool_flag(dict.as_ref(), key_name));
+    }
+
+    #[test]
+    fn sanitize_wake_reason_truncates_and_defaults_safely() {
+        assert_eq!(sanitize_wake_reason(""), DEFAULT_WAKE_REASON);
+        assert_eq!(sanitize_wake_reason("   \t\n\0  "), DEFAULT_WAKE_REASON);
+        assert_eq!(
+            sanitize_wake_reason("  RabbitControl\0Wake\nNow  "),
+            "RabbitControl Wake Now"
+        );
+
+        let long_ascii = "A".repeat(250);
+        let truncated_ascii = sanitize_wake_reason(&long_ascii);
+        assert_eq!(truncated_ascii.len(), MAX_WAKE_REASON_UTF16_LEN);
+        assert!(truncated_ascii.encode_utf16().count() <= MAX_WAKE_REASON_UTF16_LEN);
+
+        // 多字节中文 + 4 字节 emoji 混合，截断必须在合法 UTF-8 字符边界且 UTF-16 长度 ≤ 128。
+        let mixed = "唤醒屏幕😀".repeat(40);
+        let truncated_mixed = sanitize_wake_reason(&mixed);
+        assert!(!truncated_mixed.is_empty());
+        assert!(truncated_mixed.encode_utf16().count() <= MAX_WAKE_REASON_UTF16_LEN);
+    }
+
+    #[test]
+    fn display_wake_assertion_zero_id_drop_is_noop_and_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<DisplayWakeAssertion>();
+
+        let mut guard = DisplayWakeAssertion::new(0);
+        assert_eq!(guard.assertion_id, 0);
+        // 显式置零与 Drop 均应为空操作，不调用 IOPMAssertionRelease。
+        guard.assertion_id = 0;
+        drop(guard);
+    }
+
+    #[test]
+    fn repeated_display_sleep_and_screen_lock_queries_do_not_crash_or_leak() {
+        for _ in 0..100 {
+            let _ = is_display_asleep(None);
+            let _ = is_display_asleep(Some(main_display_id()));
+            let _ = is_screen_locked();
         }
     }
 

@@ -383,6 +383,12 @@ fn start_background_poller(app: AppHandle) {
                                     *st.host_version.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some((sid, hv.clone()));
                                 }
+                                SessionUpdate::HostScreenState {
+                                    locked,
+                                    capture_suspended,
+                                } => {
+                                    active.host_screen_state = Some((locked, capture_suspended));
+                                }
                                 _ => {}
                             }
                             if matches!(upd, SessionUpdate::Ended { .. }) {
@@ -418,6 +424,7 @@ fn start_background_poller(app: AppHandle) {
                                     | SessionUpdate::VirtualDisplayError { .. }
                                     | SessionUpdate::HostVersion(_)
                                     | SessionUpdate::RemoteUpdateStatus(_)
+                                    | SessionUpdate::HostScreenState { .. }
                             )
                         }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。
@@ -1323,6 +1330,8 @@ fn main() {
             commands::renew_device_cert,
             commands::get_general_prefs,
             commands::save_general_prefs,
+            commands::pick_transfer_storage_dir,
+            commands::open_transfer_storage_dir,
             commands::get_service_status,
             commands::install_system_service,
             commands::uninstall_system_service,
