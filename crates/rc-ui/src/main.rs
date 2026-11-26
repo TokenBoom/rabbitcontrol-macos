@@ -175,6 +175,7 @@ fn sync_proxy_state_and_emit(
                 || prev.device_id != raw.device_id
                 || prev.device_id_formatted != raw.device_id_formatted
                 || prev.error_message != raw.error_message
+                || prev.ui_error != raw.ui_error
                 || prev.signal_addr != raw.signal_addr
                 || prev.relay_addr != raw.relay_addr
         });
@@ -467,9 +468,14 @@ fn start_background_poller(app: AppHandle) {
                                 } => {
                                     active.host_screen_state = Some((locked, capture_suspended));
                                 }
+                                SessionUpdate::ToolPermissionsUpdated(perms) => {
+                                    active.meta.tool_permissions = perms.into();
+                                    emit_active_state = true;
+                                }
                                 SessionUpdate::Ended {
                                     ref reason,
                                     recoverable,
+                                    ref ui_error,
                                 } => {
                                     saw_ended = true;
                                     let should_auto_reconnect = recoverable
@@ -488,9 +494,10 @@ fn start_background_poller(app: AppHandle) {
                                         let cur_epoch = st
                                             .session_open_epoch
                                             .load(std::sync::atomic::Ordering::Acquire);
-                                        st.record_terminal_error_if_epoch(
+                                        st.record_terminal_error_with_ui_if_epoch(
                                             cur_epoch,
                                             reason.clone(),
+                                            ui_error.clone(),
                                         );
                                     }
                                     emit_active_state = true;
@@ -528,6 +535,8 @@ fn start_background_poller(app: AppHandle) {
                                     | SessionUpdate::RemoteUpdateStatus(_)
                                     | SessionUpdate::HostScreenState { .. }
                                     | SessionUpdate::MediaState { .. }
+                                    | SessionUpdate::ToolPermissionsUpdated(_)
+                                    | SessionUpdate::ToolPermissionDenied { .. }
                             )
                         }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。

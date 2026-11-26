@@ -98,6 +98,12 @@ fn report_to_file_matches_schema() {
 /// probe --json 的关键字段用字符串断言（不引 serde，与任务卡口径一致）。
 #[test]
 fn probe_json_is_valid() {
+    let expected_core_version = rc_client_core::version::core_version();
+    assert!(
+        !expected_core_version.is_empty(),
+        "rc_client_core::version::core_version() 不得为空"
+    );
+    let expected_core_ver_json = format!("\"coreVersion\": \"{expected_core_version}\"");
     Command::cargo_bin("rc-cli")
         .expect("测试必须能定位 rc-cli 二进制")
         .args(["probe", "--json"])
@@ -108,7 +114,7 @@ fn probe_json_is_valid() {
         .stdout(predicate::str::contains("\"platform\":"))
         .stdout(predicate::str::contains("\"arch\":"))
         .stdout(predicate::str::contains("\"core_build_info\":"))
-        .stdout(predicate::str::contains("\"coreVersion\": \"0.1.26\""))
+        .stdout(predicate::str::contains(expected_core_ver_json))
         .stdout(predicate::str::contains("\"sessionProtocolVersion\":"))
         .stdout(predicate::str::contains("\"abiVersion\":"));
 }

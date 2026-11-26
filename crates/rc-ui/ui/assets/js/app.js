@@ -703,11 +703,66 @@
         : s.connection_mode
           ? String(s.connection_mode)
           : "auto",
-      transport: s.transport ? String(s.transport) : null
+      transport: s.transport ? String(s.transport) : null,
+      toolPermissions: normalizeToolPermissions(
+        nextActive ? (s.toolPermissions || s.tool_permissions) : null
+      )
     };
     paintSidebarRows();
     if (state.route === "p1") renderP1();
+    syncP1ToolPermissions();
     renderP2SessionBar();
+  }
+
+  function normalizeToolPermissions(raw) {
+    if (!raw || typeof raw !== "object") {
+      return {
+        allowFileTransfer: true,
+        allowTerminal: true,
+        allowPortMap: true
+      };
+    }
+    return {
+      allowFileTransfer:
+        typeof raw.allowFileTransfer === "boolean"
+          ? raw.allowFileTransfer
+          : typeof raw.allow_file_transfer === "boolean"
+            ? raw.allow_file_transfer
+            : true,
+      allowTerminal:
+        typeof raw.allowTerminal === "boolean"
+          ? raw.allowTerminal
+          : typeof raw.allow_terminal === "boolean"
+            ? raw.allow_terminal
+            : true,
+      allowPortMap:
+        typeof raw.allowPortMap === "boolean"
+          ? raw.allowPortMap
+          : typeof raw.allow_port_map === "boolean"
+            ? raw.allow_port_map
+            : true
+    };
+  }
+
+  function isActiveFileTransferForbiddenForDevice(device) {
+    var active = state.activeSession;
+    if (!active || !active.active) return false;
+    var perms = active.toolPermissions;
+    if (!perms || perms.allowFileTransfer !== false) return false;
+    if (!device) return true;
+    return hasActiveSessionForDevice(device);
+  }
+
+  function syncP1ToolPermissions() {
+    var device = findDevice(state.deviceId);
+    var forbidden = isActiveFileTransferForbiddenForDevice(device);
+    var transferBtns = document.querySelectorAll('.p1__tool[data-tool="transfer"]');
+    Array.prototype.forEach.call(transferBtns, function (btn) {
+      btn.disabled = forbidden;
+      btn.classList.toggle("is-disabled", forbidden);
+      btn.setAttribute("aria-disabled", forbidden ? "true" : "false");
+      btn.title = forbidden ? "被控端已禁止本次远程协助使用文件传输" : "文件传输";
+    });
   }
 
   function focusSessionWindow() {
@@ -809,6 +864,7 @@
     );
     if (p1SessionBanner) p1SessionBanner.hidden = !hasSession;
     if (p1ActiveOverlay) p1ActiveOverlay.hidden = !desktopControlled;
+    syncP1ToolPermissions();
   }
 
   function openSession(watchOnly, targetDevice, extraOpts) {
@@ -900,6 +956,10 @@
       if (active && active.active && (!device || hasActiveSessionForDevice(device))) {
         if (active.watchOnly) {
           toast("观看模式为只读，请切换完整控制模式后再使用工具");
+          return;
+        }
+        if (tool === "transfer" && isActiveFileTransferForbiddenForDevice(device)) {
+          toast("被控端已禁止本次远程协助使用文件传输");
           return;
         }
         return openWindow(tool);
@@ -1839,7 +1899,27 @@
       return;
     }
     if (ev.kind === "error") {
-      toast("被控端错误：" + (ev.message || "未知错误"));
+      var hostUiErr = ev.ui_error || ev.uiError || null;
+      if (window.RCErrorDisplay && hostUiErr) {
+        window.RCErrorDisplay.present(hostUiErr, {
+          toastFn: toast,
+          onAction: function (action) {
+            if (action === "open_permissions" && typeof Bridge.checkPermissions === "function") {
+              Bridge.checkPermissions()
+                .then(function (perms) {
+                  if (perms && perms.platformSupported) {
+                    openPermissionModal(perms, { enableHostOnReady: false, startup: false });
+                  }
+                })
+                .catch(function () {});
+            } else if (action === "open_settings") {
+              openWindow("settings");
+            }
+          }
+        });
+      } else {
+        toast("被控端错误：" + (ev.message || "未知错误"));
+      }
     }
   }
 
@@ -2607,7 +2687,12 @@
 
       var transferBtn = el("button", "rc-ctx-menu__item", "文件传输");
       transferBtn.type = "button";
-      transferBtn.disabled = Boolean(device.isLocal || !device.online);
+      transferBtn.disabled = Boolean(
+        device.isLocal || !device.online || isActiveFileTransferForbiddenForDevice(device)
+      );
+      if (isActiveFileTransferForbiddenForDevice(device)) {
+        transferBtn.title = "被控端已禁止本次远程协助使用文件传输";
+      }
       transferBtn.addEventListener("click", function () {
         closeDeviceContextMenu();
         openTool("transfer", device);
@@ -3357,6 +3442,15 @@
 
   function setGateError(elErr, msg) {
     if (!elErr) return;
+    if (window.RCErrorDisplay) {
+      var ui = window.RCErrorDisplay.extractUiError(msg);
+      if (ui) {
+        elErr.classList.add("gate-error--structured");
+        window.RCErrorDisplay.renderInline(elErr, ui);
+        return;
+      }
+    }
+    elErr.classList.remove("gate-error--structured");
     var text = msg ? String(msg).trim() : "";
     elErr.textContent = text;
     elErr.hidden = !text;
@@ -3624,7 +3718,7 @@
           })
           .catch(function (err) {
             invalidateProbe();
-            setGateError(gateServerError, String(err || "连接服务器失败"));
+            setGateError(gateServerError, err || "连接服务器失败");
           })
           .then(function () {
             gateProbeBtn.disabled = false;
@@ -3688,7 +3782,7 @@
           })
           .catch(function (err) {
             invalidateProbe();
-            setGateError(gateServerError, String(err || "连接或保存服务器失败"));
+            setGateError(gateServerError, err || "连接或保存服务器失败");
           })
           .then(function () {
             gateConfirmServerBtn.disabled = false;
@@ -3744,7 +3838,7 @@
             }
           })
           .catch(function (err) {
-            setGateError(gateLoginError, String(err || "登录失败"));
+            setGateError(gateLoginError, err || "登录失败");
           })
           .then(function () {
             gateLoginBtn.disabled = false;
@@ -3789,7 +3883,7 @@
             }
           })
           .catch(function (err) {
-            setGateError(gateRegError, String(err || "注册失败"));
+            setGateError(gateRegError, err || "注册失败");
           })
           .then(function () {
             gateRegBtn.disabled = false;
@@ -3828,7 +3922,7 @@
             toast("密码修改成功，欢迎使用 RabbitControl");
           })
           .catch(function (err) {
-            setGateError(gateCpError, String(err || "修改密码失败"));
+            setGateError(gateCpError, err || "修改密码失败");
           })
           .then(function () {
             gateCpSubmitBtn.disabled = false;
@@ -4034,10 +4128,47 @@
       }
       if (typeof Bridge.onSessionUpdate === "function") {
         Bridge.onSessionUpdate(function (upd) {
-          if (!upd || upd.kind !== "ended") return;
-          if (activeMainRemoteUpdate) return;
+          if (!upd || !upd.kind) return;
           var data = upd.data || {};
-          var reason = data.reason ? String(data.reason) : "";
+          if (upd.kind === "tool_permissions_updated") {
+            if (state.activeSession && state.activeSession.active) {
+              state.activeSession.toolPermissions = normalizeToolPermissions(data);
+              syncP1ToolPermissions();
+            }
+            return;
+          }
+          if (upd.kind === "tool_permission_denied") {
+            var deniedUi = data.ui_error || data.uiError || null;
+            if (data.channel === 1 && state.activeSession && state.activeSession.active) {
+              if (!state.activeSession.toolPermissions) {
+                state.activeSession.toolPermissions = normalizeToolPermissions(null);
+              }
+              state.activeSession.toolPermissions.allowFileTransfer = false;
+              syncP1ToolPermissions();
+            }
+            if (window.RCErrorDisplay && deniedUi) {
+              window.RCErrorDisplay.showToast(deniedUi, { toastFn: toast });
+            } else {
+              var chName = window.RCErrorDisplay
+                ? window.RCErrorDisplay.channelLabel(data.channel)
+                : "远程工具";
+              toast("被控端已禁止本次远程协助使用" + chName);
+            }
+            return;
+          }
+          if (upd.kind !== "ended") return;
+          if (state.activeSession) {
+            state.activeSession.toolPermissions = normalizeToolPermissions(null);
+            syncP1ToolPermissions();
+          }
+          if (activeMainRemoteUpdate) return;
+          var endedUi = window.RCErrorDisplay
+            ? window.RCErrorDisplay.extractUiError(data)
+            : null;
+          var reason =
+            (endedUi && endedUi.message) ||
+            (data.reason ? String(data.reason) : "");
+          var rawReason = data.reason ? String(data.reason) : reason;
           var recoverable = Boolean(data.recoverable);
           var isDesktopSession = Boolean(
             (state.activeSession && state.activeSession.mediaActive) || lastActiveWasDesktop
@@ -4047,11 +4178,15 @@
             !isDesktopSession &&
             !hasRecentFailureToast() &&
             reason &&
-            reason !== "用户主动断开" &&
-            reason !== "已主动断开远控会话"
+            rawReason !== "用户主动断开" &&
+            rawReason !== "已主动断开远控会话"
           ) {
             markFailureToastShown();
-            toast("连接失败：" + reason);
+            if (window.RCErrorDisplay && endedUi) {
+              window.RCErrorDisplay.showToast(endedUi, { toastFn: toast });
+            } else {
+              toast("连接失败：" + reason);
+            }
           }
         });
       }
@@ -4060,8 +4195,19 @@
       }
       if (typeof Bridge.onAuthKicked === "function") {
         Bridge.onAuthKicked(function (payload) {
+          var kickedUi =
+            (payload && (payload.uiError || payload.ui_error)) || null;
           var reason = (payload && payload.reason) || "请重新登录";
-          toast("账号会话已强制注销：" + reason);
+          if (window.RCErrorDisplay && kickedUi) {
+            window.RCErrorDisplay.present(kickedUi, {
+              toastFn: toast,
+              onAction: function (action) {
+                if (action === "relogin") refreshGateStatus();
+              }
+            });
+          } else {
+            toast("账号会话已强制注销：" + reason);
+          }
           refreshGateStatus();
         });
       }

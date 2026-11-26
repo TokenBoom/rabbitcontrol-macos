@@ -200,10 +200,19 @@ fn build_host_session(
     let injector: Box<dyn rc_input::InputInjector> = match args.inject_mode {
         InjectMode::Record => Box::new(RecordingInjector::new()),
         #[cfg(target_os = "macos")]
-        InjectMode::Real => Box::new(
-            rc_input_macos::InputBridge::new()
-                .map_err(|e| format!("CGEvent 注入桥初始化失败（需辅助功能权限）: {e}"))?,
-        ),
+        InjectMode::Real => Box::new(rc_input_macos::InputBridge::new().map_err(|e| {
+            let ui_err = rc_client_core::ui_error::resolve_ui_error(
+                rc_client_core::ui_error::codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED,
+                rc_client_core::ui_error::ErrorPlatform::Macos,
+                &[],
+                None,
+                Some(e.to_string()),
+            );
+            format!(
+                "CGEvent 注入桥初始化失败（{}，{}）: {e}",
+                ui_err.code, ui_err.suggestion
+            )
+        })?),
         #[cfg(not(target_os = "macos"))]
         InjectMode::Real => {
             return Err("--inject-mode real 仅 macOS 支持（其他平台用 record）".into())
@@ -252,6 +261,7 @@ fn build_host_session(
             ..rc_session::HostAuthConfig::default()
         },
         approver,
+        tool_permissions: rc_session::ToolPermissions::all_allowed(),
     };
 
     // ── 会话钟（握手/审批期以当前墙钟推进，管线工厂构造后端时重锚，见 ClockOrigin 文档）──

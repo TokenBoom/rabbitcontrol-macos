@@ -26,12 +26,42 @@
 
   var isTauri = Boolean(getInvoke());
 
+  function normalizeInvokeError(err) {
+    if (err && typeof err === "object") {
+      var uiErr = err.uiError || err.ui_error || (err.code && err.title ? err : null);
+      if (uiErr && typeof uiErr === "object") {
+        var text =
+          (typeof err.message === "string" && err.message) ||
+          uiErr.message ||
+          uiErr.title ||
+          "操作失败";
+        try {
+          Object.defineProperty(err, "toString", {
+            value: function () {
+              return text;
+            },
+            configurable: true,
+            writable: true
+          });
+        } catch (e) {
+          /* ignore */
+        }
+        if (!err.uiError) err.uiError = uiErr;
+        if (!err.message) err.message = text;
+        return err;
+      }
+    }
+    return err;
+  }
+
   function invoke(cmd, args) {
     var fn = getInvoke();
     if (!fn) {
       return Promise.reject(new Error("Tauri IPC 不可用"));
     }
-    return fn(cmd, args || {});
+    return Promise.resolve(fn(cmd, args || {})).catch(function (err) {
+      throw normalizeInvokeError(err);
+    });
   }
 
   function listen(eventName, handler) {

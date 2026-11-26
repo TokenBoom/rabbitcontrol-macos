@@ -207,6 +207,40 @@ fn render_codec_array(items: &[CodecProbe]) -> String {
     format!("[\n{}\n  ]", entries.join(",\n"))
 }
 
+fn capture_tcc_ui_error(perms: CapturePermissions) -> Option<rc_client_core::ui_error::UiError> {
+    use rc_client_core::ui_error::{codes, resolve_ui_error, ErrorPlatform};
+    let code = if !perms.screen_recording {
+        codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+    } else if !perms.accessibility {
+        codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED
+    } else if !perms.input_monitoring {
+        codes::PLATFORM_MACOS_INPUT_MONITORING_DENIED
+    } else {
+        return None;
+    };
+    Some(resolve_ui_error(
+        code,
+        ErrorPlatform::Macos,
+        &[],
+        None,
+        None,
+    ))
+}
+
+fn render_ui_error_json(ui: &rc_client_core::ui_error::UiError) -> String {
+    format!(
+        "{{ \"code\": {}, \"title\": {}, \"message\": {}, \"suggestion\": {}, \"severity\": {}, \"presentation\": {}, \"action\": {}, \"retryable\": {} }}",
+        json_string(&ui.code),
+        json_string(&ui.title),
+        json_string(&ui.message),
+        json_string(&ui.suggestion),
+        json_string(ui.severity.as_str()),
+        json_string(ui.presentation.as_str()),
+        json_string(ui.action.as_str()),
+        ui.retryable,
+    )
+}
+
 /// 机器可读 JSON 输出（手写拼接，不引入 serde）。
 fn render_json(report: &ProbeReport) -> String {
     let mut capture_fields = vec![
@@ -221,6 +255,9 @@ fn render_json(report: &ProbeReport) -> String {
             "\"permissions\": {{ \"screen_recording\": {}, \"accessibility\": {}, \"input_monitoring\": {} }}",
             perms.screen_recording, perms.accessibility, perms.input_monitoring
         ));
+        if let Some(ui_err) = capture_tcc_ui_error(perms) {
+            capture_fields.push(format!("\"ui_error\": {}", render_ui_error_json(&ui_err)));
+        }
     }
     let capture_json = format!("{{ {} }}", capture_fields.join(", "));
 
@@ -296,6 +333,12 @@ fn render_human(report: &ProbeReport) -> String {
             yes_no(perms.accessibility),
             yes_no(perms.input_monitoring),
         ));
+        if let Some(ui_err) = capture_tcc_ui_error(perms) {
+            lines.push(format!(
+                "  hint       : [{}] {} — {}",
+                ui_err.code, ui_err.title, ui_err.suggestion
+            ));
+        }
     }
 
     lines.push("encoders :".to_string());

@@ -178,6 +178,19 @@
             </div>
           </div>
 
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-assist-file-transfer">被远程协助时允许文件互传</div>
+              <div class="rc-setting-row__desc">关闭后，他人通过验证码远程协助本机时将禁止浏览目录与收发文件（本人同账号设备免密自控不受影响）。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-assist-file-transfer" aria-labelledby="row-assist-file-transfer" checked />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+
         </section>
 
         <section class="rc-group" aria-label="本机设备证书">
@@ -328,6 +341,7 @@
   </div>
 
   <script src="assets/js/bridge.js"></script>
+  <script src="assets/js/error-display.js"></script>
   <script src="assets/js/overlay.js"></script>
   <script>
     (function () {
@@ -727,9 +741,10 @@
         });
       }
 
-      /* ── 安全设置：mTLS 默认开关与设备证书状态 ────── */
+      /* ── 安全设置：mTLS 默认开关、远程协助文件互传门控与设备证书状态 ────── */
       var SEC_STORE_KEY = "rc.settings.security.v1";
       var optDefaultMtls = document.getElementById("opt-default-mtls");
+      var optAssistFileTransfer = document.getElementById("opt-assist-file-transfer");
       var certStatusBadge = document.getElementById("cert-status-badge");
       var certStatusText = document.getElementById("cert-status-text");
       var certStatusDetail = document.getElementById("cert-status-detail");
@@ -778,6 +793,13 @@
         if (optDefaultMtls && typeof snap.defaultEncryptConnection === "boolean") {
           optDefaultMtls.checked = snap.defaultEncryptConnection;
         }
+        if (optAssistFileTransfer) {
+          if (typeof snap.allowAssistFileTransfer === "boolean") {
+            optAssistFileTransfer.checked = snap.allowAssistFileTransfer;
+          } else if (typeof snap.allow_assist_file_transfer === "boolean") {
+            optAssistFileTransfer.checked = snap.allow_assist_file_transfer;
+          }
+        }
         applyCertStatus(snap.certStatus);
       }
 
@@ -791,6 +813,8 @@
         applySecurityPrefs({
           defaultEncryptConnection: saved && typeof saved.defaultEncryptConnection === "boolean"
             ? saved.defaultEncryptConnection : true,
+          allowAssistFileTransfer: saved && typeof saved.allowAssistFileTransfer === "boolean"
+            ? saved.allowAssistFileTransfer : true,
           certStatus: { issued: false }
         });
       }
@@ -799,7 +823,8 @@
         if (!IS_TAURI || typeof Bridge.saveSecurityPrefs !== "function") {
           try {
             window.localStorage.setItem(SEC_STORE_KEY, JSON.stringify({
-              defaultEncryptConnection: Boolean(optDefaultMtls && optDefaultMtls.checked)
+              defaultEncryptConnection: Boolean(optDefaultMtls && optDefaultMtls.checked),
+              allowAssistFileTransfer: Boolean(optAssistFileTransfer && optAssistFileTransfer.checked)
             }));
           } catch (err) { /* ignore */ }
           toast("已更新安全偏好");
@@ -814,7 +839,13 @@
             if (optDefaultMtls && typeof patch.defaultEncryptConnection === "boolean") {
               optDefaultMtls.checked = !patch.defaultEncryptConnection;
             }
-            toast("保存安全设置失败：" + String(err));
+            if (optAssistFileTransfer && typeof patch.allowAssistFileTransfer === "boolean") {
+              optAssistFileTransfer.checked = !patch.allowAssistFileTransfer;
+            }
+            var errMsg = window.RCErrorDisplay
+              ? window.RCErrorDisplay.formatSummary(err, String(err))
+              : String(err);
+            toast("保存安全设置失败：" + errMsg);
           });
       }
 
@@ -836,6 +867,11 @@
       if (optDefaultMtls) {
         optDefaultMtls.addEventListener("change", function () {
           saveSecurityPatch({ defaultEncryptConnection: Boolean(optDefaultMtls.checked) });
+        });
+      }
+      if (optAssistFileTransfer) {
+        optAssistFileTransfer.addEventListener("change", function () {
+          saveSecurityPatch({ allowAssistFileTransfer: Boolean(optAssistFileTransfer.checked) });
         });
       }
       if (btnCertRenew) {

@@ -89,11 +89,15 @@
   ];
 
   /* 运行态状态 */
+  var ErrorDisplay = window.RCErrorDisplay || null;
   var REMOTE_REQ_TIMEOUT_MS = 15000;
   var remoteSession = {
     active: !IS_TAURI,
     connected: !IS_TAURI,
     watchOnly: false,
+    allowFileTransfer: true,
+    permissionUiError: null,
+    endedUiError: null,
     phase: !IS_TAURI ? 'connected' : '',
     reconnectingAttempt: 0,
     reconnectingMax: 8,
@@ -257,7 +261,74 @@
 
   function isRemoteReady() {
     if (!IS_TAURI) return true;
-    return Boolean(remoteSession.active && remoteSession.connected && !remoteSession.watchOnly);
+    return Boolean(
+      remoteSession.active &&
+        remoteSession.connected &&
+        !remoteSession.watchOnly &&
+        remoteSession.allowFileTransfer
+    );
+  }
+
+  function defaultFileForbiddenUiError() {
+    return {
+      code: 'tool.forbidden',
+      title: '工具权限受限',
+      message: '被控端未允许在本次会话中使用文件传输。',
+      suggestion: '如需继续，请让被控端在「设置 → 安全」中开启「被远程协助时允许文件互传」。',
+      severity: 'warning',
+      presentation: 'banner',
+      action: 'none',
+      retryable: false,
+      status: null,
+      detail: null
+    };
+  }
+
+  function renderPermissionBanner(uiErr) {
+    var bannerEl = document.getElementById('tr-perm-banner');
+    if (!bannerEl) return;
+    if (!uiErr) {
+      bannerEl.textContent = '';
+      bannerEl.hidden = true;
+      return;
+    }
+    if (ErrorDisplay) {
+      ErrorDisplay.renderBanner(bannerEl, uiErr);
+    } else {
+      bannerEl.textContent = errMessage(uiErr);
+      bannerEl.hidden = false;
+    }
+  }
+
+  function syncTransferBanner() {
+    renderPermissionBanner(remoteSession.permissionUiError || remoteSession.endedUiError || null);
+  }
+
+  function applyFileTransferPermission(allowed, uiErr) {
+    var nextAllowed = allowed !== false;
+    var prevAllowed = remoteSession.allowFileTransfer;
+    remoteSession.allowFileTransfer = nextAllowed;
+    if (!nextAllowed) {
+      var effectiveUi =
+        (ErrorDisplay && ErrorDisplay.extractUiError(uiErr)) ||
+        remoteSession.permissionUiError ||
+        defaultFileForbiddenUiError();
+      remoteSession.permissionUiError = effectiveUi;
+      syncTransferBanner();
+      resetRemotePaneDisconnected(
+        (effectiveUi && effectiveUi.message) || '被控端已禁止本次远程协助使用文件传输',
+        false
+      );
+      return;
+    }
+    remoteSession.permissionUiError = null;
+    syncTransferBanner();
+    if (!prevAllowed && isRemoteReady()) {
+      syncSendState();
+      loadRemoteDir(null, false);
+    } else {
+      syncSendState();
+    }
   }
 
   function parentDir(dirPath) {
@@ -285,9 +356,29 @@
 
   function errMessage(err) {
     if (!err) return '操作失败';
+    if (ErrorDisplay) {
+      var summary = ErrorDisplay.formatSummary(err, '');
+      if (summary) return summary;
+    }
     if (typeof err === 'string') return err;
     if (err.message) return String(err.message);
     return String(err);
+  }
+
+  function handleRemoteToolError(err, prefix) {
+    var ui = ErrorDisplay ? ErrorDisplay.extractUiError(err) : null;
+    if (ui && ui.code === 'tool.forbidden') {
+      applyFileTransferPermission(false, ui);
+      if (ErrorDisplay) {
+        ErrorDisplay.showToast(ui, { toastFn: toast });
+      } else {
+        toast(ui.message || '被控端已禁止使用文件传输');
+      }
+      return ui.message || '被控端已禁止使用文件传输';
+    }
+    var msg = errMessage(err);
+    toast(prefix ? prefix + msg : msg);
+    return msg;
   }
 
   function mapTransferItem(item) {
@@ -707,15 +798,18 @@
       pane.loading = false;
       pane.error = remoteSession.watchOnly
         ? '当前为只读观看模式，无法使用文件传输'
-        : remoteSession.phase === 'reconnecting'
-          ? '连接中断，正在自动重连 (' +
-            (remoteSession.reconnectingAttempt || 1) +
-            '/' +
-            (remoteSession.reconnectingMax || 8) +
-            ')…'
-          : remoteSession.active
-            ? '正在建立安全连接…'
-            : remoteSession.endedReason || '请先建立远控会话';
+        : !remoteSession.allowFileTransfer
+          ? (remoteSession.permissionUiError && remoteSession.permissionUiError.message) ||
+            '被控端已禁止本次远程协助使用文件传输'
+          : remoteSession.phase === 'reconnecting'
+            ? '连接中断，正在自动重连 (' +
+              (remoteSession.reconnectingAttempt || 1) +
+              '/' +
+              (remoteSession.reconnectingMax || 8) +
+              ')…'
+            : remoteSession.active
+              ? '正在建立安全连接…'
+              : remoteSession.endedReason || '请先建立远控会话';
       renderPane(pane);
       return;
     }
@@ -746,10 +840,12 @@
       pane.timeoutId = 0;
       pane.pendingHistoryDir = null;
       pane.loading = false;
-      pane.error = errMessage(err);
-      pane.files = [];
-      renderPane(pane);
-      toast(pane.error);
+      var msg = handleRemoteToolError(err, '');
+      if (remoteSession.allowFileTransfer) {
+        pane.error = msg;
+        pane.files = [];
+        renderPane(pane);
+      }
     });
   }
 
@@ -881,6 +977,8 @@
     remoteSession.connected = false;
     remoteSession.phase = 'connecting';
     remoteSession.endedReason = '';
+    remoteSession.endedUiError = null;
+    syncTransferBanner();
     resetRemotePaneDisconnected('正在建立安全连接…', false);
     toast('正在重新连接…');
     fn().catch(function (err) {
@@ -899,6 +997,15 @@
     var nextActive = Boolean(s.active);
     var nextConnected = Boolean(s.connected);
     var nextWatch = Boolean(s.watchOnly !== undefined ? s.watchOnly : s.watch_only);
+    var toolPerms = s.toolPermissions || s.tool_permissions || null;
+    var nextAllowFt = true;
+    if (toolPerms && typeof toolPerms === 'object') {
+      if (typeof toolPerms.allowFileTransfer === 'boolean') {
+        nextAllowFt = toolPerms.allowFileTransfer;
+      } else if (typeof toolPerms.allow_file_transfer === 'boolean') {
+        nextAllowFt = toolPerms.allow_file_transfer;
+      }
+    }
     var rawPhase = s.phase ? String(s.phase) : '';
     var nextPhase = rawPhase || (nextConnected ? 'connected' : nextActive ? 'connecting' : '');
     var nextName = String(
@@ -915,13 +1022,30 @@
     );
 
     if (!nextActive) {
+      remoteSession.allowFileTransfer = true;
+      remoteSession.permissionUiError = null;
+      syncTransferBanner();
       resetRemotePaneDisconnected(remoteSession.endedReason || '请先建立远控会话', true);
       return;
     }
     if (nextWatch) {
+      remoteSession.permissionUiError = null;
+      remoteSession.endedUiError = null;
+      syncTransferBanner();
       resetRemotePaneDisconnected('当前为只读观看模式，无法使用文件传输', false);
       return;
     }
+    if (!nextAllowFt) {
+      remoteSession.endedUiError = null;
+      applyFileTransferPermission(false, null);
+      return;
+    }
+    remoteSession.endedUiError = null;
+    if (!remoteSession.allowFileTransfer) {
+      remoteSession.allowFileTransfer = true;
+      remoteSession.permissionUiError = null;
+    }
+    syncTransferBanner();
     if (nextPhase === 'reconnecting') {
       resetRemotePaneDisconnected(
         '连接中断，正在自动重连 (' +
@@ -1023,6 +1147,10 @@
     if (upd.kind === 'connecting') {
       remoteSession.active = true;
       remoteSession.connected = false;
+      remoteSession.allowFileTransfer = true;
+      remoteSession.permissionUiError = null;
+      remoteSession.endedUiError = null;
+      syncTransferBanner();
       remoteSession.phase = 'connecting';
       remoteSession.endedReason = '';
       var connName = data.device_name || data.device || remoteSession.deviceName;
@@ -1031,6 +1159,29 @@
         setHeaderDeviceName('tr-remote-name', String(connName));
       }
       resetRemotePaneDisconnected('正在建立安全连接…', false);
+      return;
+    }
+    if (upd.kind === 'tool_permissions_updated') {
+      var allowFt =
+        typeof data.allow_file_transfer === 'boolean'
+          ? data.allow_file_transfer
+          : typeof data.allowFileTransfer === 'boolean'
+            ? data.allowFileTransfer
+            : true;
+      applyFileTransferPermission(allowFt, null);
+      return;
+    }
+    if (upd.kind === 'tool_permission_denied') {
+      var deniedUi = (data && (data.ui_error || data.uiError)) || null;
+      if (data && data.channel === 1) {
+        applyFileTransferPermission(false, deniedUi);
+      }
+      if (ErrorDisplay && deniedUi) {
+        ErrorDisplay.showToast(deniedUi, { toastFn: toast });
+      } else {
+        var chName = ErrorDisplay ? ErrorDisplay.channelLabel(data && data.channel) : '远程工具';
+        toast('被控端已禁止本次远程协助使用' + chName);
+      }
       return;
     }
     if (upd.kind === 'reconnecting') {
@@ -1051,10 +1202,18 @@
       return;
     }
     if (upd.kind === 'ended') {
-      var reason = data.reason ? String(data.reason) : '远控会话已断开';
+      var endedUi = ErrorDisplay ? ErrorDisplay.extractUiError(data) : null;
+      var reason =
+        (endedUi && endedUi.message) ||
+        (data.reason ? String(data.reason) : '远控会话已断开');
       remoteSession.active = false;
       remoteSession.connected = false;
       remoteSession.watchOnly = false;
+      remoteSession.allowFileTransfer = true;
+      remoteSession.permissionUiError = null;
+      remoteSession.endedUiError =
+        endedUi && endedUi.code !== 'session.cancelled' ? endedUi : null;
+      syncTransferBanner();
       remoteSession.phase = 'ended';
       remoteSession.endedReason = reason;
       setHeaderDeviceName('tr-remote-name', '未连接远端');
@@ -1067,6 +1226,7 @@
       remoteSession.connected = true;
       remoteSession.phase = 'connected';
       remoteSession.endedReason = '';
+      remoteSession.endedUiError = null;
       if (typeof data.watch_only === 'boolean') {
         remoteSession.watchOnly = data.watch_only;
       }
@@ -1074,7 +1234,8 @@
         remoteSession.deviceName = String(dName);
         setHeaderDeviceName('tr-remote-name', String(dName));
       }
-      if (!remoteSession.watchOnly) {
+      if (!remoteSession.watchOnly && remoteSession.allowFileTransfer) {
+        syncTransferBanner();
         syncSendState();
         loadRemoteDir(null, false);
         Bridge.fileListTransfers()
@@ -1107,6 +1268,14 @@
   }
 
   function startRealTransfer(side) {
+    if (!remoteSession.allowFileTransfer) {
+      applyFileTransferPermission(false, remoteSession.permissionUiError);
+      toast(
+        (remoteSession.permissionUiError && remoteSession.permissionUiError.message) ||
+          '被控端已禁止本次远程协助使用文件传输'
+      );
+      return;
+    }
     var srcPane = side === 'local' ? panes.local : panes.remote;
     var dstPane = side === 'local' ? panes.remote : panes.local;
     var indices = checkedFiles(srcPane.el);
@@ -1145,14 +1314,26 @@
     settleAll(promises).then(function (results) {
       var okCount = 0;
       var errors = [];
+      var forbiddenUi = null;
       results.forEach(function (res, i) {
         if (res.status === 'fulfilled') {
           okCount += 1;
         } else {
+          var ui = ErrorDisplay ? ErrorDisplay.extractUiError(res.reason) : null;
+          if (ui && ui.code === 'tool.forbidden' && !forbiddenUi) {
+            forbiddenUi = ui;
+          }
           var name = selectedFiles[i] ? selectedFiles[i].name : '';
           errors.push((name ? name + '：' : '') + errMessage(res.reason));
         }
       });
+      if (forbiddenUi) {
+        applyFileTransferPermission(false, forbiddenUi);
+        if (ErrorDisplay) {
+          ErrorDisplay.showToast(forbiddenUi, { toastFn: toast });
+          return;
+        }
+      }
 
       var verb = side === 'local' ? '上传' : '下载';
       if (errors.length === 0) {
@@ -1344,7 +1525,7 @@
         Bridge.fileMkdirRemote(pane.dir, name).catch(function (err) {
           window.clearTimeout(panes.remote.mkdirTimeoutId);
           panes.remote.mkdirTimeoutId = 0;
-          toast('新建失败：' + errMessage(err));
+          handleRemoteToolError(err, '新建失败：');
         });
       }
     });
@@ -1570,7 +1751,7 @@
           );
         } else {
           Bridge.fileRenameRemote(entry.path, nextName).catch(function (err) {
-            toast('重命名失败：' + errMessage(err));
+            handleRemoteToolError(err, '重命名失败：');
           });
         }
       });
@@ -1621,7 +1802,7 @@
             })
           ).then(function (results) {
             var failed = results.find(function (r) { return r.status === 'rejected'; });
-            if (failed) toast('删除请求失败：' + errMessage(failed.reason));
+            if (failed) handleRemoteToolError(failed.reason, '删除请求失败：');
           });
         }
       });

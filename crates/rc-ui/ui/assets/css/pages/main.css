@@ -2220,6 +2220,12 @@ body.is-tauri .p2__body.is-disabled .p2__verify-col {
   display: none;
 }
 
+.gate-error.gate-error--structured {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
 .gate-actions {
   display: flex;
   align-items: center;

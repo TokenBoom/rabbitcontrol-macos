@@ -645,6 +645,7 @@ impl AgentInner {
             }
             host.set_allow_owner_control(self.allow_owner_control);
             host.set_allow_remote_assist(allow_remote_assist);
+            host.set_allow_assist_file_transfer(self.prefs.allow_assist_file_transfer);
             host.set_owner_verifier(owner_verifier);
             host.set_mtls_config(mtls_bundle, accept_mtls_lan);
             host.set_file_transfer_dir(file_transfer_dir);
@@ -677,6 +678,7 @@ impl AgentInner {
             accept_mtls_lan,
             forbid_passwordless_auto_approve: self.session_type == ServiceSessionType::LoginWindow,
             file_transfer_dir,
+            allow_assist_file_transfer: self.prefs.allow_assist_file_transfer,
         };
 
         match HostHandle::spawn(cfg) {
@@ -812,6 +814,7 @@ impl AgentInner {
                 self.session_type != ServiceSessionType::LoginWindow && !self.custom_password,
             );
             running_host.set_file_transfer_dir(Some(self.prefs.resolved_file_transfer_dir()));
+            running_host.set_allow_assist_file_transfer(self.prefs.allow_assist_file_transfer);
         }
         retired
     }
@@ -819,6 +822,7 @@ impl AgentInner {
     fn snapshot(&self) -> AgentSnapshot {
         AgentSnapshot {
             enabled: self.host.is_some() && self.effective_allow_remote_assist(),
+            allow_assist_file_transfer: self.prefs.allow_assist_file_transfer,
             host_running: self.host.is_some(),
             listen_addr: self.listen_addr.clone(),
             display_addr: self.display_addr.clone(),
@@ -1087,8 +1091,15 @@ impl AgentInner {
                         lan_dirty = true;
                         break;
                     }
-                    HostUpdate::Error { message } => {
-                        eprintln!("[rc-host-agent] 被控端运行异常: {message}");
+                    HostUpdate::Error { message, ui_error } => {
+                        if let Some(ref ui) = ui_error {
+                            eprintln!(
+                                "[rc-host-agent] 被控端运行异常 [{}] {}: {}",
+                                ui.code, ui.title, message
+                            );
+                        } else {
+                            eprintln!("[rc-host-agent] 被控端运行异常: {message}");
+                        }
                     }
                 }
             }
@@ -1158,6 +1169,21 @@ impl AgentInner {
                 Err(err)
             }
         }
+    }
+
+    fn set_assist_file_transfer(&mut self, enabled: bool) -> Result<AgentSnapshot, String> {
+        let prefs_path = app_prefs::default_prefs_path();
+        {
+            let _prefs_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
+            let mut latest = app_prefs::load_from_path(&prefs_path);
+            latest.allow_assist_file_transfer = enabled;
+            app_prefs::save_to_path(&prefs_path, &latest)?;
+            self.prefs = latest;
+        }
+        if let Some(ref host) = self.host {
+            host.set_allow_assist_file_transfer(enabled);
+        }
+        Ok(self.snapshot())
     }
 
     fn set_password(
@@ -1317,6 +1343,13 @@ fn main() {
                     metal_attach::update_status_bar(tray);
                 }
                 res
+            }
+            ServiceRequest::SetAssistFileTransfer { enabled } => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.set_assist_file_transfer(enabled) {
+                    Ok(snap) => ServiceResponse::Snapshot(Box::new(snap)),
+                    Err(message) => ServiceResponse::Error { message },
+                }
             }
             ServiceRequest::SetPassword { password } => {
                 let (res, retired_host) = {

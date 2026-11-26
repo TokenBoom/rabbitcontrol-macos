@@ -8,6 +8,8 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+use rc_client_core::ui_error::{codes, resolve_ui_error, ErrorPlatform, UiError};
+
 /// 供前端渲染与启动前门禁使用的系统权限状态快照（IPC `camelCase`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +30,38 @@ pub struct PermissionSnapshot {
     pub missing_required: Vec<String>,
     /// 若较进程启动时授权状态发生变化，提示用户重启进程使授权生效。
     pub restart_hint: Option<String>,
+    /// 当 macOS 缺少 TCC 权限时的结构化引导错误（`platform.macos.*`；权限齐全或非 macOS 为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_error: Option<UiError>,
+}
+
+/// 根据三项权限布尔状态映射最优先的 macOS TCC 结构化 [`UiError`]（`platform.macos.*`）。
+pub fn permission_ui_error_from_flags(
+    platform_supported: bool,
+    screen_recording: bool,
+    accessibility: bool,
+    input_monitoring: bool,
+    detail: Option<String>,
+) -> Option<UiError> {
+    if !platform_supported {
+        return None;
+    }
+    let code = if !screen_recording {
+        codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+    } else if !accessibility {
+        codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED
+    } else if !input_monitoring {
+        codes::PLATFORM_MACOS_INPUT_MONITORING_DENIED
+    } else {
+        return None;
+    };
+    Some(resolve_ui_error(
+        code,
+        ErrorPlatform::Macos,
+        &[],
+        None,
+        detail,
+    ))
 }
 
 impl PermissionSnapshot {
@@ -46,6 +80,13 @@ impl PermissionSnapshot {
         if !accessibility {
             missing_required.push("辅助功能".to_string());
         }
+        let ui_error = permission_ui_error_from_flags(
+            platform_supported,
+            screen_recording,
+            accessibility,
+            input_monitoring,
+            restart_hint.clone(),
+        );
         Self {
             platform_supported,
             screen_recording,
@@ -55,6 +96,7 @@ impl PermissionSnapshot {
             all_granted: screen_recording && accessibility && input_monitoring,
             missing_required,
             restart_hint,
+            ui_error,
         }
     }
 }
@@ -78,6 +120,18 @@ fn parse_permission_kind(kind: &str) -> Result<ParsedPermissionKind, String> {
     }
 }
 
+/// 将指定 macOS 权限类型（`"screen_recording"` / `"accessibility"` / `"input_monitoring"`）
+/// 映射为结构化 [`UiError`]（未知类型回退 `validation.invalid_input`）。
+pub fn permission_kind_ui_error(kind: &str, detail: Option<String>) -> UiError {
+    let code = match kind {
+        "screen_recording" => codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED,
+        "accessibility" => codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED,
+        "input_monitoring" => codes::PLATFORM_MACOS_INPUT_MONITORING_DENIED,
+        _ => codes::VALIDATION_INVALID_INPUT,
+    };
+    resolve_ui_error(code, ErrorPlatform::Macos, &[], None, detail)
+}
+
 /// 校验开启本机被控端服务前的必需系统权限；在不支持权限预检的平台直接放行。
 pub fn ensure_host_ready(snapshot: &PermissionSnapshot) -> Result<(), String> {
     if !snapshot.platform_supported || snapshot.host_ready {
@@ -91,6 +145,26 @@ pub fn ensure_host_ready(snapshot: &PermissionSnapshot) -> Result<(), String> {
     Err(format!(
         "开启远程协助前请先在 macOS 系统设置中授予「{missing}」权限，授权后若未立即生效请重启 RabbitControl"
     ))
+}
+
+/// 校验开启本机被控端服务前的必需系统权限，缺失时返回结构化 `platform.macos.*` [`UiError`]。
+pub fn ensure_host_ready_ui_error(snapshot: &PermissionSnapshot) -> Result<(), Box<UiError>> {
+    if !snapshot.platform_supported || snapshot.host_ready {
+        return Ok(());
+    }
+    let detail = ensure_host_ready(snapshot).err();
+    let code = if !snapshot.screen_recording {
+        codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+    } else {
+        codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED
+    };
+    Err(Box::new(resolve_ui_error(
+        code,
+        ErrorPlatform::Macos,
+        &[],
+        None,
+        detail,
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -255,5 +329,66 @@ mod tests {
         let err = open_permission_settings("camera").unwrap_err();
         assert!(err.contains("camera"), "错误信息应指明非法类型: {err}");
         assert!(open_permission_settings("").is_err());
+    }
+
+    #[test]
+    fn permission_snapshot_maps_macos_tcc_ui_errors_and_camel_case_json() {
+        let missing_screen = PermissionSnapshot::from_flags(true, false, true, true, None);
+        let ui_screen = missing_screen
+            .ui_error
+            .as_ref()
+            .expect("missing screen recording must populate ui_error");
+        assert_eq!(
+            ui_screen.code,
+            codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+        );
+        assert_eq!(
+            ui_screen.action,
+            rc_client_core::ui_error::ErrorAction::OpenPermissions
+        );
+        let err_screen = ensure_host_ready_ui_error(&missing_screen).unwrap_err();
+        assert_eq!(
+            err_screen.code,
+            codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+        );
+
+        let missing_ax = PermissionSnapshot::from_flags(true, true, false, true, None);
+        assert_eq!(
+            missing_ax.ui_error.as_ref().map(|e| e.code.as_str()),
+            Some(codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED)
+        );
+        assert_eq!(
+            ensure_host_ready_ui_error(&missing_ax).unwrap_err().code,
+            codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED
+        );
+
+        let missing_input = PermissionSnapshot::from_flags(true, true, true, false, None);
+        assert_eq!(
+            missing_input.ui_error.as_ref().map(|e| e.code.as_str()),
+            Some(codes::PLATFORM_MACOS_INPUT_MONITORING_DENIED)
+        );
+        assert!(ensure_host_ready_ui_error(&missing_input).is_ok());
+
+        let all_ok = PermissionSnapshot::from_flags(true, true, true, true, None);
+        assert!(all_ok.ui_error.is_none());
+        let ok_json = serde_json::to_value(&all_ok).unwrap();
+        assert!(ok_json.get("uiError").is_none());
+
+        assert_eq!(
+            permission_kind_ui_error("screen_recording", None).code,
+            codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+        );
+        assert_eq!(
+            permission_kind_ui_error("accessibility", None).code,
+            codes::PLATFORM_MACOS_ACCESSIBILITY_DENIED
+        );
+        assert_eq!(
+            permission_kind_ui_error("input_monitoring", None).code,
+            codes::PLATFORM_MACOS_INPUT_MONITORING_DENIED
+        );
+        assert_eq!(
+            permission_kind_ui_error("unknown", None).code,
+            codes::VALIDATION_INVALID_INPUT
+        );
     }
 }

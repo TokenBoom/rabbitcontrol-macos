@@ -39,6 +39,7 @@ use rc_ui::session_bridge::{
     SessionCommand, SessionHandle, SessionUpdate, ToolClientHandle, UiSessionConfig,
 };
 use rc_ui::signal_client::{self, SignalClientHandle, SignalClientOptions};
+use rc_ui::ui_error::{self, codes, ErrorPlatform, IntoUiError, UiError};
 use rc_ui::upnp::UpnpStatus;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -48,6 +49,160 @@ use crate::state::{
     GateCertStatus, GateStatusSnapshot, HostRuntime, HostStatusSnapshot,
 };
 use crate::window;
+
+/// Tauri IPC 结构化错误信封（增量附加 4 级 [`UiError`]，同时保留顶层 `message` 兼容字符串回退）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiCommandError {
+    /// 面向兼容路径的人类可读主错误文案。
+    pub message: String,
+    /// 基于 `rabbitcontrol-spec` 与 `ErrorPlatform::Macos` 生成的结构化 4 级 UI 错误对象。
+    pub ui_error: Box<UiError>,
+}
+
+impl std::fmt::Display for UiCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl UiCommandError {
+    pub(crate) fn from_ui_error(ui_error: UiError) -> Self {
+        let message = if !ui_error.message.trim().is_empty() {
+            ui_error.message.clone()
+        } else {
+            ui_error.title.clone()
+        };
+        Self {
+            message,
+            ui_error: Box::new(ui_error),
+        }
+    }
+
+    pub(crate) fn from_ui_error_with_message(
+        message: impl Into<String>,
+        ui_error: UiError,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            ui_error: Box::new(ui_error),
+        }
+    }
+
+    pub(crate) fn from_auth_error(err: &AuthClientError) -> Self {
+        let ui_error = err.to_ui_error(ErrorPlatform::Macos);
+        Self::from_ui_error(ui_error)
+    }
+
+    pub(crate) fn from_host_error(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let ui_error = ui_error::classify_host_error(&raw, ErrorPlatform::Macos);
+        Self::from_ui_error_with_message(raw, ui_error)
+    }
+
+    pub(crate) fn from_validation_error(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let ui_error = ui_error::resolve_ui_error(
+            codes::VALIDATION_INVALID_INPUT,
+            ErrorPlatform::Macos,
+            &[],
+            None,
+            Some(raw.clone()),
+        );
+        Self::from_ui_error_with_message(raw, ui_error)
+    }
+
+    pub(crate) fn from_auth_gate_error(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let code = if raw.contains("修改密码") {
+            codes::AUTH_PASSWORD_CHANGE_REQUIRED
+        } else if raw.contains("服务器") {
+            codes::VALIDATION_INVALID_CONFIG
+        } else {
+            codes::AUTH_UNAUTHORIZED
+        };
+        let ui_error =
+            ui_error::resolve_ui_error(code, ErrorPlatform::Macos, &[], None, Some(raw.clone()));
+        Self::from_ui_error_with_message(raw, ui_error)
+    }
+
+    pub(crate) fn from_file_tool_error_with_policy(
+        raw: impl Into<String>,
+        allow_file_transfer: bool,
+    ) -> Self {
+        let raw = raw.into();
+        let core_forbidden_msg = ui_error::tool_forbidden_ui_error(
+            rc_session::TOOL_CHANNEL_FILE,
+            ErrorPlatform::Macos,
+            None,
+        )
+        .message;
+        let is_tool_forbidden = !allow_file_transfer
+            || raw == core_forbidden_msg
+            || raw.contains(codes::TOOL_FORBIDDEN)
+            || raw.contains("TOOL_FORBIDDEN")
+            || raw.contains("已禁用工具");
+        let ui_error = if is_tool_forbidden {
+            ui_error::tool_forbidden_ui_error(
+                rc_session::TOOL_CHANNEL_FILE,
+                ErrorPlatform::Macos,
+                Some(raw.clone()),
+            )
+        } else {
+            ui_error::resolve_ui_error(
+                codes::TOOL_FILE_TRANSFER_FAILED,
+                ErrorPlatform::Macos,
+                &[],
+                None,
+                Some(raw.clone()),
+            )
+        };
+        Self::from_ui_error_with_message(raw, ui_error)
+    }
+}
+
+fn active_session_file_transfer_allowed(state: &AppState) -> bool {
+    let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    slot.as_ref()
+        .filter(|a| !a.disconnecting)
+        .map(|a| a.meta.tool_permissions.allow_file_transfer)
+        .unwrap_or(true)
+}
+
+fn classify_macos_session_or_signal_error(raw: &str) -> UiError {
+    let session_err = ui_error::classify_session_reason(raw, ErrorPlatform::Macos);
+    if session_err.code != codes::COMMON_UNKNOWN {
+        session_err
+    } else {
+        ui_error::classify_signal_error(raw, ErrorPlatform::Macos)
+    }
+}
+
+fn session_ended_user_cancelled(reason: impl Into<String>) -> SessionUpdate {
+    let reason = reason.into();
+    let ui_error = ui_error::resolve_ui_error(
+        codes::SESSION_CANCELLED,
+        ErrorPlatform::Macos,
+        &[],
+        None,
+        Some(reason.clone()),
+    );
+    SessionUpdate::Ended {
+        reason,
+        recoverable: false,
+        ui_error: Some(ui_error),
+    }
+}
+
+fn session_ended_with_error(reason: impl Into<String>, recoverable: bool) -> SessionUpdate {
+    let reason = reason.into();
+    let ui_error = classify_macos_session_or_signal_error(&reason);
+    SessionUpdate::Ended {
+        reason,
+        recoverable,
+        ui_error: Some(ui_error),
+    }
+}
 
 /// `open_session` 默认请求宽度（0 表示采用被控端当前分辨率）。
 const DEFAULT_SESSION_WIDTH: u32 = 0;
@@ -427,10 +582,7 @@ pub(crate) fn disconnect_active_session_with_lock(
         let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
         let _ = app.emit(
             "session://update",
-            &SessionUpdate::Ended {
-                reason: "已主动断开远控会话".to_string(),
-                recoverable: false,
-            },
+            &session_ended_user_cancelled("已主动断开远控会话"),
         );
         teardown_session(app, session);
     }
@@ -837,11 +989,15 @@ pub(crate) fn apply_local_device_status_policy(
     true
 }
 
-/// 将最新的 `allow_remote_assist` / `allow_owner_control` / `OwnerTicketVerifier` / `mTLS` 策略热同步至正在运行的被控端监听服务。
+/// 将最新的 `allow_remote_assist` / `allow_assist_file_transfer` / `allow_owner_control` / `OwnerTicketVerifier` / `mTLS` 策略热同步至正在运行的被控端监听服务。
 pub(crate) fn refresh_host_security_runtime(state: &AppState) {
-    let (allow_remote_assist, default_encrypt) = {
+    let (allow_remote_assist, allow_assist_file_transfer, default_encrypt) = {
         let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
-        (prefs.allow_remote_assist, prefs.default_encrypt_connection)
+        (
+            prefs.allow_remote_assist,
+            prefs.allow_assist_file_transfer,
+            prefs.default_encrypt_connection,
+        )
     };
     let owner_verifier = build_owner_verifier(state);
     let mtls_bundle = build_session_mtls_bundle(state, None, None);
@@ -851,6 +1007,7 @@ pub(crate) fn refresh_host_security_runtime(state: &AppState) {
     if let Some(handle) = host.handle.as_ref() {
         handle.set_allow_owner_control(host.allow_owner_control);
         handle.set_allow_remote_assist(allow_remote_assist);
+        handle.set_allow_assist_file_transfer(allow_assist_file_transfer);
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_bundle, accept_mtls_lan);
     }
@@ -1352,6 +1509,7 @@ pub async fn open_session(
         peer_cert_fingerprint: None,
         connected: false,
         transport: None,
+        tool_permissions: state::ToolPermissionsSnapshot::default(),
     };
 
     // H9：在打开窗口与 `request_connect` 之前递增代次并取消任何在途自动重连；
@@ -1404,16 +1562,15 @@ pub async fn open_session(
             Err(err) => {
                 state.clear_connecting_epoch(my_epoch);
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                    state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                    let ended = session_ended_with_error(err.clone(), false);
+                    let ui_err = match &ended {
+                        SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                        _ => None,
+                    };
+                    state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
                     // 铁律：连接失败绝不自动关闭或销毁 S1 远控窗口，仅推送不可恢复终态由界面常驻展示错误。
-                    let _ = app.emit(
-                        "session://update",
-                        &SessionUpdate::Ended {
-                            reason: err.clone(),
-                            recoverable: false,
-                        },
-                    );
+                    let _ = app.emit("session://update", &ended);
                 }
                 return Err(err);
             }
@@ -1445,16 +1602,15 @@ pub async fn open_session(
         Err(err) => {
             state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let ended = session_ended_with_error(err.clone(), false);
+                let ui_err = match &ended {
+                    SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                    _ => None,
+                };
+                state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                 let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
                 // 铁律：安全配置失败同样绝不自动销毁 S1 远控窗口。
-                let _ = app.emit(
-                    "session://update",
-                    &SessionUpdate::Ended {
-                        reason: err.clone(),
-                        recoverable: false,
-                    },
-                );
+                let _ = app.emit("session://update", &ended);
             }
             return Err(err);
         }
@@ -1585,6 +1741,7 @@ pub async fn set_session_connection_mode(
     meta.peer_cert_fingerprint = None;
     meta.connected = false;
     meta.transport = None;
+    meta.tool_permissions = state::ToolPermissionsSnapshot::default();
     save_last_session_params(&state, watch_only, meta.clone());
     let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
 
@@ -1620,15 +1777,14 @@ pub async fn set_session_connection_mode(
             Err(err) => {
                 state.clear_connecting_epoch(my_epoch);
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                    state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                    let ended = session_ended_with_error(err.clone(), false);
+                    let ui_err = match &ended {
+                        SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                        _ => None,
+                    };
+                    state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-                    let _ = app.emit(
-                        "session://update",
-                        &SessionUpdate::Ended {
-                            reason: err.clone(),
-                            recoverable: false,
-                        },
-                    );
+                    let _ = app.emit("session://update", &ended);
                 }
                 return Err(err);
             }
@@ -1659,15 +1815,14 @@ pub async fn set_session_connection_mode(
         Err(err) => {
             state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let ended = session_ended_with_error(err.clone(), false);
+                let ui_err = match &ended {
+                    SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                    _ => None,
+                };
+                state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                 let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-                let _ = app.emit(
-                    "session://update",
-                    &SessionUpdate::Ended {
-                        reason: err.clone(),
-                        recoverable: false,
-                    },
-                );
+                let _ = app.emit("session://update", &ended);
             }
             return Err(err);
         }
@@ -1842,6 +1997,7 @@ pub async fn set_session_mtls_mode(
     meta.peer_cert_fingerprint = None;
     meta.connected = false;
     meta.transport = None;
+    meta.tool_permissions = state::ToolPermissionsSnapshot::default();
     save_last_session_params(&state, watch_only, meta.clone());
     let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
 
@@ -1880,15 +2036,14 @@ pub async fn set_session_mtls_mode(
         Err(err) => {
             state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let ended = session_ended_with_error(err.clone(), false);
+                let ui_err = match &ended {
+                    SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                    _ => None,
+                };
+                state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                 let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-                let _ = app.emit(
-                    "session://update",
-                    &SessionUpdate::Ended {
-                        reason: err.clone(),
-                        recoverable: false,
-                    },
-                );
+                let _ = app.emit("session://update", &ended);
             }
             return Err(err);
         }
@@ -1908,15 +2063,14 @@ pub async fn set_session_mtls_mode(
         Err(err) => {
             state.clear_connecting_epoch(my_epoch);
             if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-                state.record_terminal_error_if_epoch(my_epoch, err.clone());
+                let ended = session_ended_with_error(err.clone(), false);
+                let ui_err = match &ended {
+                    SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                    _ => None,
+                };
+                state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
                 let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-                let _ = app.emit(
-                    "session://update",
-                    &SessionUpdate::Ended {
-                        reason: err.clone(),
-                        recoverable: false,
-                    },
-                );
+                let _ = app.emit("session://update", &ended);
             }
             return Err(err);
         }
@@ -2008,17 +2162,20 @@ pub(crate) fn resolve_session_snapshot(
             None,
         );
     }
-    if let Some((err_epoch, reason)) = state
+    if let Some((err_epoch, reason, stored_ui_error)) = state
         .last_terminal_error
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
     {
         if err_epoch == cur_epoch {
+            let ui_error =
+                stored_ui_error.or_else(|| Some(classify_macos_session_or_signal_error(&reason)));
             return (
                 Some(SessionUpdate::Ended {
                     reason,
                     recoverable: false,
+                    ui_error,
                 }),
                 None,
             );
@@ -2030,6 +2187,7 @@ pub(crate) fn resolve_session_snapshot(
 /// IPC 命令：拉取最近一次会话状态快照（Review M8 + U-H2 / U-H3：
 /// 在单次 `session` 锁内校验 `!disconnecting` 与匹配 `sid`，同时原子取出缓存的被控端锁屏/挂起状态；
 /// 若处于锁屏或采集挂起态，则向 S1 窗口补发一次 `host_screen_state`；
+/// 若当前活动会话有工具权限限制，亦补发一次 `tool_permissions_updated`；
 /// 若当前无活动会话但处于重连中 / 协商中 / 当前代次终态失败，则补发对应状态避免 S1 永久转圈）。
 #[tauri::command]
 pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<SessionUpdate> {
@@ -2043,6 +2201,25 @@ pub fn session_snapshot(app: AppHandle, state: State<'_, AppState>) -> Option<Se
                 capture_suspended,
             },
         );
+    }
+    let active_perms = {
+        let slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .filter(|a| !a.disconnecting)
+            .map(|a| a.meta.tool_permissions)
+    };
+    if let Some(perms) = active_perms {
+        if !perms.allow_file_transfer || !perms.allow_terminal || !perms.allow_port_map {
+            let _ = app.emit_to(
+                "session",
+                "session://update",
+                &SessionUpdate::ToolPermissionsUpdated(rc_session::ToolPermissions {
+                    allow_file_transfer: perms.allow_file_transfer,
+                    allow_terminal: perms.allow_terminal,
+                    allow_port_map: perms.allow_port_map,
+                }),
+            );
+        }
     }
     snap
 }
@@ -2136,10 +2313,7 @@ pub fn session_command(
                     let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
                     let _ = app.emit(
                         "session://update",
-                        &SessionUpdate::Ended {
-                            reason: "已主动断开远控会话".to_string(),
-                            recoverable: false,
-                        },
+                        &session_ended_user_cancelled("已主动断开远控会话"),
                     );
                 }
                 DisconnectCommandOutcome::NeedsMainThreadDetach(sid, lease) => {
@@ -2388,10 +2562,11 @@ pub(crate) fn start_host_service_with_policy(
             other => Err(format!("后台服务返回异常响应: {other:?}")),
         };
     }
-    let (default_encrypt, file_transfer_dir) = {
+    let (default_encrypt, allow_assist_file_transfer, file_transfer_dir) = {
         let prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
         (
             prefs.default_encrypt_connection,
+            prefs.allow_assist_file_transfer,
             prefs.resolved_file_transfer_dir(),
         )
     };
@@ -2403,6 +2578,7 @@ pub(crate) fn start_host_service_with_policy(
     if let Some(handle) = host.handle.as_ref() {
         handle.set_allow_owner_control(host.allow_owner_control);
         handle.set_allow_remote_assist(allow_remote_assist);
+        handle.set_allow_assist_file_transfer(allow_assist_file_transfer);
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_config, accept_mtls_lan);
         handle.set_file_transfer_dir(Some(file_transfer_dir));
@@ -2426,6 +2602,7 @@ pub(crate) fn start_host_service_with_policy(
             accept_mtls_lan,
             forbid_passwordless_auto_approve: false,
             file_transfer_dir: Some(file_transfer_dir),
+            allow_assist_file_transfer,
         })?;
         host.allow_remote_assist = allow_remote_assist;
         let actual = handle.listen_addr();
@@ -2682,8 +2859,11 @@ pub fn request_screen_recording_permission(state: State<'_, AppState>) -> Permis
 
 /// IPC 命令：打开指定权限对应的系统设置隐私面板（`"screen_recording"` / `"accessibility"` / `"input_monitoring"`）。
 #[tauri::command]
-pub fn open_permission_settings(kind: String) -> Result<(), String> {
-    permissions::open_permission_settings(&kind)
+pub fn open_permission_settings(kind: String) -> Result<(), UiCommandError> {
+    permissions::open_permission_settings(&kind).map_err(|err| {
+        let ui_err = permissions::permission_kind_ui_error(&kind, Some(err.clone()));
+        UiCommandError::from_ui_error_with_message(err, ui_err)
+    })
 }
 
 fn persist_prefs_mutation(
@@ -2750,9 +2930,13 @@ pub fn set_host_enabled(
     enabled: bool,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<HostStatusSnapshot, String> {
-    state.require_unlocked()?;
-    state.require_authenticated()?;
+) -> Result<HostStatusSnapshot, UiCommandError> {
+    state
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
+    state
+        .require_authenticated()
+        .map_err(UiCommandError::from_auth_gate_error)?;
     if enabled {
         let prefs_path = app_prefs::default_prefs_path();
         let snapshot = {
@@ -2760,10 +2944,18 @@ pub fn set_host_enabled(
                 let snap = match call_agent_ipc(
                     ServiceRequest::SetRemoteAssist { enabled: true },
                     Duration::from_secs(3),
-                )? {
+                )
+                .map_err(UiCommandError::from_host_error)?
+                {
                     ServiceResponse::Snapshot(s) => HostStatusSnapshot::from_agent_snapshot(*s),
-                    ServiceResponse::Error { message } => return Err(message),
-                    other => return Err(format!("后台开启远程协助返回异常: {other:?}")),
+                    ServiceResponse::Error { message } => {
+                        return Err(UiCommandError::from_host_error(message));
+                    }
+                    other => {
+                        return Err(UiCommandError::from_host_error(format!(
+                            "后台开启远程协助返回异常: {other:?}"
+                        )));
+                    }
                 };
                 let _io = state
                     .prefs_io_lock
@@ -2776,7 +2968,12 @@ pub fn set_host_enabled(
                 snap
             } else {
                 let perms = permissions::check_permissions();
-                permissions::ensure_host_ready(&perms)?;
+                if let Err(ui_err) = permissions::ensure_host_ready_ui_error(&perms) {
+                    let msg = permissions::ensure_host_ready(&perms)
+                        .err()
+                        .unwrap_or_else(|| ui_err.message.clone());
+                    return Err(UiCommandError::from_ui_error_with_message(msg, *ui_err));
+                }
 
                 let _io = state
                     .prefs_io_lock
@@ -2793,7 +2990,7 @@ pub fn set_host_enabled(
                     app_prefs::save_to_path(&prefs_path, &snapshot_prefs).map_err(|err| {
                         let mut revert = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
                         revert.allow_remote_assist = prev;
-                        err
+                        UiCommandError::from_host_error(err)
                     })?;
                     prev
                 };
@@ -2807,7 +3004,7 @@ pub fn set_host_enabled(
                             prefs.clone()
                         };
                         let _ = app_prefs::save_to_path(&prefs_path, &reverted);
-                        return Err(err);
+                        return Err(UiCommandError::from_host_error(err));
                     }
                 }
             }
@@ -2821,10 +3018,18 @@ pub fn set_host_enabled(
                 let snap = match call_agent_ipc(
                     ServiceRequest::SetRemoteAssist { enabled: false },
                     Duration::from_secs(3),
-                )? {
+                )
+                .map_err(UiCommandError::from_host_error)?
+                {
                     ServiceResponse::Snapshot(s) => HostStatusSnapshot::from_agent_snapshot(*s),
-                    ServiceResponse::Error { message } => return Err(message),
-                    other => return Err(format!("后台关闭远程协助返回异常: {other:?}")),
+                    ServiceResponse::Error { message } => {
+                        return Err(UiCommandError::from_host_error(message));
+                    }
+                    other => {
+                        return Err(UiCommandError::from_host_error(format!(
+                            "后台关闭远程协助返回异常: {other:?}"
+                        )));
+                    }
                 };
                 {
                     let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
@@ -2855,7 +3060,7 @@ pub fn set_host_enabled(
                     app_prefs::save_to_path(&prefs_path, &snapshot_prefs).map_err(|err| {
                         let mut revert = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
                         revert.allow_remote_assist = prev;
-                        err
+                        UiCommandError::from_host_error(err)
                     })?;
                     prev
                 };
@@ -3710,10 +3915,60 @@ pub struct SecurityPrefsSnapshot {
     pub default_encrypt_connection: bool,
     /// 是否开启允许他人远程协助。
     pub allow_remote_assist: bool,
+    /// 他人远程协助本机时是否允许文件互传（默认 `true`；同账号本人自控始终豁免）。
+    pub allow_assist_file_transfer: bool,
     /// 是否显示局域网设备（默认关闭）。
     pub show_lan_devices: bool,
     /// 本机设备证书状态。
     pub cert_status: GateCertStatus,
+}
+
+/// 桌面端安全设置偏好补丁（包含核心 `SecurityPrefsPatch` 与 Issue #6 文件互传门控）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UiSecurityPrefsPatch {
+    /// 可选「允许其他设备远程协助本机」开关。
+    pub allow_remote_assist: Option<bool>,
+    /// 可选「被远程协助时允许文件互传」开关。
+    pub allow_assist_file_transfer: Option<bool>,
+    /// 可选「默认开启加密连接（mTLS）」开关。
+    pub default_encrypt_connection: Option<bool>,
+    /// 可选「显示局域网设备」开关。
+    pub show_lan_devices: Option<bool>,
+    /// 可选自定义访问验证码。
+    pub custom_host_password: Option<String>,
+    /// 为 `Some(true)` 时清除自定义密码并切回临时验证码模式。
+    pub clear_custom_host_password: Option<bool>,
+}
+
+impl From<SecurityPrefsPatch> for UiSecurityPrefsPatch {
+    fn from(p: SecurityPrefsPatch) -> Self {
+        Self {
+            allow_remote_assist: p.allow_remote_assist,
+            allow_assist_file_transfer: None,
+            default_encrypt_connection: p.default_encrypt_connection,
+            show_lan_devices: p.show_lan_devices,
+            custom_host_password: p.custom_host_password,
+            clear_custom_host_password: p.clear_custom_host_password,
+        }
+    }
+}
+
+impl UiSecurityPrefsPatch {
+    fn apply_to(self, prefs: &mut AppPrefs) -> Result<(), String> {
+        let allow_ft = self.allow_assist_file_transfer;
+        prefs.apply_security_patch(SecurityPrefsPatch {
+            allow_remote_assist: self.allow_remote_assist,
+            default_encrypt_connection: self.default_encrypt_connection,
+            show_lan_devices: self.show_lan_devices,
+            custom_host_password: self.custom_host_password,
+            clear_custom_host_password: self.clear_custom_host_password,
+        })?;
+        if let Some(v) = allow_ft {
+            prefs.allow_assist_file_transfer = v;
+        }
+        Ok(())
+    }
 }
 
 fn format_auth_error(err: AuthClientError) -> String {
@@ -3880,11 +4135,26 @@ fn with_valid_token_in_mode_raw<T>(
 fn handle_relogin_required_error(app: &AppHandle, err: AuthClientError) -> String {
     match err {
         AuthClientError::ReloginRequired(msg) => {
+            let ui_err =
+                AuthClientError::ReloginRequired(msg.clone()).to_ui_error(ErrorPlatform::Macos);
             let zh = format_auth_error(AuthClientError::ReloginRequired(msg));
-            force_logout_from_kick(app, zh.clone());
+            force_logout_from_kick_with_ui_error(app, zh.clone(), ui_err);
             zh
         }
         other => format_auth_error(other),
+    }
+}
+
+fn handle_relogin_required_ui_error(app: &AppHandle, err: AuthClientError) -> UiCommandError {
+    match err {
+        AuthClientError::ReloginRequired(msg) => {
+            let ui_err =
+                AuthClientError::ReloginRequired(msg.clone()).to_ui_error(ErrorPlatform::Macos);
+            let zh = format_auth_error(AuthClientError::ReloginRequired(msg));
+            force_logout_from_kick_with_ui_error(app, zh.clone(), ui_err.clone());
+            UiCommandError::from_ui_error_with_message(zh, ui_err)
+        }
+        other => UiCommandError::from_auth_error(&other),
     }
 }
 
@@ -4090,28 +4360,31 @@ fn post_auth_ready_with_reload(app: &AppHandle, state: &AppState, reload_proxy: 
     let _ = app.emit("gate://status", &state.gate_status_snapshot());
 }
 
-fn probe_and_save_server_to_path(
+fn probe_and_save_server_to_path_ui(
     state: &AppState,
     req: ProbeAndSaveServerRequest,
     path: &Path,
-) -> Result<ProbeServerResponse, String> {
+) -> Result<ProbeServerResponse, UiCommandError> {
     let default_api_port = req.api_port.unwrap_or(server_config::DEFAULT_API_PORT);
     let signal_port = req
         .signal_port
         .unwrap_or(server_config::DEFAULT_SIGNAL_PORT);
     let relay_port = req.relay_port.unwrap_or(server_config::DEFAULT_RELAY_PORT);
     if default_api_port == 0 || signal_port == 0 || relay_port == 0 {
-        return Err("API 端口、信令端口与中继端口必须为 1–65535".to_string());
+        return Err(UiCommandError::from_validation_error(
+            "API 端口、信令端口与中继端口必须为 1–65535",
+        ));
     }
 
     let (clean_host, effective_api_port) =
-        server_config::parse_server_input(&req.server_host, default_api_port)?;
+        server_config::parse_server_input(&req.server_host, default_api_port)
+            .map_err(UiCommandError::from_validation_error)?;
 
     let client = AuthHttpClient::new(clean_host.clone(), effective_api_port, req.use_https, None)
-        .map_err(format_auth_error)?;
+        .map_err(|e| UiCommandError::from_auth_error(&e))?;
     let probe = client
         .probe_server(req.expected_ca_fingerprint_sha256.as_deref())
-        .map_err(format_auth_error)?;
+        .map_err(|e| UiCommandError::from_auth_error(&e))?;
 
     *state
         .allow_registration
@@ -4166,7 +4439,18 @@ fn probe_and_save_server_to_path(
             (next, !same_endpoint, old_did)
         };
 
-        server_config::save_to_path(path, &next_cfg)?;
+        server_config::save_to_path(path, &next_cfg).map_err(|err| {
+            UiCommandError::from_ui_error_with_message(
+                err.clone(),
+                ui_error::resolve_ui_error(
+                    codes::VALIDATION_INVALID_CONFIG,
+                    ErrorPlatform::Macos,
+                    &[],
+                    None,
+                    Some(err),
+                ),
+            )
+        })?;
         if endpoint_changed {
             let (old_cfg, prev_sess) = state.auth.take_logout_context_and_wipe();
             if prev_sess.is_some() {
@@ -4215,6 +4499,15 @@ fn probe_and_save_server_to_path(
     })
 }
 
+#[cfg(test)]
+fn probe_and_save_server_to_path(
+    state: &AppState,
+    req: ProbeAndSaveServerRequest,
+    path: &Path,
+) -> Result<ProbeServerResponse, String> {
+    probe_and_save_server_to_path_ui(state, req, path).map_err(|e| e.message)
+}
+
 /// IPC 命令：查询首次启动双阶门禁状态、服务器配置、当前登录用户与设备证书状态。
 #[tauri::command]
 pub fn get_gate_status(state: State<'_, AppState>) -> GateStatusSnapshot {
@@ -4226,15 +4519,23 @@ pub fn get_gate_status(state: State<'_, AppState>) -> GateStatusSnapshot {
 pub async fn probe_and_save_server(
     req: ProbeAndSaveServerRequest,
     app: AppHandle,
-) -> Result<ProbeServerResponse, String> {
-    app.state::<AppState>().require_unlocked()?;
+) -> Result<ProbeServerResponse, UiCommandError> {
+    app.state::<AppState>()
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
     let app_for_blocking = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
-        probe_and_save_server_to_path(&state, req, &server_config::default_config_path())
+        probe_and_save_server_to_path_ui(&state, req, &server_config::default_config_path())
     })
     .await
-    .map_err(|e| format!("探测服务器任务异常：{e}"))??;
+    .map_err(|e| {
+        let msg = format!("探测服务器任务异常：{e}");
+        UiCommandError::from_ui_error_with_message(
+            msg.clone(),
+            ui_error::classify_signal_error(&msg, ErrorPlatform::Macos),
+        )
+    })??;
     if res.saved {
         let state = app.state::<AppState>();
         if state.gate_state() != AppGateState::Authenticated {
@@ -4264,13 +4565,16 @@ pub async fn probe_and_save_server(
 
 /// IPC 命令：刷新并返回服务端 `allowRegistration` 公共配置。
 #[tauri::command]
-pub async fn fetch_auth_config(app: AppHandle) -> Result<AuthConfigView, String> {
+pub async fn fetch_auth_config(app: AppHandle) -> Result<AuthConfigView, UiCommandError> {
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         let cfg = state.auth.server_config();
-        let client = AuthHttpClient::from_server_config(&cfg).map_err(format_auth_error)?;
-        let auth_cfg = client.fetch_auth_config().map_err(format_auth_error)?;
+        let client = AuthHttpClient::from_server_config(&cfg)
+            .map_err(|e| UiCommandError::from_auth_error(&e))?;
+        let auth_cfg = client
+            .fetch_auth_config()
+            .map_err(|e| UiCommandError::from_auth_error(&e))?;
         *state
             .allow_registration
             .lock()
@@ -4280,7 +4584,13 @@ pub async fn fetch_auth_config(app: AppHandle) -> Result<AuthConfigView, String>
         })
     })
     .await
-    .map_err(|e| format!("拉取认证配置任务异常：{e}"))?
+    .map_err(|e| {
+        let msg = format!("拉取认证配置任务异常：{e}");
+        UiCommandError::from_ui_error_with_message(
+            msg.clone(),
+            ui_error::classify_signal_error(&msg, ErrorPlatform::Macos),
+        )
+    })?
 }
 
 /// IPC 命令：注册新账号并在成功后签发设备证书、绑定设备及启动后台服务。
@@ -4288,19 +4598,23 @@ pub async fn fetch_auth_config(app: AppHandle) -> Result<AuthConfigView, String>
 pub async fn auth_register(
     req: AuthRegisterRequest,
     app: AppHandle,
-) -> Result<GateStatusSnapshot, String> {
-    app.state::<AppState>().require_unlocked()?;
+) -> Result<GateStatusSnapshot, UiCommandError> {
+    app.state::<AppState>()
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
     if req.email.trim().is_empty() {
-        return Err("请输入邮箱地址".to_string());
+        return Err(UiCommandError::from_validation_error("请输入邮箱地址"));
     }
     if req.password.is_empty() {
-        return Err("请输入密码".to_string());
+        return Err(UiCommandError::from_validation_error("请输入密码"));
     }
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         if state.gate_state() == AppGateState::Unconfigured {
-            return Err("请先配置并连接 RabbitControl 服务器".to_string());
+            return Err(UiCommandError::from_auth_gate_error(
+                "请先配置并连接 RabbitControl 服务器",
+            ));
         }
         let hostname = lan_discovery::local_hostname();
         let os_name = std::env::consts::OS;
@@ -4313,13 +4627,16 @@ pub async fn auth_register(
                 Some(&hostname),
                 Some(os_name),
             )
-            .map_err(format_auth_error)?;
+            .map_err(|e| UiCommandError::from_auth_error(&e))?;
         if !sess.must_change_password {
             if let Err(err) =
                 bind_device_and_ensure_cert(&state, &server_config::default_config_path(), None)
             {
                 let _ = perform_logout_cleanup(&app_for_blocking, false);
-                return Err(err);
+                return Err(UiCommandError::from_ui_error_with_message(
+                    err.clone(),
+                    ui_error::classify_signal_error(&err, ErrorPlatform::Macos),
+                ));
             }
             post_auth_ready_with_reload(&app_for_blocking, &state, true);
         } else {
@@ -4328,7 +4645,13 @@ pub async fn auth_register(
         Ok(state.gate_status_snapshot())
     })
     .await
-    .map_err(|e| format!("注册任务异常：{e}"))?
+    .map_err(|e| {
+        let msg = format!("注册任务异常：{e}");
+        UiCommandError::from_ui_error_with_message(
+            msg.clone(),
+            ui_error::classify_signal_error(&msg, ErrorPlatform::Macos),
+        )
+    })?
 }
 
 /// IPC 命令：邮箱密码登录并在成功后签发设备证书、绑定设备及启动后台服务。
@@ -4336,32 +4659,39 @@ pub async fn auth_register(
 pub async fn auth_login(
     req: AuthLoginRequest,
     app: AppHandle,
-) -> Result<GateStatusSnapshot, String> {
-    app.state::<AppState>().require_unlocked()?;
+) -> Result<GateStatusSnapshot, UiCommandError> {
+    app.state::<AppState>()
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
     if req.email.trim().is_empty() {
-        return Err("请输入邮箱地址".to_string());
+        return Err(UiCommandError::from_validation_error("请输入邮箱地址"));
     }
     if req.password.is_empty() {
-        return Err("请输入密码".to_string());
+        return Err(UiCommandError::from_validation_error("请输入密码"));
     }
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         if state.gate_state() == AppGateState::Unconfigured {
-            return Err("请先配置并连接 RabbitControl 服务器".to_string());
+            return Err(UiCommandError::from_auth_gate_error(
+                "请先配置并连接 RabbitControl 服务器",
+            ));
         }
         let hostname = lan_discovery::local_hostname();
         let os_name = std::env::consts::OS;
         let sess = state
             .auth
             .login(&req.email, &req.password, Some(&hostname), Some(os_name))
-            .map_err(format_auth_error)?;
+            .map_err(|e| UiCommandError::from_auth_error(&e))?;
         if !sess.must_change_password {
             if let Err(err) =
                 bind_device_and_ensure_cert(&state, &server_config::default_config_path(), None)
             {
                 let _ = perform_logout_cleanup(&app_for_blocking, false);
-                return Err(err);
+                return Err(UiCommandError::from_ui_error_with_message(
+                    err.clone(),
+                    ui_error::classify_signal_error(&err, ErrorPlatform::Macos),
+                ));
             }
             post_auth_ready_with_reload(&app_for_blocking, &state, true);
         } else {
@@ -4370,7 +4700,13 @@ pub async fn auth_login(
         Ok(state.gate_status_snapshot())
     })
     .await
-    .map_err(|e| format!("登录任务异常：{e}"))?
+    .map_err(|e| {
+        let msg = format!("登录任务异常：{e}");
+        UiCommandError::from_ui_error_with_message(
+            msg.clone(),
+            ui_error::classify_signal_error(&msg, ErrorPlatform::Macos),
+        )
+    })?
 }
 
 /// IPC 命令：修改当前登录账号密码；若由首次强制改密解锁则立即完成设备绑定与证书签发。
@@ -4378,16 +4714,20 @@ pub async fn auth_login(
 pub async fn auth_change_password(
     req: AuthChangePasswordRequest,
     app: AppHandle,
-) -> Result<GateStatusSnapshot, String> {
-    app.state::<AppState>().require_unlocked()?;
+) -> Result<GateStatusSnapshot, UiCommandError> {
+    app.state::<AppState>()
+        .require_unlocked()
+        .map_err(UiCommandError::from_auth_gate_error)?;
     if req.current_password.is_empty() || req.new_password.is_empty() {
-        return Err("请填写当前密码与新密码".to_string());
+        return Err(UiCommandError::from_validation_error(
+            "请填写当前密码与新密码",
+        ));
     }
     let app_for_blocking = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
         if state.auth.current_session().is_none() {
-            return Err("当前未登录".to_string());
+            return Err(UiCommandError::from_auth_gate_error("当前未登录"));
         }
         let prev_must_change = state
             .auth
@@ -4395,12 +4735,12 @@ pub async fn auth_change_password(
             .is_some_and(|s| s.must_change_password);
         if state.is_service_proxy() {
             let _ = sync_access_token_via_daemon(&state.auth, None)
-                .map_err(|err| handle_relogin_required_error(&app_for_blocking, err))?;
+                .map_err(|err| handle_relogin_required_ui_error(&app_for_blocking, err))?;
         }
         let updated = state
             .auth
             .change_password(&req.current_password, &req.new_password)
-            .map_err(|err| handle_relogin_required_error(&app_for_blocking, err))?;
+            .map_err(|err| handle_relogin_required_ui_error(&app_for_blocking, err))?;
         if !updated.must_change_password {
             if !prev_must_change {
                 let _ = state.auth.cert_manager().clear_device_cert();
@@ -4409,7 +4749,10 @@ pub async fn auth_change_password(
                 bind_device_and_ensure_cert(&state, &server_config::default_config_path(), None)
             {
                 let _ = perform_logout_cleanup(&app_for_blocking, false);
-                return Err(err);
+                return Err(UiCommandError::from_ui_error_with_message(
+                    err.clone(),
+                    ui_error::classify_signal_error(&err, ErrorPlatform::Macos),
+                ));
             }
             post_auth_ready_with_reload(&app_for_blocking, &state, true);
         } else {
@@ -4418,7 +4761,13 @@ pub async fn auth_change_password(
         Ok(state.gate_status_snapshot())
     })
     .await
-    .map_err(|e| format!("修改密码任务异常：{e}"))?
+    .map_err(|e| {
+        let msg = format!("修改密码任务异常：{e}");
+        UiCommandError::from_ui_error_with_message(
+            msg.clone(),
+            ui_error::classify_signal_error(&msg, ErrorPlatform::Macos),
+        )
+    })?
 }
 
 fn perform_logout_cleanup(app: &AppHandle, notify_remote: bool) -> GateStatusSnapshot {
@@ -4468,8 +4817,16 @@ fn perform_logout_cleanup(app: &AppHandle, notify_remote: bool) -> GateStatusSna
 
 /// 当账号被管理员禁用/删除/踢线时，强制清理本地凭据与证书并回退门禁至 `Unauthenticated`。
 pub(crate) fn force_logout_from_kick(app: &AppHandle, reason: String) {
+    let ui_error = ui_error::classify_signal_error(&reason, ErrorPlatform::Macos);
+    force_logout_from_kick_with_ui_error(app, reason, ui_error);
+}
+
+fn force_logout_from_kick_with_ui_error(app: &AppHandle, reason: String, ui_error: UiError) {
     let _ = perform_logout_cleanup(app, false);
-    let _ = app.emit("auth://kicked", serde_json::json!({ "reason": reason }));
+    let _ = app.emit(
+        "auth://kicked",
+        serde_json::json!({ "reason": reason, "uiError": ui_error }),
+    );
 }
 
 /// IPC 命令：退出当前账号登录，清空凭据与设备证书、停信令与被控端并回退门禁至 `Unauthenticated`。
@@ -4557,6 +4914,7 @@ fn security_prefs_snapshot(state: &AppState) -> SecurityPrefsSnapshot {
     SecurityPrefsSnapshot {
         default_encrypt_connection: prefs.default_encrypt_connection,
         allow_remote_assist: prefs.allow_remote_assist,
+        allow_assist_file_transfer: prefs.allow_assist_file_transfer,
         show_lan_devices: prefs.show_lan_devices,
         cert_status: state.cert_status(),
     }
@@ -4565,22 +4923,24 @@ fn security_prefs_snapshot(state: &AppState) -> SecurityPrefsSnapshot {
 #[cfg(test)]
 fn save_security_prefs_to_path(
     state: &AppState,
-    patch: SecurityPrefsPatch,
+    patch: impl Into<UiSecurityPrefsPatch>,
     path: &Path,
 ) -> Result<SecurityPrefsSnapshot, String> {
+    let patch: UiSecurityPrefsPatch = patch.into();
     let _io = state
         .prefs_io_lock
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let next = {
         let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
-        prefs.apply_security_patch(patch)?;
+        patch.apply_to(&mut prefs)?;
         prefs.clone()
     };
     app_prefs::save_to_path(path, &next)?;
     Ok(SecurityPrefsSnapshot {
         default_encrypt_connection: next.default_encrypt_connection,
         allow_remote_assist: next.allow_remote_assist,
+        allow_assist_file_transfer: next.allow_assist_file_transfer,
         show_lan_devices: next.show_lan_devices,
         cert_status: state.cert_status(),
     })
@@ -4602,13 +4962,14 @@ pub async fn get_security_prefs(app: AppHandle) -> Result<SecurityPrefsSnapshot,
 /// IPC 命令：保存安全与 mTLS 加密偏好设置，并实时同步被控端策略（始终保留同账号本人免密自控监听）。
 #[tauri::command]
 pub async fn save_security_prefs(
-    patch: SecurityPrefsPatch,
+    patch: UiSecurityPrefsPatch,
     app: AppHandle,
 ) -> Result<SecurityPrefsSnapshot, String> {
     let state_gate = app.state::<AppState>();
     state_gate.require_unlocked()?;
     state_gate.require_authenticated()?;
     let assist_changed = patch.allow_remote_assist;
+    let assist_ft_changed = patch.allow_assist_file_transfer;
     let app_for_blocking = app.clone();
     let snap = tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_blocking.state::<AppState>();
@@ -4625,7 +4986,7 @@ pub async fn save_security_prefs(
                 if state.is_service_proxy() && prefs_path.exists() {
                     *prefs = app_prefs::load_from_path(&prefs_path);
                 }
-                prefs.apply_security_patch(patch)?;
+                patch.apply_to(&mut prefs)?;
                 (prev, prefs.clone())
             };
             if let Err(err) = app_prefs::save_to_path(&prefs_path, &next) {
@@ -4678,12 +5039,39 @@ pub async fn save_security_prefs(
             SecurityPrefsSnapshot {
                 default_encrypt_connection: next.default_encrypt_connection,
                 allow_remote_assist: next.allow_remote_assist,
+                allow_assist_file_transfer: next.allow_assist_file_transfer,
                 show_lan_devices: next.show_lan_devices,
                 cert_status: state.cert_status(),
             }
         };
         if let Some(allow) = assist_changed {
             sync_assist_state_to_server(&app_for_blocking, &state, allow);
+        }
+        if state.is_service_proxy() {
+            if let Some(allow_ft) = assist_ft_changed {
+                match call_agent_ipc(
+                    ServiceRequest::SetAssistFileTransfer { enabled: allow_ft },
+                    Duration::from_secs(2),
+                ) {
+                    Ok(ServiceResponse::Snapshot(_)) | Ok(ServiceResponse::Ok) => {}
+                    Ok(ServiceResponse::Error { message }) => {
+                        eprintln!(
+                            "[rc-ui] 后台服务同步远程协助文件互传策略被拒绝: {message}"
+                        );
+                        return Err(format!("后台服务同步文件互传策略失败：{message}"));
+                    }
+                    Ok(other) => {
+                        eprintln!(
+                            "[rc-ui] 后台服务同步远程协助文件互传策略返回异常响应: {other:?}"
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[rc-ui] 通知后台服务热更新文件互传策略失败（已落盘并由 ReloadPrefs 兜底）: {err}"
+                        );
+                    }
+                }
+            }
         }
         notify_background_services_reload(&state, false);
         sync_standalone_status_bar(&state);
@@ -4901,11 +5289,22 @@ fn validate_portmap_add(
 pub async fn file_list_remote(
     path: Option<String>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    let tools = active_session_tools(&state)?;
+) -> Result<(), UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     tauri::async_runtime::spawn_blocking(move || tools.file_list_remote(path))
         .await
-        .map_err(|e| format!("列举远端目录任务异常：{e}"))?
+        .map_err(|e| {
+            UiCommandError::from_file_tool_error_with_policy(
+                format!("列举远端目录任务异常：{e}"),
+                allow_ft,
+            )
+        })?
+        .map_err(|e| {
+            let cur_allow_ft = active_session_file_transfer_allowed(&state);
+            UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+        })
 }
 
 /// IPC 命令：请求在远端创建目录（结果通过 `"file://event"` 推送，H12 经 `spawn_blocking` 投递专用文件工作线程）。
@@ -4914,20 +5313,45 @@ pub async fn file_mkdir_remote(
     parent: String,
     name: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    let tools = active_session_tools(&state)?;
+) -> Result<(), UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     tauri::async_runtime::spawn_blocking(move || tools.file_mkdir_remote(parent, name))
         .await
-        .map_err(|e| format!("创建远端目录任务异常：{e}"))?
+        .map_err(|e| {
+            UiCommandError::from_file_tool_error_with_policy(
+                format!("创建远端目录任务异常：{e}"),
+                allow_ft,
+            )
+        })?
+        .map_err(|e| {
+            let cur_allow_ft = active_session_file_transfer_allowed(&state);
+            UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+        })
 }
 
 /// IPC 命令：请求删除远端文件或目录（结果通过 `"file://event"` 推送）。
 #[tauri::command]
-pub async fn file_delete_remote(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let tools = active_session_tools(&state)?;
+pub async fn file_delete_remote(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     tauri::async_runtime::spawn_blocking(move || tools.file_delete_remote(path))
         .await
-        .map_err(|e| format!("删除远端文件任务异常：{e}"))?
+        .map_err(|e| {
+            UiCommandError::from_file_tool_error_with_policy(
+                format!("删除远端文件任务异常：{e}"),
+                allow_ft,
+            )
+        })?
+        .map_err(|e| {
+            let cur_allow_ft = active_session_file_transfer_allowed(&state);
+            UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+        })
 }
 
 /// IPC 命令：请求重命名远端文件或目录（结果通过 `"file://event"` 推送）。
@@ -4936,11 +5360,22 @@ pub async fn file_rename_remote(
     path: String,
     new_name: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    let tools = active_session_tools(&state)?;
+) -> Result<(), UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     tauri::async_runtime::spawn_blocking(move || tools.file_rename_remote(path, new_name))
         .await
-        .map_err(|e| format!("重命名远端文件任务异常：{e}"))?
+        .map_err(|e| {
+            UiCommandError::from_file_tool_error_with_policy(
+                format!("重命名远端文件任务异常：{e}"),
+                allow_ft,
+            )
+        })?
+        .map_err(|e| {
+            let cur_allow_ft = active_session_file_transfer_allowed(&state);
+            UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+        })
 }
 
 /// IPC 命令：上传本地文件至远端目录，返回传输任务 ID（H12：不阻塞 UI IPC 线程与 60fps 视频线程）。
@@ -4949,11 +5384,22 @@ pub async fn file_upload(
     local_path: String,
     remote_dir: String,
     state: State<'_, AppState>,
-) -> Result<u64, String> {
-    let tools = active_session_tools(&state)?;
+) -> Result<u64, UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     tauri::async_runtime::spawn_blocking(move || tools.file_upload(&local_path, &remote_dir))
         .await
-        .map_err(|e| format!("发起文件上传任务异常：{e}"))?
+        .map_err(|e| {
+            UiCommandError::from_file_tool_error_with_policy(
+                format!("发起文件上传任务异常：{e}"),
+                allow_ft,
+            )
+        })?
+        .map_err(|e| {
+            let cur_allow_ft = active_session_file_transfer_allowed(&state);
+            UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+        })
 }
 
 /// IPC 命令：从远端下载文件至本地目录，返回传输任务 ID（H12：不阻塞 UI IPC 线程与 60fps 视频线程）。
@@ -4962,8 +5408,10 @@ pub async fn file_download(
     remote_path: String,
     local_dir: String,
     state: State<'_, AppState>,
-) -> Result<u64, String> {
-    let tools = active_session_tools(&state)?;
+) -> Result<u64, UiCommandError> {
+    let allow_ft = active_session_file_transfer_allowed(&state);
+    let tools = active_session_tools(&state)
+        .map_err(|e| UiCommandError::from_file_tool_error_with_policy(e, allow_ft))?;
     let fallback_dir = if local_dir.trim().is_empty() {
         let prefs = sync_prefs_from_disk_if_proxy(&state);
         Some((
@@ -5012,7 +5460,16 @@ pub async fn file_download(
         tools.file_download(&remote_path, &effective_dir)
     })
     .await
-    .map_err(|e| format!("发起文件下载任务异常：{e}"))?
+    .map_err(|e| {
+        UiCommandError::from_file_tool_error_with_policy(
+            format!("发起文件下载任务异常：{e}"),
+            allow_ft,
+        )
+    })?
+    .map_err(|e| {
+        let cur_allow_ft = active_session_file_transfer_allowed(&state);
+        UiCommandError::from_file_tool_error_with_policy(e, cur_allow_ft)
+    })
 }
 
 /// IPC 命令：取消进行中的文件传输任务（H12）。
@@ -6819,6 +7276,7 @@ async fn reconnect_with_saved_params(
     meta.mtls_active = false;
     meta.peer_cert_fingerprint = None;
     meta.phase = "connecting".to_string();
+    meta.tool_permissions = state::ToolPermissionsSnapshot::default();
 
     let ui_cfg = UiSessionConfig {
         connect_addr,
@@ -6911,6 +7369,7 @@ pub(crate) fn spawn_auto_reconnect_task(
             }
             meta.phase = "reconnecting".to_string();
             meta.connected = false;
+            meta.tool_permissions = state::ToolPermissionsSnapshot::default();
             save_last_session_params(&st, watch_only, meta.clone());
 
             let attempt = (idx + 1) as u32;
@@ -6978,17 +7437,16 @@ pub(crate) fn spawn_auto_reconnect_task(
         // 8 次全部耗尽：仅在代次未变更时记录终态错误、释放活跃令牌并通知终态失败与非活动态，绝不自动关闭 S1 窗口。
         if st.session_open_epoch.load(Ordering::Acquire) == expected_epoch {
             let reason = format!("自动重连失败（已重试 {max_attempts} 次）：{last_err}");
+            let ended = session_ended_with_error(reason.clone(), false);
+            let ui_err = match &ended {
+                SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                _ => None,
+            };
             st.auto_reconnect_attempts.store(0, Ordering::Release);
-            st.record_terminal_error_if_epoch(expected_epoch, reason.clone());
+            st.record_terminal_error_with_ui_if_epoch(expected_epoch, reason, ui_err);
             drop(guard);
             let _ = app_bg.emit("session://active-state", &ActiveSessionInfo::inactive());
-            let _ = app_bg.emit(
-                "session://update",
-                &SessionUpdate::Ended {
-                    reason,
-                    recoverable: false,
-                },
-            );
+            let _ = app_bg.emit("session://update", &ended);
         }
     });
 }
@@ -7020,6 +7478,7 @@ pub async fn reconnect_last_session(
     meta.transport = None;
     meta.mtls_active = false;
     meta.peer_cert_fingerprint = None;
+    meta.tool_permissions = state::ToolPermissionsSnapshot::default();
     save_last_session_params(&state, watch_only, meta.clone());
     let _connecting_guard = ConnectingEpochGuard::begin(&state, my_epoch);
 
@@ -7052,15 +7511,14 @@ pub async fn reconnect_last_session(
     {
         state.clear_connecting_epoch(my_epoch);
         if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
-            state.record_terminal_error_if_epoch(my_epoch, err.clone());
+            let ended = session_ended_with_error(err.clone(), false);
+            let ui_err = match &ended {
+                SessionUpdate::Ended { ui_error, .. } => ui_error.clone(),
+                _ => None,
+            };
+            state.record_terminal_error_with_ui_if_epoch(my_epoch, err.clone(), ui_err);
             let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-            let _ = app.emit(
-                "session://update",
-                &SessionUpdate::Ended {
-                    reason: err.clone(),
-                    recoverable: false,
-                },
-            );
+            let _ = app.emit("session://update", &ended);
         }
         return Err(err);
     }
@@ -8330,7 +8788,8 @@ mod tests {
     #[test]
     fn open_permission_settings_command_rejects_invalid_kind() {
         let err = open_permission_settings("unknown_perm".to_string()).unwrap_err();
-        assert!(err.contains("unknown_perm"));
+        assert!(err.message.contains("unknown_perm"));
+        assert_eq!(err.ui_error.code, codes::VALIDATION_INVALID_INPUT);
     }
 
     #[test]
@@ -9160,13 +9619,14 @@ mod tests {
         };
 
         let val = serde_json::to_value(&app_info).expect("serialize AppInfo");
-        assert_eq!(
-            val.get("coreVersion").and_then(|v| v.as_str()),
-            Some(rc_client_core::version::core_version())
+        let expected_core_version = rc_client_core::version::core_version();
+        assert!(
+            !expected_core_version.is_empty(),
+            "rc_client_core::version::core_version() 不得为空"
         );
         assert_eq!(
             val.get("coreVersion").and_then(|v| v.as_str()),
-            Some("0.1.26")
+            Some(expected_core_version)
         );
         let cbi = val
             .get("coreBuildInfo")
@@ -9651,13 +10111,14 @@ mod tests {
         );
         drop(reconn_guard);
 
-        // 3) 快速/早期失败写入当前 epoch 终态错误后，晚加载 S1 通过 session_snapshot 可 100% 补领 Ended。
+        // 3) 快速/早期失败写入当前 epoch 终态错误后，晚加载 S1 通过 session_snapshot 可 100% 补领 Ended（附带结构化 UiError）。
         state.record_terminal_error_if_epoch(epoch, "对端设备离线".to_string());
         assert_eq!(
             resolve_session_snapshot(&state).0,
             Some(SessionUpdate::Ended {
                 reason: "对端设备离线".to_string(),
                 recoverable: false,
+                ui_error: Some(classify_macos_session_or_signal_error("对端设备离线")),
             })
         );
 
@@ -9754,5 +10215,128 @@ mod tests {
             ),
             ConnectionMode::TcpRelay
         );
+    }
+
+    #[test]
+    fn allow_assist_file_transfer_prefs_persist_and_json_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "rc-ui-assist-ft-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let prefs_path = dir.join("prefs.json");
+
+        let state = AppState::new_for_test();
+        let initial = security_prefs_snapshot(&state);
+        assert!(
+            initial.allow_assist_file_transfer,
+            "默认应允许远程协助文件互传以兼容存量配置"
+        );
+
+        let updated = save_security_prefs_to_path(
+            &state,
+            UiSecurityPrefsPatch {
+                allow_assist_file_transfer: Some(false),
+                ..Default::default()
+            },
+            &prefs_path,
+        )
+        .expect("save allow_assist_file_transfer=false must succeed");
+        assert!(!updated.allow_assist_file_transfer);
+        let snap_json = serde_json::to_value(&updated).expect("serialize SecurityPrefsSnapshot");
+        assert_eq!(snap_json["allowAssistFileTransfer"], false);
+
+        let reloaded = app_prefs::load_from_path(&prefs_path);
+        assert!(!reloaded.allow_assist_file_transfer);
+
+        let reenabled = save_security_prefs_to_path(
+            &state,
+            UiSecurityPrefsPatch {
+                allow_assist_file_transfer: Some(true),
+                ..Default::default()
+            },
+            &prefs_path,
+        )
+        .expect("save allow_assist_file_transfer=true must succeed");
+        assert!(reenabled.allow_assist_file_transfer);
+        assert!(app_prefs::load_from_path(&prefs_path).allow_assist_file_transfer);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_command_error_maps_auth_signal_session_tcc_and_tool_forbidden() {
+        let auth_err = AuthClientError::Api {
+            status: 401,
+            code: "INVALID_CREDENTIALS".to_string(),
+            message: "邮箱或密码错误".to_string(),
+        };
+        let cmd_auth = UiCommandError::from_auth_error(&auth_err);
+        assert_eq!(cmd_auth.ui_error.code, codes::AUTH_INVALID_CREDENTIALS);
+        assert_eq!(cmd_auth.ui_error.status, Some(401));
+        let auth_json = serde_json::to_value(&cmd_auth).expect("serialize UiCommandError");
+        assert_eq!(
+            auth_json["uiError"]["code"],
+            codes::AUTH_INVALID_CREDENTIALS
+        );
+        assert!(!auth_json["message"].as_str().unwrap_or("").is_empty());
+
+        let reuse_err = AuthClientError::ReloginRequired("TOKEN_REUSE_DETECTED".to_string());
+        let cmd_reuse = UiCommandError::from_auth_error(&reuse_err);
+        assert_eq!(cmd_reuse.ui_error.code, codes::AUTH_TOKEN_REUSE_DETECTED);
+
+        let offline_ui = classify_macos_session_or_signal_error("对端设备离线");
+        assert_eq!(offline_ui.code, codes::SIGNAL_PEER_OFFLINE);
+
+        let auth_rej_ui = classify_macos_session_or_signal_error("访问密码校验失败");
+        assert_eq!(auth_rej_ui.code, codes::SESSION_AUTH_REJECTED);
+
+        let host_tcc = UiCommandError::from_host_error("缺少屏幕录制权限，无法采集画面");
+        assert_eq!(
+            host_tcc.ui_error.code,
+            codes::PLATFORM_MACOS_SCREEN_RECORDING_DENIED
+        );
+
+        // 本地磁盘 I/O Permission denied（会话允许文件互传）绝不得误判为 tool.forbidden。
+        let os_perm_denied = UiCommandError::from_file_tool_error_with_policy(
+            "打开本地文件失败: Permission denied (os error 13)",
+            true,
+        );
+        assert_eq!(
+            os_perm_denied.ui_error.code,
+            codes::TOOL_FILE_TRANSFER_FAILED
+        );
+
+        let zh_perm_denied = UiCommandError::from_file_tool_error_with_policy(
+            "写入目标目录失败：目录权限不足",
+            true,
+        );
+        assert_eq!(
+            zh_perm_denied.ui_error.code,
+            codes::TOOL_FILE_TRANSFER_FAILED
+        );
+
+        // 会话策略明确关闭文件互传，或核心层返回规范 tool.forbidden 文案时才映射为 tool.forbidden。
+        let policy_denied =
+            UiCommandError::from_file_tool_error_with_policy("任意文件调用失败", false);
+        assert_eq!(policy_denied.ui_error.code, codes::TOOL_FORBIDDEN);
+        assert!(policy_denied.ui_error.message.contains("文件传输"));
+
+        let core_forbidden_msg = ui_error::tool_forbidden_ui_error(
+            rc_session::TOOL_CHANNEL_FILE,
+            ErrorPlatform::Macos,
+            None,
+        )
+        .message;
+        let core_denied =
+            UiCommandError::from_file_tool_error_with_policy(core_forbidden_msg, true);
+        assert_eq!(core_denied.ui_error.code, codes::TOOL_FORBIDDEN);
+
+        let file_generic = UiCommandError::from_file_tool_error_with_policy("磁盘空间不足", true);
+        assert_eq!(file_generic.ui_error.code, codes::TOOL_FILE_TRANSFER_FAILED);
     }
 }

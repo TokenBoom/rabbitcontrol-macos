@@ -254,8 +254,47 @@
     var stageSpinnerEl = document.getElementById('stage-spinner');
     var stageTitleEl = document.getElementById('stage-title');
     var stageDescEl = document.getElementById('stage-desc');
+    var stageUiErrEl = document.getElementById('stage-uierr');
     var stageReconnectingActionsEl = document.getElementById('stage-reconnecting-actions');
     var stageEndedPanelEl = document.getElementById('stage-ended-panel');
+    var ErrorDisplay = window.RCErrorDisplay || null;
+    var toolPermissions = {
+      allowFileTransfer: true,
+      allowTerminal: true,
+      allowPortMap: true
+    };
+    function syncToolPermissionsUi() {
+      if (!toolsEl) return;
+      var transferBtn = toolsEl.querySelector('[data-tool="transfer"]');
+      if (transferBtn) {
+        var allowed = toolPermissions.allowFileTransfer !== false;
+        transferBtn.disabled = !allowed;
+        transferBtn.classList.toggle('is-disabled', !allowed);
+        transferBtn.setAttribute('aria-disabled', allowed ? 'false' : 'true');
+        transferBtn.title = allowed
+          ? '文件传输'
+          : '被控端已禁止本次远程协助使用文件传输';
+      }
+    }
+    function applyToolPermissionsData(raw) {
+      if (!raw || typeof raw !== 'object') return;
+      if (typeof raw.allow_file_transfer === 'boolean') {
+        toolPermissions.allowFileTransfer = raw.allow_file_transfer;
+      } else if (typeof raw.allowFileTransfer === 'boolean') {
+        toolPermissions.allowFileTransfer = raw.allowFileTransfer;
+      }
+      if (typeof raw.allow_terminal === 'boolean') {
+        toolPermissions.allowTerminal = raw.allow_terminal;
+      } else if (typeof raw.allowTerminal === 'boolean') {
+        toolPermissions.allowTerminal = raw.allowTerminal;
+      }
+      if (typeof raw.allow_port_map === 'boolean') {
+        toolPermissions.allowPortMap = raw.allow_port_map;
+      } else if (typeof raw.allowPortMap === 'boolean') {
+        toolPermissions.allowPortMap = raw.allowPortMap;
+      }
+      syncToolPermissionsUi();
+    }
     var btnStageRetryNow = document.getElementById('btn-stage-retry-now');
     var btnStageDisconnect = document.getElementById('btn-stage-disconnect');
     var btnStageReconnect = document.getElementById('btn-stage-reconnect');
@@ -451,7 +490,7 @@
       stage.classList.toggle('has-video', on);
     }
 
-    function showStageOverlay(stateKind, title, desc) {
+    function showStageOverlay(stateKind, title, desc, uiError) {
       if (!stageOverlayEl) return;
       var kind = stateKind || 'connecting';
       stageOverlayEl.setAttribute('data-state', kind);
@@ -459,13 +498,26 @@
       if (stageSpinnerEl) {
         stageSpinnerEl.hidden = !(kind === 'connecting' || kind === 'reconnecting');
       }
+      var ui = uiError && ErrorDisplay ? ErrorDisplay.extractUiError(uiError) : null;
       if (stageTitleEl) {
-        stageTitleEl.textContent = title || '';
+        stageTitleEl.textContent = (ui && ui.title) || title || '';
       }
       if (stageDescEl) {
-        var d = desc ? String(desc).trim() : '';
+        var d = (ui && ui.message) || (desc ? String(desc).trim() : '');
         stageDescEl.textContent = d;
         stageDescEl.hidden = !d;
+      }
+      if (stageUiErrEl) {
+        if (kind === 'ended' && ui && ErrorDisplay && (ui.suggestion || ui.detail)) {
+          ErrorDisplay.renderInline(stageUiErrEl, ui, {
+            variant: 'stage',
+            omitTitle: true,
+            omitMessage: true
+          });
+        } else {
+          stageUiErrEl.textContent = '';
+          stageUiErrEl.hidden = true;
+        }
       }
       if (stageReconnectingActionsEl) {
         stageReconnectingActionsEl.hidden = kind !== 'reconnecting';
@@ -481,6 +533,10 @@
     function hideStageOverlay() {
       if (!stageOverlayEl) return;
       stageOverlayEl.hidden = true;
+      if (stageUiErrEl) {
+        stageUiErrEl.textContent = '';
+        stageUiErrEl.hidden = true;
+      }
     }
 
     function formatTransportBadge(raw) {
@@ -1620,6 +1676,9 @@
       if (privacyPreviewOverlay && !privacyPreviewOverlay.hidden) return true;
       if (shortcutsModalBackdrop && !shortcutsModalBackdrop.hidden) return true;
       if (remoteUpdateModalBackdrop && !remoteUpdateModalBackdrop.hidden) return true;
+      if (ErrorDisplay && typeof ErrorDisplay.isModalOpen === 'function' && ErrorDisplay.isModalOpen()) {
+        return true;
+      }
       return false;
     }
 
@@ -3133,10 +3192,17 @@
         btn.addEventListener('click', function (e) {
           e.preventDefault();
           var kind = btn.getAttribute('data-tool');
+          if (kind === 'transfer' && toolPermissions.allowFileTransfer === false) {
+            toast('被控端已禁止本次远程协助使用文件传输');
+            return;
+          }
           closePopover();
           if (IS_TAURI && typeof Bridge.openToolWindow === 'function') {
             Bridge.openToolWindow(kind).catch(function (err) {
-              toast('打开工具窗口失败：' + String(err || '未知错误'));
+              var msg = ErrorDisplay
+                ? ErrorDisplay.formatSummary(err, String(err || '未知错误'))
+                : String(err || '未知错误');
+              toast('打开工具窗口失败：' + msg);
             });
             return;
           }
@@ -3557,6 +3623,12 @@
           closeShortcutsModal();
           return;
         }
+        if (ErrorDisplay && typeof ErrorDisplay.isModalOpen === 'function' && ErrorDisplay.isModalOpen()) {
+          e.preventDefault();
+          swallowEscapeKeyup = true;
+          ErrorDisplay.closeModal();
+          return;
+        }
         if (remoteUpdateModalBackdrop && !remoteUpdateModalBackdrop.hidden) {
           e.preventDefault();
           swallowEscapeKeyup = true;
@@ -3752,6 +3824,12 @@
         remoteAudioMuted = false;
         displaysRequested = false;
         initialSessionPrefsApplied = false;
+        toolPermissions = {
+          allowFileTransfer: true,
+          allowTerminal: true,
+          allowPortMap: true
+        };
+        syncToolPermissionsUi();
         if (!preserveHostScreenState) {
           hostScreenLocked = false;
           hostCaptureSuspended = false;
@@ -4193,8 +4271,30 @@
           );
           return;
         }
+        if (upd.kind === 'tool_permissions_updated') {
+          applyToolPermissionsData(data);
+          return;
+        }
+        if (upd.kind === 'tool_permission_denied') {
+          var deniedUi = (data && (data.ui_error || data.uiError)) || null;
+          if (data && data.channel === 1) {
+            toolPermissions.allowFileTransfer = false;
+            syncToolPermissionsUi();
+          }
+          if (ErrorDisplay && deniedUi) {
+            ErrorDisplay.showToast(deniedUi, { toastFn: toast });
+          } else {
+            var chName = ErrorDisplay ? ErrorDisplay.channelLabel(data && data.channel) : '远程工具';
+            toast('被控端已禁止本次远程协助使用' + chName);
+          }
+          return;
+        }
         if (upd.kind === 'ended') {
-          var reason = data.reason ? String(data.reason) : '连接已断开';
+          var endedUi = ErrorDisplay ? ErrorDisplay.extractUiError(data) : null;
+          var reason =
+            (endedUi && endedUi.message) ||
+            (data.reason ? String(data.reason) : '连接已断开');
+          var rawReason = data.reason ? String(data.reason) : reason;
           var prevEndedSameReason =
             sessionLifecycleState === 'ended' &&
             stageDescEl &&
@@ -4209,7 +4309,7 @@
           degradedVideoNotice = false;
           setHasVideo(false);
           realSessionActive = false;
-          if (isUserDisconnectReason(reason)) {
+          if (isUserDisconnectReason(rawReason)) {
             sessionSwitchingPending = false;
             sessionSwitchAttempts = 0;
             cancelSessionSwitchTimer();
@@ -4219,26 +4319,31 @@
           if (
             (sessionSwitchingPending ||
               (remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting') ||
-              (typeof reason === 'string' && reason.indexOf('正在切换系统桌面') !== -1)) &&
+              (typeof rawReason === 'string' && rawReason.indexOf('正在切换系统桌面') !== -1)) &&
             typeof Bridge.reconnectLastSession === 'function'
           ) {
             sessionSwitchingPending = true;
             toast(
               remoteUpdateState.inProgress && remoteUpdateState.stage === 'restarting'
                 ? '被控端正在重启升级，自动重连中…'
-                : reason
+                : rawReason
             );
             scheduleSessionSwitchRetry();
             return;
           }
           /* 红线：任何连接失败 / 超时 / 重连耗尽 / 对端断开绝不自动关闭窗口，常驻展示失败交互面板 */
           if (!prevEndedSameReason) {
-            toast(reason);
+            toast(
+              endedUi && ErrorDisplay
+                ? ErrorDisplay.formatToastText(endedUi, reason)
+                : reason
+            );
           }
           showStageOverlay(
             'ended',
-            seenAnyConnected ? '远控连接已断开' : '连接失败',
-            reason
+            (endedUi && endedUi.title) || (seenAnyConnected ? '远控连接已断开' : '连接失败'),
+            reason,
+            endedUi
           );
         }
       }
@@ -4262,6 +4367,29 @@
         sessionUpdateListenPromise.then(fetchInitialSessionSnapshot, fetchInitialSessionSnapshot);
       } else {
         fetchInitialSessionSnapshot();
+      }
+      if (typeof Bridge.getActiveSessionInfo === 'function') {
+        Bridge.getActiveSessionInfo()
+          .then(function (info) {
+            if (info && info.active && info.toolPermissions) {
+              applyToolPermissionsData(info.toolPermissions);
+            }
+          })
+          .catch(function () {});
+      }
+      if (typeof Bridge.onActiveSessionState === 'function') {
+        Bridge.onActiveSessionState(function (info) {
+          if (info && info.active && info.toolPermissions) {
+            applyToolPermissionsData(info.toolPermissions);
+          } else if (info && !info.active) {
+            toolPermissions = {
+              allowFileTransfer: true,
+              allowTerminal: true,
+              allowPortMap: true
+            };
+            syncToolPermissionsUi();
+          }
+        });
       }
       if (typeof Bridge.getSessionHostVersion === 'function') {
         Bridge.getSessionHostVersion()

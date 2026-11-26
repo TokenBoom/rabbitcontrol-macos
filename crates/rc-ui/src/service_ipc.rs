@@ -31,12 +31,19 @@ pub enum ServiceSessionType {
     Standalone,
 }
 
+fn default_true_bool() -> bool {
+    true
+}
+
 /// 后台 `rc-host-agent` 暴露给前台 GUI 与状态栏菜单的状态快照。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSnapshot {
     /// 「允许远程协助」开关当前状态（仅本人自控监听运行但未开放他人协助时为 `false`）。
     pub enabled: bool,
+    /// 他人远程协助本机时是否允许文件互传（默认 `true` 兼容旧版快照）。
+    #[serde(default = "default_true_bool")]
+    pub allow_assist_file_transfer: bool,
     /// 被控端监听/信令循环是否在运行中。
     pub host_running: bool,
     /// 实际绑定的监听地址。
@@ -79,6 +86,11 @@ pub enum ServiceRequest {
     /// 开启或关闭「允许他人远程协助」。
     SetRemoteAssist {
         /// 是否允许非同账号他人协助。
+        enabled: bool,
+    },
+    /// 热更新「被远程协助时允许文件互传」策略（不中断当前会话，即时作用于运行中的被控端）。
+    SetAssistFileTransfer {
+        /// 是否允许他人远程协助本机时使用 W2 文件传输通道。
         enabled: bool,
     },
     /// 更新访问密码（`None` 或空串表示无密码/仅机主审批；临时验证码刷新请调用 `RotateTempCode`）。
@@ -713,6 +725,27 @@ mod tests {
             ServiceRequest::SetRemoteAssist { enabled } => {
                 ServiceResponse::Snapshot(Box::new(AgentSnapshot {
                     enabled,
+                    allow_assist_file_transfer: true,
+                    host_running: true,
+                    listen_addr: Some("0.0.0.0:9901".to_string()),
+                    display_addr: Some("192.168.1.10:9901".to_string()),
+                    password: "ABCD2345".to_string(),
+                    custom_password: false,
+                    backend: "sck+videotoolbox".to_string(),
+                    connected_peer: None,
+                    pending_approval: None,
+                    device_id: Some("604928235".to_string()),
+                    signal_online: true,
+                    session_type: ServiceSessionType::Aqua,
+                    degraded_permissions: false,
+                    permissions: PermissionSnapshot::from_flags(true, true, true, true, None),
+                    upnp_status: Some(rc_client_core::upnp::UpnpStatus::Disabled),
+                }))
+            }
+            ServiceRequest::SetAssistFileTransfer { enabled } => {
+                ServiceResponse::Snapshot(Box::new(AgentSnapshot {
+                    enabled: true,
+                    allow_assist_file_transfer: enabled,
                     host_running: true,
                     listen_addr: Some("0.0.0.0:9901".to_string()),
                     display_addr: Some("192.168.1.10:9901".to_string()),
@@ -759,7 +792,22 @@ mod tests {
         match snap_resp {
             ServiceResponse::Snapshot(snap) => {
                 assert!(snap.enabled);
+                assert!(snap.allow_assist_file_transfer);
                 assert_eq!(snap.device_id.as_deref(), Some("604928235"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let ft_resp = IpcClient::call(
+            &sock,
+            &secret_path,
+            ServiceRequest::SetAssistFileTransfer { enabled: false },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        match ft_resp {
+            ServiceResponse::Snapshot(snap) => {
+                assert!(!snap.allow_assist_file_transfer);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1033,6 +1081,7 @@ mod tests {
     fn agent_snapshot_upnp_status_defaults_none_and_roundtrips() {
         let base = AgentSnapshot {
             enabled: true,
+            allow_assist_file_transfer: false,
             host_running: true,
             listen_addr: Some("0.0.0.0:9901".to_string()),
             display_addr: Some("192.168.1.10:9901".to_string()),
@@ -1052,14 +1101,22 @@ mod tests {
             }),
         };
 
-        // 1) 移除 upnpStatus 模拟旧版本快照 JSON，反序列化必须兼容默认 None。
+        // 1) 移除 upnpStatus 与 allowAssistFileTransfer 模拟旧版本快照 JSON，反序列化必须兼容默认 None / true。
         let mut legacy_val = serde_json::to_value(&base).expect("serialize AgentSnapshot to value");
         let obj = legacy_val
             .as_object_mut()
             .expect("AgentSnapshot must serialize as JSON object");
         assert!(obj.remove("upnpStatus").is_some());
+        assert_eq!(
+            obj.remove("allowAssistFileTransfer"),
+            Some(serde_json::json!(false))
+        );
         let legacy: AgentSnapshot =
             serde_json::from_value(legacy_val).expect("legacy AgentSnapshot without upnpStatus");
+        assert!(
+            legacy.allow_assist_file_transfer,
+            "旧快照缺少 allowAssistFileTransfer 时必须默认 true"
+        );
         assert_eq!(legacy.upnp_status, None);
 
         // 2) 携带 upnpStatus 完整序列化与反序列化往返一致。

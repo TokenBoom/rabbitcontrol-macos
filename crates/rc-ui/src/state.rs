@@ -24,6 +24,7 @@ use rc_ui::server_config::{self, ServerConfig, ServerStatusSnapshot};
 use rc_ui::service_ipc::AgentSnapshot;
 use rc_ui::session_bridge::{LayerLease, SessionHandle, SessionUpdate};
 use rc_ui::signal_client::SignalClientHandle;
+use rc_ui::ui_error::UiError;
 
 /// §6.0 侧栏设备条目（IPC 序列化字段与 `mock.js` 保持一致）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -104,6 +105,38 @@ pub enum CompleteAttachOutcome {
 }
 
 /// 当前活动会话状态（泛型 `H` 默认为 [`SessionHandle`]，便于无窗口状态机回归单测）。
+/// 当前会话生效的工具通道权限快照（IPC `camelCase`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPermissionsSnapshot {
+    /// 是否允许使用 W2 文件传输通道。
+    pub allow_file_transfer: bool,
+    /// 是否允许使用 W3 远程终端通道。
+    pub allow_terminal: bool,
+    /// 是否允许使用 W4 端口映射通道。
+    pub allow_port_map: bool,
+}
+
+impl Default for ToolPermissionsSnapshot {
+    fn default() -> Self {
+        Self {
+            allow_file_transfer: true,
+            allow_terminal: true,
+            allow_port_map: true,
+        }
+    }
+}
+
+impl From<rc_session::ToolPermissions> for ToolPermissionsSnapshot {
+    fn from(p: rc_session::ToolPermissions) -> Self {
+        Self {
+            allow_file_transfer: p.allow_file_transfer,
+            allow_terminal: p.allow_terminal,
+            allow_port_map: p.allow_port_map,
+        }
+    }
+}
+
 /// 当前活动远控会话的控制端元数据（用于主窗状态显示、壁纸归档与中继热切换）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveSessionMeta {
@@ -151,6 +184,8 @@ pub struct ActiveSessionMeta {
     pub connected: bool,
     /// 协商后的传输方式标签（`"UDP LAN"` / `"UDP P2P"` / `"Relay"`）。
     pub transport: Option<String>,
+    /// 当前会话由被控端下发的工具通道权限状态。
+    pub tool_permissions: ToolPermissionsSnapshot,
 }
 
 /// 面向主窗前端展示的当前活动会话只读状态快照（`get_active_session_info` / `session://active-state`）。
@@ -185,6 +220,8 @@ pub struct ActiveSessionInfo {
     pub mtls_active: bool,
     /// 对端设备证书 SHA-256 指纹。
     pub peer_cert_fingerprint: Option<String>,
+    /// 当前会话生效的工具通道权限（供主窗/会话窗/文件传输窗实时门控）。
+    pub tool_permissions: ToolPermissionsSnapshot,
 }
 
 impl ActiveSessionInfo {
@@ -210,6 +247,7 @@ impl ActiveSessionInfo {
             encrypt_connection: meta.encrypt_connection,
             mtls_active: false,
             peer_cert_fingerprint: None,
+            tool_permissions: meta.tool_permissions,
         }
     }
 
@@ -230,6 +268,7 @@ impl ActiveSessionInfo {
             encrypt_connection: meta.encrypt_connection,
             mtls_active: false,
             peer_cert_fingerprint: None,
+            tool_permissions: meta.tool_permissions,
         }
     }
 }
@@ -322,6 +361,7 @@ impl<H> ActiveSession<H> {
             encrypt_connection: self.meta.encrypt_connection,
             mtls_active: self.meta.mtls_active,
             peer_cert_fingerprint: self.meta.peer_cert_fingerprint.clone(),
+            tool_permissions: self.meta.tool_permissions,
         }
     }
 
@@ -912,7 +952,7 @@ pub struct AppState {
     /// 锁序恒为 `session -> last_session_update`，防旧会话快照串台或泄露过期 `Ended`）。
     pub last_session_update: Mutex<Option<(u64, SessionUpdate)>>,
     /// 绑定 `session_open_epoch` 的最近一次不可恢复会话终态错误（供晚挂载 S1 窗口通过 `session_snapshot` 补领失败面板）。
-    pub last_terminal_error: Mutex<Option<(u64, String)>>,
+    pub last_terminal_error: Mutex<Option<(u64, String, Option<UiError>)>>,
     /// 会话打开代次计数器（H9：`open_session` 与 `disconnect_active_session` 递增，
     /// 使在途 `request_connect` 在被更新请求或关窗取消后自动作废）。
     pub session_open_epoch: AtomicU64,
@@ -1429,13 +1469,24 @@ impl AppState {
     }
 
     /// 在当前代次仍等于 `epoch` 时记录不可恢复终态错误（供晚加载 S1 窗口通过 `session_snapshot` 补领失败面板）。
+    #[cfg(test)]
     pub fn record_terminal_error_if_epoch(&self, epoch: u64, reason: String) {
+        self.record_terminal_error_with_ui_if_epoch(epoch, reason, None);
+    }
+
+    /// 在当前代次仍等于 `epoch` 时记录带结构化 [`UiError`] 的不可恢复终态错误。
+    pub fn record_terminal_error_with_ui_if_epoch(
+        &self,
+        epoch: u64,
+        reason: String,
+        ui_error: Option<UiError>,
+    ) {
         let mut guard = self
             .last_terminal_error
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if self.session_open_epoch.load(Ordering::Acquire) == epoch {
-            *guard = Some((epoch, reason));
+            *guard = Some((epoch, reason, ui_error));
         }
     }
 
@@ -2008,6 +2059,7 @@ mod tests {
             SessionUpdate::Ended {
                 reason: "旧会话已结束".to_string(),
                 recoverable: false,
+                ui_error: None,
             },
         );
         assert_eq!(current_session_snapshot(&session_slot, &snap_slot), None);
@@ -2025,6 +2077,7 @@ mod tests {
             SessionUpdate::Ended {
                 reason: "过期事件".to_string(),
                 recoverable: false,
+                ui_error: None,
             },
         );
         assert_eq!(current_session_snapshot(&session_slot, &snap_slot), None);
