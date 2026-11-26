@@ -367,6 +367,31 @@ pub(crate) fn teardown_session(app: &AppHandle, mut old: ActiveSession) {
     }
 }
 
+/// 同步等待旧会话发完 `Bye(Normal)` / 断开并摘除 Metal 图层（有界超时），
+/// 避免在切换传输模式或加密模式时旧连接尚未退场就向服务端申请新中继凭据，导致被控端错过新配对。
+async fn teardown_session_and_wait(app: &AppHandle, mut old: ActiveSession) {
+    stop_shortcut_tap_runtime(&app.state::<AppState>());
+    old.handle.send(SessionCommand::Disconnect);
+    let app_bg = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(lease) = old.layer_state.take_lease() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let scheduled = app_bg.run_on_main_thread(move || {
+                metal_attach::detach_leased_layer(&lease);
+                let _ = tx.send(lease);
+            });
+            let returned_lease = if scheduled.is_ok() {
+                rx.recv_timeout(Duration::from_millis(500)).ok()
+            } else {
+                None
+            };
+            drop(returned_lease);
+        }
+        drop(old);
+    })
+    .await;
+}
+
 /// 断开并回收当前活动会话；可按需覆写或在未传入时读取 `prefs.lock_on_exit` 在断线前发送锁屏指令。
 /// 返回递增后的 `session_open_epoch`。
 pub(crate) fn disconnect_active_session_with_lock(
@@ -493,6 +518,7 @@ fn resolve_session_target_meta(
 async fn resolve_endpoint_and_grant(
     state: &AppState,
     target: ConnectTarget,
+    force_relay: bool,
 ) -> Result<(SocketAddr, Option<rc_ui::signal_client::ConnectGrant>), String> {
     match target {
         ConnectTarget::Direct(addr) => Ok((addr, None)),
@@ -503,6 +529,7 @@ async fn resolve_endpoint_and_grant(
                         ServiceRequest::RequestConnect {
                             target_id,
                             timeout_ms: 10_000,
+                            force_relay,
                         },
                         Duration::from_secs(12),
                     )? {
@@ -526,7 +553,11 @@ async fn resolve_endpoint_and_grant(
                 return Err("请先在「设置 → 网络」配置并连接服务器".to_string());
             }
             let grant = tauri::async_runtime::spawn_blocking(move || {
-                client.request_connect(&target_id, Duration::from_secs(10))
+                if force_relay {
+                    client.request_relay(&target_id, Duration::from_secs(10))
+                } else {
+                    client.request_connect(&target_id, Duration::from_secs(10))
+                }
             })
             .await
             .map_err(|e| format!("发起中继连接任务异常：{e}"))??;
@@ -882,7 +913,7 @@ pub async fn open_session(
         let _ = old.handle.tools().detach_all_terminals();
         let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
         let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
-        teardown_session(&app, old);
+        teardown_session_and_wait(&app, old).await;
     }
 
     if !cfg.headless {
@@ -899,7 +930,7 @@ pub async fn open_session(
     let preallocated_layer = preallocate_metal_layer_for_session(&app, cfg.prefer_hardware);
 
     let (connect_addr, relay_grant) =
-        match resolve_endpoint_and_grant(&state, effective_target).await {
+        match resolve_endpoint_and_grant(&state, effective_target, cfg.force_relay).await {
             Ok(res) => res,
             Err(err) => {
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
@@ -1076,7 +1107,7 @@ pub async fn set_session_relay_mode(
     if let Some(old) = previous {
         let _ = old.handle.tools().detach_all_terminals();
         let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
-        teardown_session(&app, old);
+        teardown_session_and_wait(&app, old).await;
     }
     let _ = app.emit(
         "session://update",
@@ -1087,7 +1118,7 @@ pub async fn set_session_relay_mode(
     );
 
     let (connect_addr, relay_grant) =
-        match resolve_endpoint_and_grant(&state, effective_target).await {
+        match resolve_endpoint_and_grant(&state, effective_target, force_relay).await {
             Ok(res) => res,
             Err(err) => {
                 if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
@@ -1283,7 +1314,41 @@ pub async fn set_session_mtls_mode(
     }
 
     let my_epoch = state.session_open_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let (connect_addr, relay_grant) = resolve_endpoint_and_grant(&state, effective_target).await?;
+    let previous = {
+        let mut slot = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        state::clear_session_snapshot_locked(&state.last_session_update);
+        *state.host_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        slot.take()
+    };
+    if let Some(old) = previous {
+        let _ = old.handle.tools().detach_all_terminals();
+        let _ = app.emit("portmap://update", &Vec::<PortMapRuleSnapshot>::new());
+        teardown_session_and_wait(&app, old).await;
+    }
+    let _ = app.emit(
+        "session://update",
+        &SessionUpdate::Connecting {
+            phase: rc_ui::session_bridge::ConnectPhase::Connecting,
+            watch_only,
+        },
+    );
+
+    let (connect_addr, relay_grant) =
+        match resolve_endpoint_and_grant(&state, effective_target, meta.force_relay).await {
+            Ok(res) => res,
+            Err(err) => {
+                if state.session_open_epoch.load(Ordering::Acquire) == my_epoch {
+                    let _ = app.emit("session://active-state", &ActiveSessionInfo::inactive());
+                    let _ = app.emit(
+                        "session://update",
+                        &SessionUpdate::Ended {
+                            reason: err.clone(),
+                        },
+                    );
+                }
+                return Err(err);
+            }
+        };
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Err("会话状态已变更，请重试".to_string());
     }
@@ -5879,7 +5944,8 @@ pub async fn reconnect_last_session(
         parsed
     };
 
-    let (connect_addr, relay_grant) = resolve_endpoint_and_grant(&state, effective_target).await?;
+    let (connect_addr, relay_grant) =
+        resolve_endpoint_and_grant(&state, effective_target, meta.force_relay).await?;
     if state.session_open_epoch.load(Ordering::Acquire) != my_epoch {
         return Ok(());
     }

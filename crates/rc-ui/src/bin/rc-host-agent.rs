@@ -1400,6 +1400,7 @@ fn main() {
             ServiceRequest::RequestConnect {
                 target_id,
                 timeout_ms,
+                force_relay,
             } => {
                 let sig_opt = {
                     let guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
@@ -1416,7 +1417,12 @@ fn main() {
                     };
                 }
                 let timeout = Duration::from_millis(timeout_ms.clamp(1_000, 30_000));
-                match sig.request_connect(&target_id, timeout) {
+                let res = if force_relay {
+                    sig.request_relay(&target_id, timeout)
+                } else {
+                    sig.request_connect(&target_id, timeout)
+                };
+                match res {
                     Ok(grant) => ServiceResponse::ConnectGrant(Box::new(grant)),
                     Err(message) => ServiceResponse::Error { message },
                 }

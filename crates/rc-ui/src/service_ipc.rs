@@ -111,6 +111,9 @@ pub enum ServiceRequest {
         target_id: String,
         /// 超时毫秒数。
         timeout_ms: u64,
+        /// 是否强制走纯中继（`relay_alloc` → `relay_ready`，跳过双方 LAN 宽限与 UDP P2P 打洞）。
+        #[serde(default)]
+        force_relay: bool,
     },
     /// 查询后台信令服务实时状态快照。
     GetServerStatus,
@@ -987,5 +990,38 @@ mod tests {
         assert_eq!(resp, ServiceResponse::Ok);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn request_connect_force_relay_defaults_false_and_roundtrips_true() {
+        let legacy: ServiceRequest = serde_json::from_str(
+            r#"{"op":"request_connect","target_id":"604928235","timeout_ms":10000}"#,
+        )
+        .expect("deserialize legacy RequestConnect without force_relay");
+        assert!(matches!(
+            legacy,
+            ServiceRequest::RequestConnect {
+                ref target_id,
+                timeout_ms: 10000,
+                force_relay: false
+            } if target_id == "604928235"
+        ));
+
+        let relay_req = ServiceRequest::RequestConnect {
+            target_id: "604928235".to_string(),
+            timeout_ms: 10_000,
+            force_relay: true,
+        };
+        let encoded = serde_json::to_string(&relay_req).expect("serialize force_relay request");
+        let decoded: ServiceRequest =
+            serde_json::from_str(&encoded).expect("deserialize force_relay request");
+        assert!(matches!(
+            decoded,
+            ServiceRequest::RequestConnect {
+                ref target_id,
+                timeout_ms: 10000,
+                force_relay: true
+            } if target_id == "604928235"
+        ));
     }
 }
