@@ -1372,6 +1372,11 @@ fn main() {
 
     let binary_sha256 = current_exe_sha256();
     let session_type = detect_session_type();
+    if session_type == ServiceSessionType::Aqua {
+        // 在任何权限检测、WindowServer/CoreGraphics 初始化与 NSStatusItem 安装之前，
+        // 率先以 Accessory 模式初始化 NSApplication 并挂载 Reopen 转发委托（配合 Info.plist LSUIElement 双重防占 Dock）。
+        let _ = metal_attach::init_accessory_app_with_reopen_handler(Arc::new(launch_main_gui));
+    }
     let secret_path = config_paths::ipc_secret_path();
     let ipc_secret = match read_or_create_ipc_secret(&secret_path) {
         Ok(s) => s,
@@ -1674,10 +1679,8 @@ fn main() {
         let stop_tray = Arc::clone(&stop_flag);
         let secret_tray = ipc_secret.clone();
 
-        // 必须在安装 NSStatusItem 之前将 NSApplication 切为 Accessory（不占 Dock 图标）
-        // 并注册 Reopen Delegate：即便 Finder / Spotlight / Dock 将激活事件误路由到本 Agent，也会自动转发拉起主界面。
-        let _ = metal_attach::init_accessory_app_with_reopen_handler(Arc::new(launch_main_gui));
-
+        // NSApplication 已在 `main()` 开头（所有权限检查与宿主初始化之前）以 Accessory 模式初始化并挂载 Reopen 委托，
+        // 配合主包 `Info.plist` 的 `LSUIElement=true` 确保 `rc-host-agent` 永不占用第二个 Dock 图标。
         let _ = metal_attach::install_status_bar(
             initial_tray,
             Arc::new(move |action| match action {

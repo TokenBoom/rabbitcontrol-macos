@@ -1253,6 +1253,12 @@ fn main() {
         .menu(build_app_menu)
         .manage(AppState::new())
         .setup(|app| {
+            // 打包 Info.plist 设置了 LSUIElement=true，使同包内后台 `rc-host-agent` 天生以 UIElement 签到、
+            // 绝不抢占第二个 Dock 图标；仅真正的前台 GUI 进程在此升格为 Regular 显示唯一 Dock 图标与菜单栏。
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            }
             let state = app.state::<AppState>();
             let app_for_standalone_upd = app.handle().clone();
             rc_ui::updater_macos::register_standalone_pre_restart_hook(Arc::new(move || {
@@ -1269,6 +1275,10 @@ fn main() {
             // 0) 按当前显示器尺寸自适应主窗口大小并居中（兼容 13"/14" 笔记本与 2K/4K 大屏），
             //    并启动 `gui.sock` 单实例唤醒通道供后台菜单栏与重复启动实例直接前置本窗口。
             window::adapt_main_window_on_startup(app.handle());
+            #[cfg(target_os = "macos")]
+            {
+                metal_attach::activate_app_and_unhide();
+            }
             if let Ok(secret) = read_or_create_ipc_secret(&config_paths::ipc_secret_path()) {
                 let app_wake = app.handle().clone();
                 if let Ok(gui_srv) = IpcServer::bind(

@@ -139,6 +139,40 @@ pub fn is_plist_pointing_to_other_bundle(plist_bin: &Path, current_bundle: Optio
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn render_launchctl_wait_unloaded(service_target_expr: &str) -> String {
+    // macOS `launchctl bootout` 异步卸载旧进程，须轮询 `launchctl print` 确认服务彻底移出域（最多 3s）
+    // 再继续 `bootstrap` 或配置回写，避免撞 `Bootstrap failed: 5: Input/output error`。
+    format!(
+        "i=0; while [ \"$i\" -lt 30 ] && launchctl print {target} >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done",
+        target = service_target_expr,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn render_launchctl_bootstrap_with_retry(
+    domain_expr: &str,
+    service_target_expr: &str,
+    plist_quoted: &str,
+) -> String {
+    // 先解除可能存在的 disable 状态，再对 `launchctl bootstrap` 做最多 10 次短退避重试；
+    // 若全部失败则不重定向 stderr 再执行一次，把真实错误透传给调用方。
+    format!(
+        concat!(
+            "launchctl enable {target} >/dev/null 2>&1 || true; ",
+            "boot_ok=0; ",
+            "for attempt in 1 2 3 4 5 6 7 8 9 10; do ",
+            "if launchctl bootstrap {domain} {plist} >/dev/null 2>&1; then boot_ok=1; break; fi; ",
+            "sleep 0.2; ",
+            "done; ",
+            "if [ \"$boot_ok\" -ne 1 ]; then launchctl bootstrap {domain} {plist}; fi"
+        ),
+        target = service_target_expr,
+        domain = domain_expr,
+        plist = plist_quoted,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpgradeRestartOutcome {
     UpToDate,
@@ -659,8 +693,10 @@ mod macos_imp {
                 "chmod 644 {daemon_plist} {agent_plist}; ",
                 "launchctl bootout system/{daemon_label} >/dev/null 2>&1 || true; ",
                 "launchctl bootout \"gui/$CONSOLE_UID/{agent_label}\" >/dev/null 2>&1 || true; ",
-                "launchctl bootstrap system {daemon_plist}; ",
-                "launchctl bootstrap \"gui/$CONSOLE_UID\" {agent_plist}"
+                "{wait_daemon_unloaded}; ",
+                "{wait_agent_unloaded}; ",
+                "{bootstrap_daemon}; ",
+                "{bootstrap_agent}"
             ),
             sys_cfg = shell_quote_posix(&sys_cfg.to_string_lossy()),
             run_dir = shell_quote_posix(&run_dir.to_string_lossy()),
@@ -684,6 +720,19 @@ mod macos_imp {
             agent_plist = shell_quote_posix(AGENT_PLIST_PATH),
             daemon_label = DAEMON_LABEL,
             agent_label = AGENT_LABEL,
+            wait_daemon_unloaded = render_launchctl_wait_unloaded(&format!("system/{DAEMON_LABEL}")),
+            wait_agent_unloaded =
+                render_launchctl_wait_unloaded(&format!("\"gui/$CONSOLE_UID/{AGENT_LABEL}\"")),
+            bootstrap_daemon = render_launchctl_bootstrap_with_retry(
+                "system",
+                &format!("system/{DAEMON_LABEL}"),
+                &shell_quote_posix(DAEMON_PLIST_PATH),
+            ),
+            bootstrap_agent = render_launchctl_bootstrap_with_retry(
+                "\"gui/$CONSOLE_UID\"",
+                &format!("\"gui/$CONSOLE_UID/{AGENT_LABEL}\""),
+                &shell_quote_posix(AGENT_PLIST_PATH),
+            ),
         );
 
         let res = run_osascript_admin_shell(&script);
@@ -794,6 +843,8 @@ mod macos_imp {
                 "chown -h \"$CONSOLE_UID:20\" {user_cfg} 2>/dev/null || true; ",
                 "launchctl bootout \"gui/$CONSOLE_UID/{agent_label}\" >/dev/null 2>&1 || true; ",
                 "launchctl bootout system/{daemon_label} >/dev/null 2>&1 || true; ",
+                "{wait_agent_unloaded}; ",
+                "{wait_daemon_unloaded}; ",
                 "{restore_user_cfg}; ",
                 "{restore_certs}; ",
                 "rm -f {agent_plist} {daemon_plist} {marker} {manual_stop}; ",
@@ -805,6 +856,9 @@ mod macos_imp {
             cleanup_sys_cfg = cleanup_sys_cfg,
             agent_label = AGENT_LABEL,
             daemon_label = DAEMON_LABEL,
+            wait_agent_unloaded =
+                render_launchctl_wait_unloaded(&format!("\"gui/$CONSOLE_UID/{AGENT_LABEL}\"")),
+            wait_daemon_unloaded = render_launchctl_wait_unloaded(&format!("system/{DAEMON_LABEL}")),
             agent_plist = shell_quote_posix(AGENT_PLIST_PATH),
             daemon_plist = shell_quote_posix(DAEMON_PLIST_PATH),
             marker = shell_quote_posix(&marker.to_string_lossy()),
@@ -1251,5 +1305,48 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launchctl_reload_snippets_wait_unload_retry_bootstrap_and_pass_sh_syntax() {
+        let wait_daemon = render_launchctl_wait_unloaded("system/com.rabbitcontrol.daemon");
+        let wait_agent =
+            render_launchctl_wait_unloaded("\"gui/$CONSOLE_UID/com.rabbitcontrol.agent\"");
+        let boot_daemon = render_launchctl_bootstrap_with_retry(
+            "system",
+            "system/com.rabbitcontrol.daemon",
+            "'/Library/LaunchDaemons/com.rabbitcontrol.daemon.plist'",
+        );
+        let boot_agent = render_launchctl_bootstrap_with_retry(
+            "\"gui/$CONSOLE_UID\"",
+            "\"gui/$CONSOLE_UID/com.rabbitcontrol.agent\"",
+            "'/Library/LaunchAgents/com.rabbitcontrol.agent.plist'",
+        );
+
+        assert!(wait_daemon.contains("launchctl print system/com.rabbitcontrol.daemon"));
+        assert!(wait_agent.contains("launchctl print \"gui/$CONSOLE_UID/com.rabbitcontrol.agent\""));
+        assert!(boot_daemon.contains("launchctl enable system/com.rabbitcontrol.daemon"));
+        assert!(boot_daemon.contains(
+            "launchctl bootstrap system '/Library/LaunchDaemons/com.rabbitcontrol.daemon.plist'"
+        ));
+        assert!(
+            boot_agent.contains("launchctl enable \"gui/$CONSOLE_UID/com.rabbitcontrol.agent\"")
+        );
+        assert!(boot_agent.contains("launchctl bootstrap \"gui/$CONSOLE_UID\" '/Library/LaunchAgents/com.rabbitcontrol.agent.plist'"));
+
+        #[cfg(unix)]
+        {
+            let full_script = format!(
+                "set -e; CONSOLE_UID=501; {wait_daemon}; {wait_agent}; {boot_daemon}; {boot_agent}"
+            );
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-n", "-c", &full_script])
+                .status()
+                .expect("spawn /bin/sh -n");
+            assert!(
+                status.success(),
+                "生成的 POSIX sh 脚本必须语法合法: {full_script}"
+            );
+        }
     }
 }

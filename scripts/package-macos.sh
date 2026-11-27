@@ -287,6 +287,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
     <string>${MIN_MACOS}</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
