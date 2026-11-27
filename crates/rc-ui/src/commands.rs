@@ -2643,6 +2643,7 @@ pub(crate) fn start_host_service_with_policy(
         handle.set_owner_verifier(owner_verifier);
         handle.set_mtls_config(mtls_config, accept_mtls_lan);
         handle.set_file_transfer_dir(Some(file_transfer_dir));
+        apply_host_signal_client(handle, signal_client);
         host.allow_remote_assist = allow_remote_assist;
     } else {
         let password = (!host.password.is_empty()).then(|| host.password.clone());
@@ -3292,6 +3293,33 @@ fn reap_signal_client_async(old: Option<Arc<SignalClientHandle>>) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_HOST_SIGNAL_SYNC_LOG: std::cell::RefCell<Option<Vec<Option<usize>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn apply_host_signal_client(handle: &HostHandle, signal_client: Option<Arc<SignalClientHandle>>) {
+    #[cfg(test)]
+    TEST_HOST_SIGNAL_SYNC_LOG.with(|slot| {
+        if let Some(ref mut log) = *slot.borrow_mut() {
+            log.push(signal_client.as_ref().map(|s| Arc::as_ptr(s) as usize));
+        }
+    });
+    handle.set_signal_client(signal_client);
+}
+
+/// 将最新信令客户端句柄同步至运行中的独立模式 `HostHandle`（绝不在持有 `state.server` 锁时调用）。
+fn sync_running_host_signal_client(
+    state: &AppState,
+    signal_client: Option<Arc<SignalClientHandle>>,
+) {
+    let host = state.host.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = host.handle.as_ref() {
+        apply_host_signal_client(handle, signal_client);
+    }
+}
+
 /// 退出应用时停机并同步回收信令客户端：先置位 `shutting_down = true` 阻止新客户端派生，
 /// 再释放 `ServerRuntime` 锁后调用 `request_stop()` 与 `stop()` 同步等待回收（可中断拨号 <= 150ms）。
 pub(crate) fn shutdown_signal_client(state: &AppState) {
@@ -3300,6 +3328,7 @@ pub(crate) fn shutdown_signal_client(state: &AppState) {
         rt.shutting_down = true;
         rt.signal_client.take()
     };
+    sync_running_host_signal_client(state, None);
     if let Some(arc) = old {
         arc.request_stop();
         if let Some(mut handle) = Arc::into_inner(arc) {
@@ -3317,6 +3346,7 @@ fn stop_signal_client_for_logout(state: &AppState) -> ServerStatusSnapshot {
         rt.last_status = snap.clone();
         (old, snap)
     };
+    sync_running_host_signal_client(state, None);
     reap_signal_client_async(old);
     snap
 }
@@ -3348,7 +3378,7 @@ pub(crate) fn start_signal_client_if_enabled(state: &AppState) -> ServerStatusSn
         None
     };
     let options = build_signal_client_options(state);
-    let (old, snap) = {
+    let (old, new_signal, snap) = {
         let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
         let old = rt.signal_client.take();
         let can_start = authenticated
@@ -3373,8 +3403,9 @@ pub(crate) fn start_signal_client_if_enabled(state: &AppState) -> ServerStatusSn
             rt.config.disabled_snapshot()
         };
         rt.last_status = snap.clone();
-        (old, snap)
+        (old, rt.signal_client.clone(), snap)
     };
+    sync_running_host_signal_client(state, new_signal);
     reap_signal_client_async(old);
     snap
 }
@@ -3483,7 +3514,7 @@ fn save_server_config_to_path(
         .is_some_and(|s| !s.must_change_password)
         && next_cfg.is_configured();
     let options = build_signal_client_options(state);
-    let (old, snap) = {
+    let (old, new_signal, snap) = {
         let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
         rt.config = next_cfg.clone();
         rt.config_epoch = rt.config_epoch.wrapping_add(1);
@@ -3509,10 +3540,11 @@ fn save_server_config_to_path(
             rt.config.disabled_snapshot()
         };
         rt.last_status = snap.clone();
-        (old, snap)
+        (old, rt.signal_client.clone(), snap)
     };
 
     drop(_io_guard);
+    sync_running_host_signal_client(state, new_signal);
     reap_signal_client_async(old);
     if let Some((old_cfg, prev_sess)) = old_logout_ctx {
         if prev_sess.is_some() {
@@ -3621,7 +3653,7 @@ fn refresh_device_id_to_path(
         .is_some_and(|s| !s.must_change_password)
         && next_cfg.is_configured();
     let options = build_signal_client_options(state);
-    let (old, snap) = {
+    let (old, new_signal, snap) = {
         let mut rt = state.server.lock().unwrap_or_else(|e| e.into_inner());
         rt.config = next_cfg.clone();
         rt.config_epoch = rt.config_epoch.wrapping_add(1);
@@ -3654,10 +3686,11 @@ fn refresh_device_id_to_path(
             rt.config.disabled_snapshot()
         };
         rt.last_status = snap.clone();
-        (old, snap)
+        (old, rt.signal_client.clone(), snap)
     };
 
     drop(_io_guard);
+    sync_running_host_signal_client(state, new_signal);
     reap_signal_client_async(old);
     refresh_host_security_runtime(state);
     Ok(snap)
@@ -4610,6 +4643,7 @@ fn probe_and_save_server_to_path_ui(
             rt.signal_client.take()
         };
         drop(_io_guard);
+        sync_running_host_signal_client(state, None);
         reap_signal_client_async(old);
         notify_background_services_reload(state, true);
         if let Some((old_cfg, prev_sess, old_did)) = endpoint_logout_task {
@@ -11533,6 +11567,137 @@ mod tests {
             "cache must evict oldest files down to MAX_DISK_CACHED_TERMINAL_FONTS"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn standalone_signal_client_lifecycle_syncs_running_host_handle() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-standalone-signal-sync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let certs_dir = base.join("certs");
+        let auth_path = base.join("auth.json");
+        let server_path = base.join("server.json");
+        std::fs::create_dir_all(&certs_dir).expect("create temp dirs");
+
+        let configured = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: 1,
+            relay_port: 21117,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let future_exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 3600;
+        rc_ui::auth_client::save_auth_session(
+            &auth_path,
+            &rc_ui::auth_client::StoredAuthSession {
+                user_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                email: "standalone@example.com".to_string(),
+                display_name: "Standalone".to_string(),
+                role: "user".to_string(),
+                must_change_password: false,
+                access_token: "tok-standalone".to_string(),
+                refresh_token: "ref-standalone".to_string(),
+                access_expires_at_unix_sec: future_exp,
+                server_host: "127.0.0.1".to_string(),
+                api_port: 21118,
+            },
+        )
+        .expect("save auth session");
+
+        let state = AppState::with_initial_configs_and_paths(
+            configured,
+            AppPrefs::default(),
+            auth_path,
+            certs_dir,
+            None,
+        );
+        let _ = state.auth.restore_on_startup();
+        assert_eq!(state.gate_state(), AppGateState::Authenticated);
+
+        TEST_HOST_SIGNAL_SYNC_LOG.with(|slot| {
+            *slot.borrow_mut() = Some(Vec::new());
+        });
+
+        // 1) 先启动 HostHandle（此时 signal_client 为 None），再后启动信令并同步进 HostHandle。
+        let host_snap =
+            start_host_service_on(&state, "127.0.0.1:0".parse().unwrap(), false).unwrap();
+        assert!(host_snap.enabled);
+        assert!(state.server.lock().unwrap().signal_client.is_none());
+
+        let started_snap = start_signal_client_if_enabled(&state);
+        assert!(started_snap.enabled);
+        let ptr1 = Arc::as_ptr(
+            state
+                .server
+                .lock()
+                .unwrap()
+                .signal_client
+                .as_ref()
+                .expect("signal_client spawned"),
+        ) as usize;
+
+        // 2) 再次调用 start_host_service_on 命中已有 HostHandle 刷新分支，不应死锁且同步同一句柄。
+        let refreshed_snap =
+            start_host_service_on(&state, "127.0.0.1:0".parse().unwrap(), false).unwrap();
+        assert!(refreshed_snap.enabled);
+
+        // 3) 登出清空 signal_client 并同步 None 至 HostHandle。
+        let logout_snap = stop_signal_client_for_logout(&state);
+        assert_eq!(logout_snap.state, ServerConnectionState::Disabled);
+        assert!(state.server.lock().unwrap().signal_client.is_none());
+
+        // 4) 重新拉起后调用 save_server_config_to_path 禁用与 shutdown_signal_client，均正常同步 None。
+        let _ = start_signal_client_if_enabled(&state);
+        let ptr2 = Arc::as_ptr(
+            state
+                .server
+                .lock()
+                .unwrap()
+                .signal_client
+                .as_ref()
+                .expect("signal_client respawned"),
+        ) as usize;
+        assert_ne!(ptr1, ptr2);
+        let disabled_snap = save_server_config_to_path(
+            &state,
+            SaveServerConfigRequest {
+                enabled: false,
+                server_host: "127.0.0.1".to_string(),
+                signal_port: 1,
+                relay_port: 21117,
+            },
+            &server_path,
+        )
+        .expect("disable server config");
+        assert!(!disabled_snap.enabled);
+        assert_eq!(disabled_snap.state, ServerConnectionState::Disabled);
+        assert!(state.server.lock().unwrap().signal_client.is_none());
+
+        shutdown_signal_client(&state);
+        assert!(state.server.lock().unwrap().shutting_down);
+        assert!(state.server.lock().unwrap().signal_client.is_none());
+
+        let recorded = TEST_HOST_SIGNAL_SYNC_LOG
+            .with(|slot| slot.borrow_mut().take())
+            .expect("sync log present");
+        assert_eq!(
+            recorded,
+            vec![Some(ptr1), Some(ptr1), None, Some(ptr2), None, None]
+        );
+
+        let stopped = stop_host_service(&state, true);
+        assert!(!stopped.enabled);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

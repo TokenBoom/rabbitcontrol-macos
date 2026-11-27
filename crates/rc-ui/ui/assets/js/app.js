@@ -627,7 +627,7 @@
           var method = String(ack.method || "").toLowerCase();
           if (method === "already_online") {
             toast("设备「" + device.name + "」当前已在线，无需唤醒");
-            refreshMyDevices();
+            refreshMyDevices(true);
           } else if (method === "lan_peer") {
             toast("已通过同局域网在线设备向「" + device.name + "」发送远程开机魔术包");
           } else if (method === "server") {
@@ -1365,6 +1365,8 @@
     if (typeof snap.revision === "number" && snap.revision > lastServerRev) {
       lastServerRev = snap.revision;
     }
+    var prevState = state.serverStatus && state.serverStatus.state;
+    var prevDeviceId = state.serverStatus && state.serverStatus.deviceId;
     var code = snap.deviceIdFormatted
       ? String(snap.deviceIdFormatted)
       : snap.deviceId
@@ -1373,6 +1375,12 @@
     if (code) state.lastDeviceCode = code;
     state.serverStatus = snap;
     renderP2DeviceId();
+    if (
+      snap.state === "connected" &&
+      (prevState !== "connected" || (snap.deviceId && snap.deviceId !== prevDeviceId))
+    ) {
+      refreshMyDevices();
+    }
   }
 
   var sessionLaunchSeq = 0;
@@ -2137,7 +2145,7 @@
       }
     }
     if (!found) {
-      refreshMyDevices();
+      refreshMyDevices(true);
       return;
     }
     sortMyDevices(state.myDevices);
@@ -2209,22 +2217,62 @@
     }
   }
 
-  function refreshMyDevices() {
+  var MY_DEVICES_FOREGROUND_COOLDOWN_MS = 30 * 1000;
+  var MY_DEVICES_DEBOUNCE_MS = 1000;
+  var lastMyDevicesRefreshAt = 0;
+  var myDevicesRefreshInFlight = false;
+  var myDevicesRefreshPromise = null;
+
+  function refreshMyDevices(force) {
     if (!IS_TAURI || typeof Bridge.listMyDevices !== "function") {
       return Promise.resolve();
     }
-    return Bridge.listMyDevices()
-      .then(applyMyDevices)
+    if (myDevicesRefreshInFlight && myDevicesRefreshPromise) {
+      return myDevicesRefreshPromise;
+    }
+    var now = Date.now();
+    if (!force && lastMyDevicesRefreshAt > 0 && now - lastMyDevicesRefreshAt < MY_DEVICES_DEBOUNCE_MS) {
+      return Promise.resolve();
+    }
+    myDevicesRefreshInFlight = true;
+    myDevicesRefreshPromise = Bridge.listMyDevices()
+      .then(function (list) {
+        lastMyDevicesRefreshAt = Date.now();
+        applyMyDevices(list);
+      })
       .catch(function (err) {
         if (String(err || "").indexOf("登录") !== -1) {
           refreshGateStatus();
         }
+      })
+      .then(function () {
+        myDevicesRefreshInFlight = false;
+        myDevicesRefreshPromise = null;
       });
+    return myDevicesRefreshPromise;
+  }
+
+  function refreshMyDevicesIfStale(cooldownMs) {
+    if (!IS_TAURI || typeof Bridge.listMyDevices !== "function") {
+      return Promise.resolve();
+    }
+    if (myDevicesRefreshInFlight && myDevicesRefreshPromise) {
+      return myDevicesRefreshPromise;
+    }
+    var ttl = typeof cooldownMs === "number" ? cooldownMs : MY_DEVICES_FOREGROUND_COOLDOWN_MS;
+    if (lastMyDevicesRefreshAt > 0 && Date.now() - lastMyDevicesRefreshAt < ttl) {
+      return Promise.resolve();
+    }
+    return refreshMyDevices(true);
   }
 
   /* ── 自动更新版本缓存与主窗无头远程升级控制器（A1 + A3）────── */
+  var SILENT_UPDATE_CHECK_TTL_MS = 10 * 60 * 1000;
+  var SILENT_UPDATE_RETRY_BACKOFF_MS = 60 * 1000;
   var latestRelease = null;
-  var silentUpdateChecked = false;
+  var lastSilentUpdateCheckAt = 0;
+  var lastSilentUpdateAttemptAt = 0;
+  var silentUpdateCheckInFlight = false;
   var activeMainRemoteUpdate = null;
 
   function isNewerSemver(candidate, current) {
@@ -2268,11 +2316,26 @@
     return isNewerSemver(latestRelease.version, device.appVersion);
   }
 
-  function runSilentUpdateCheckOnce() {
-    if (!IS_TAURI || silentUpdateChecked || typeof Bridge.checkForUpdates !== "function") return;
-    silentUpdateChecked = true;
+  function runSilentUpdateCheckIfStale(force) {
+    if (!IS_TAURI || typeof Bridge.checkForUpdates !== "function") return;
+    if (silentUpdateCheckInFlight) return;
+    var now = Date.now();
+    if (!force) {
+      if (lastSilentUpdateCheckAt > 0 && now - lastSilentUpdateCheckAt < SILENT_UPDATE_CHECK_TTL_MS) {
+        return;
+      }
+      if (
+        lastSilentUpdateAttemptAt > 0 &&
+        now - lastSilentUpdateAttemptAt < SILENT_UPDATE_RETRY_BACKOFF_MS
+      ) {
+        return;
+      }
+    }
+    silentUpdateCheckInFlight = true;
+    lastSilentUpdateAttemptAt = now;
     Bridge.checkForUpdates()
       .then(function (res) {
+        lastSilentUpdateCheckAt = Date.now();
         if (res && res.release && res.release.version) {
           latestRelease = res.release;
           if (state.route === "p3") renderP3();
@@ -2282,7 +2345,14 @@
           }
         }
       })
-      .catch(function () {});
+      .catch(function () {})
+      .then(function () {
+        silentUpdateCheckInFlight = false;
+      });
+  }
+
+  function runSilentUpdateCheckOnce() {
+    runSilentUpdateCheckIfStale(false);
   }
 
   function cleanupMainRemoteUpdate(disconnectHeadless) {
@@ -2557,7 +2627,7 @@
           cancelBtn.disabled = false;
           cancelBtn.textContent = "完成";
           cleanupMainRemoteUpdate(true);
-          refreshMyDevices();
+          refreshMyDevices(true);
           toast("设备「" + device.name + "」已升级至 v" + cleanVer);
         }
       };
@@ -2592,7 +2662,7 @@
             : Promise.resolve(null);
         Promise.all([
           hvPromise,
-          refreshMyDevices().catch(function () {
+          refreshMyDevices(true).catch(function () {
             return null;
           })
         ])
@@ -2867,7 +2937,7 @@
         .then(function () {
           closeModal();
           toast("已更新设备备注");
-          refreshMyDevices();
+          refreshMyDevices(true);
         })
         .catch(function (err) {
           saveBtn.disabled = false;
@@ -2915,7 +2985,7 @@
         .then(function () {
           closeModal();
           toast("已移除设备「" + device.name + "」");
-          refreshMyDevices();
+          refreshMyDevices(true);
         })
         .catch(function (err) {
           delBtn.disabled = false;
@@ -3730,7 +3800,7 @@
           : "屏幕录制、辅助功能";
         if (permBannerText) {
           permBannerText.textContent =
-            "macOS 缺少「" + missing + "」权限，本人远程自控与远程协助暂无法共享画面或注入键鼠";
+            "本机 macOS 缺少「" + missing + "」权限，作为被控端暂无法共享本机画面或接收键鼠输入";
         }
         permBanner.hidden = false;
       })
@@ -3916,7 +3986,7 @@
           Bridge.getActiveSessionInfo().then(applyActiveSessionState).catch(function () {});
         }
       }
-      refreshMyDevices();
+      refreshMyDevices(true);
       runSilentUpdateCheckOnce();
       checkAndRenderPermBanner();
       runStartupPermissionCheckOnce();
@@ -4628,6 +4698,18 @@
 
     applyHashRoute();
     window.addEventListener("hashchange", applyHashRoute);
+    if (IS_TAURI) {
+      var handleForegroundResume = function () {
+        if (document.hidden) return;
+        if (!state.gateStatus || state.gateStatus.gate !== "authenticated") return;
+        refreshMyDevicesIfStale();
+        runSilentUpdateCheckIfStale(false);
+      };
+      window.addEventListener("focus", handleForegroundResume);
+      document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) handleForegroundResume();
+      });
+    }
   }
 
   if (document.readyState === "loading") {

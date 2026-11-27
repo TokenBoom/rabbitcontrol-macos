@@ -390,6 +390,8 @@ struct AgentInner {
     permissions: PermissionSnapshot,
     degraded_permissions: bool,
     last_offline_disk_check: std::time::Instant,
+    #[cfg(test)]
+    signal_sync_log: Option<Arc<Mutex<Vec<Option<usize>>>>>,
 }
 
 impl AgentInner {
@@ -435,6 +437,8 @@ impl AgentInner {
             permissions,
             degraded_permissions: false,
             last_offline_disk_check: std::time::Instant::now(),
+            #[cfg(test)]
+            signal_sync_log: None,
         })
     }
 
@@ -571,6 +575,19 @@ impl AgentInner {
         lan.set_advertising(target);
     }
 
+    /// 将当前 `self.signal` 实时同步至运行中的 `HostHandle`（支持后启动、替换或清空信令句柄）。
+    fn sync_host_signal_client(&self) {
+        if let Some(ref host) = self.host {
+            host.set_signal_client(self.signal.clone());
+            #[cfg(test)]
+            if let Some(ref log) = self.signal_sync_log {
+                log.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(self.signal.as_ref().map(|s| Arc::as_ptr(s) as usize));
+            }
+        }
+    }
+
     #[must_use]
     fn start_signal(&mut self, local_mac: Option<String>) -> Option<Arc<SignalClientHandle>> {
         let old = self.signal.take();
@@ -584,6 +601,7 @@ impl AgentInner {
             || self.server_cfg.signal_port == 0
         {
             self.signal_online = false;
+            self.sync_host_signal_client();
             return old;
         }
 
@@ -631,6 +649,7 @@ impl AgentInner {
             }
         }
         self.signal = Some(Arc::new(handle));
+        self.sync_host_signal_client();
         old
     }
 
@@ -689,6 +708,7 @@ impl AgentInner {
             host.set_owner_verifier(owner_verifier);
             host.set_mtls_config(mtls_bundle, accept_mtls_lan);
             host.set_file_transfer_dir(file_transfer_dir);
+            host.set_signal_client(self.signal.clone());
             self.sync_lan_advertising();
             return Ok(None);
         }
@@ -1858,5 +1878,115 @@ mod tests {
             resolve_request_connect_timeout(60_000),
             Duration::from_millis(30_000)
         );
+    }
+
+    #[test]
+    fn start_signal_syncs_live_host_signal_client_on_start_replace_and_clear() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-agent-signal-sync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let certs_dir = base.join("certs");
+        let auth_path = base.join("auth.json");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+
+        let server_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: 1,
+            relay_port: 21117,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let cert_mgr = Arc::new(CertManager::load_or_init(certs_dir).unwrap());
+        let auth = Arc::new(AuthSessionManager::new(
+            server_cfg.clone(),
+            auth_path,
+            cert_mgr,
+        ));
+        let future_exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 3600;
+        auth.apply_external_session(rc_ui::auth_client::StoredAuthSession {
+            user_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            email: "agent@example.com".to_string(),
+            display_name: "Agent".to_string(),
+            role: "user".to_string(),
+            must_change_password: false,
+            access_token: "tok-agent".to_string(),
+            refresh_token: "ref-agent".to_string(),
+            access_expires_at_unix_sec: future_exp,
+            server_host: "127.0.0.1".to_string(),
+            api_port: 21118,
+        });
+
+        let host = HostHandle::spawn(UiHostConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            prefer_hardware: false,
+            require_approval: false,
+            signal_client: None,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn test host");
+
+        let sync_log = Arc::new(Mutex::new(Vec::new()));
+        let mut inner = AgentInner {
+            session_type: ServiceSessionType::Aqua,
+            ipc_secret: "secret".to_string(),
+            server_cfg,
+            prefs: AppPrefs::default(),
+            auth: Arc::new(RwLock::new(auth)),
+            signal: None,
+            lan: None,
+            host: Some(host),
+            allow_owner_control: true,
+            pending_device_events: VecDeque::new(),
+            pending_device_wol_events: VecDeque::new(),
+            password: String::new(),
+            custom_password: false,
+            listen_addr: None,
+            display_addr: None,
+            backend: String::new(),
+            connected_peer: None,
+            pending_approval: None,
+            device_id: None,
+            signal_online: false,
+            permissions: permissions::check_permissions(),
+            degraded_permissions: false,
+            last_offline_disk_check: std::time::Instant::now(),
+            signal_sync_log: Some(Arc::clone(&sync_log)),
+        };
+
+        // 1) 后启动信令：应向已存在的 HostHandle 同步 Some(ptr1)。
+        let old1 = inner.start_signal(None);
+        assert!(old1.is_none());
+        let ptr1 = Arc::as_ptr(inner.signal.as_ref().expect("signal spawned")) as usize;
+
+        // 2) 替换信令：应向 HostHandle 同步新的 Some(ptr2)。
+        let old2 = inner.start_signal(None);
+        assert!(old2.is_some());
+        let ptr2 = Arc::as_ptr(inner.signal.as_ref().expect("signal replaced")) as usize;
+        assert_ne!(ptr1, ptr2);
+
+        // 3) 停用/未认证清空信令：应向 HostHandle 同步 None。
+        inner.server_cfg.enabled = false;
+        let old3 = inner.start_signal(None);
+        assert!(old3.is_some());
+        assert!(inner.signal.is_none());
+
+        let recorded = sync_log.lock().unwrap().clone();
+        assert_eq!(recorded, vec![Some(ptr1), Some(ptr2), None]);
+
+        drop(old2);
+        drop(old3);
+        let retired = inner.take_all_handles();
+        retired.stop_all(ByeReason::Normal);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
