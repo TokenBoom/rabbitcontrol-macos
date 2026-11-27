@@ -8,9 +8,9 @@
 
 | 组件 / 仓库 | 参考基线版本 / Commit | 关键依赖与说明 |
 |---|---|---|
-| `rabbitcontrol-macos` | Tag `v0.2.3`（跨仓联调基线，workspace `0.2.3`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`，plist FD 上限 `4096/8192`）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
-| `rabbitcontrol-core` | Tag `v0.2.4`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、P2P v2.1 / `SwitchableTransport`、QUIC/mTLS、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
-| `rabbitcontrol-apple-media` | Tag `v0.2.2`（`8df0d34`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
+| `rabbitcontrol-macos` | Tag `v0.2.4`（跨仓联调基线，workspace `0.2.4`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`，plist FD 上限 `4096/8192`）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
+| `rabbitcontrol-core` | Tag `v0.2.5`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、P2P v2.1 / `SwitchableTransport`、QUIC/mTLS、Relay/LAN 码率对称与突发平滑、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
+| `rabbitcontrol-apple-media` | Tag `v0.2.3`（`b2782ec`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
 | `rabbitcontrol-spec` | Tag `v1.0.0` | 统一错误目录（116 个规范错误码、127 个线协议别名、17 个域、4 端平台覆写）与多语言代码生成 |
 
 ---
@@ -133,9 +133,13 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **118 个 IPC 命令**（`#[tauri::
 
 ## 五、远控桌面（S1）与低延迟媒体/显示/音频/剪贴板
 
-1. **零拷贝硬件媒体管线与色彩/画质调优**
-   - 零拷贝链路：`ScreenCaptureKit` → `VideoToolbox`（2-deep 流水线编码与解码）→ `Metal`（`CAMetalLayer`）；
+1. **零拷贝硬件媒体管线与色彩/画质/帧节拍调优（含 `v0.2.4` / `core v0.2.5` 平滑与对称升级）**
+   - 零拷贝链路：`ScreenCaptureKit` → `VideoToolbox`（2-deep 流水线编码与解码）→ `Metal`（`CAMetalLayer`，`vsync: false` / `maximumDrawableCount = 3` / 呈现队列 = 1）；
    - **BT.709 色彩空间对齐** + H.264 **High Profile** + 内容自适应码率控制（静态零编码 + 局域变化降码率）+ **真实脏区提取**（`SCStreamFrameInfoDirtyRects`）；
+   - **VT `2.0× DataRateLimits` 突发裕度（`rc-encode-vt`）**：将 `try_set_data_rate_limits` 上限由 `1.4× AverageBitRate` 放宽至 **`2.0× AverageBitRate`**（`>= 32_768 B/s`，先放宽上限再提码率、先降码率再收紧上限），避免 `ContentAdaptiveRateController` 动态突升期间触发 `kVTEncodeInfo_FrameDropped`；
+   - **Relay vs LAN 码率对称性与路径切换同步（`core v0.2.5`）**：初始粗带宽探测仅在 `P2p` 路径启用（`Lan`/`MtlsLan`/`Relay` 跳过，消除冷启动 QUIC 窗口误判导致的 LAN 永久低码率钳制）；`SwitchPathEvent` 切换路径时同步更新 `RelayRttController`，切出 Relay 时调用 `clear_remote_probe_bitrate` 解除探针码率钳位；
+   - **静屏 IDR 风暴抑制与突发平滑（`core v0.2.5` + `server v0.1.10`）**：距上次发帧 `>= 450ms` 且无发送丢弃增量时抑制 `IdrRequest(WatchdogStall)`，并对齐实时 `ProbeSnapshot` RTT；TCP 中继采用 `32 KiB` TLS 读缓冲、单轮 `RxQueue::poll <= 2` 完整帧出队、在途 IDR 队列优先保活、无锁心跳锚点、`HostSession::tick` 先零等待收包再尾部休眠、`Pacer::poll_coalesced` 合并窗口与 `rc-net`/`rc-relay-*` 线程 QoS 提升（协同服务端 `128 KiB` 双向让渡）；
+   - **无阻塞 `StageRect` 缩放**：控制端窗口尺寸变更通过 `try_lock` + `pending_resize: AtomicU64` 避免被 `nextDrawable()` 持锁阻塞 UI 会话线程，由解码线程在同步 `SharedRenderer::present()` 内原子消费并先 `resize` 再上屏；
    - 核心指标遵循 Q1–Q6（高起始帧率、不对称降升收敛、接收端极小队列避免帧积压）。
 2. **非对称编解码协商与画质/帧率实时调控**
    - 能力真实上报：支持硬件端到端协商（例：macOS 上报 H.264/HEVC 硬编 + M3+ AV1/HEVC/H.264 硬解，**绝不虚报未支持的编码格式**；Windows NVENC/QSV/AMF 或 Android MediaCodec 可按实际硬编/硬解能力上报）；

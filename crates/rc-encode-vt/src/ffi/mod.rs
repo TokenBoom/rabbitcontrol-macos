@@ -667,6 +667,11 @@ pub(crate) fn use_low_latency_rate_control(fps: u32) -> bool {
     fps < 90
 }
 
+/// 计算 1 秒硬峰值码率上限（`2.0× AverageBitRate`，即 `2.0 * bps / 8` 字节/秒，最低 `32_768` B/s）。
+pub(crate) fn data_rate_limits_bytes_per_sec(bps: u32) -> i64 {
+    (u64::from(bps) / 4).max(32_768) as i64
+}
+
 impl CompressionSession {
     /// 创建会话并把延迟红线属性逐条落死（M6/E1/E2/E3/无限 GOP）。
     ///
@@ -887,9 +892,9 @@ impl CompressionSession {
         }
     }
 
-    /// 尽力设置 1 秒硬峰值码率上限（`1.4× AverageBitRate`），抑制稳态低变动桌面瞬时码率暴冲（Optional，不支持时静默忽略）。
+    /// 尽力设置 1 秒硬峰值码率上限（`2.0× AverageBitRate`），在保留桌面瞬时码率余量的同时抑制稳态暴冲（Optional，不支持时静默忽略）。
     fn try_set_data_rate_limits(&mut self, bps: u32) {
-        let peak_bytes_per_sec = ((u64::from(bps).saturating_mul(7)) / 40).max(16_384) as i64;
+        let peak_bytes_per_sec = data_rate_limits_bytes_per_sec(bps);
         let bytes_num = CFNumber::new_i64(peak_bytes_per_sec);
         let duration_num = CFNumber::new_f64(1.0);
         let vals = [
@@ -1993,6 +1998,19 @@ mod tests {
         assert_eq!(pipelined_in_flight_limit(144), 3);
         assert_eq!(pipelined_in_flight_limit(240), 3);
         assert_eq!(pipelined_in_flight_limit(380), 4);
+    }
+
+    #[test]
+    fn data_rate_limits_bytes_per_sec_is_2x_with_floor() {
+        assert_eq!(data_rate_limits_bytes_per_sec(0), 32_768);
+        assert_eq!(data_rate_limits_bytes_per_sec(64_000), 32_768);
+        assert_eq!(data_rate_limits_bytes_per_sec(131_072), 32_768);
+        assert_eq!(data_rate_limits_bytes_per_sec(4_000_000), 1_000_000);
+        assert_eq!(data_rate_limits_bytes_per_sec(12_000_000), 3_000_000);
+        assert_eq!(
+            data_rate_limits_bytes_per_sec(u32::MAX),
+            i64::from(u32::MAX / 4)
+        );
     }
 
     #[test]
