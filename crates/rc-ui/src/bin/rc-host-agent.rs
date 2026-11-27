@@ -719,6 +719,7 @@ impl AgentInner {
             forbid_passwordless_auto_approve: self.session_type == ServiceSessionType::LoginWindow,
             file_transfer_dir,
             allow_assist_file_transfer: self.prefs.allow_assist_file_transfer,
+            signal_client: self.signal.clone(),
         };
 
         match HostHandle::spawn(cfg) {

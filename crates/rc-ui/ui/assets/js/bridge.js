@@ -266,6 +266,12 @@
     terminalListLocalFonts: function () {
       return invoke("terminal_list_local_fonts");
     },
+    terminalGetLocalFontBytes: function (fontId, family) {
+      return invoke("terminal_get_local_font_bytes", {
+        fontId: fontId ? String(fontId) : "",
+        family: family ? String(family) : null
+      });
+    },
     terminalListRemoteFonts: function () {
       return invoke("terminal_list_remote_fonts");
     },

@@ -2076,6 +2076,12 @@
       renderP1();
       renderTitlebar();
     }
+    if (activeMainRemoteUpdate) {
+      var tracked = findMyDeviceById(activeMainRemoteUpdate.deviceId);
+      if (tracked) {
+        notifyMainRemoteUpdateDeviceStatus(tracked);
+      }
+    }
   }
 
   function applyDeviceStatusChanged(ev) {
@@ -2228,6 +2234,16 @@
     return false;
   }
 
+  function isVersionAtLeast(current, target) {
+    var cur = String(current || "").trim();
+    var tgt = String(target || "").trim();
+    var semverRe = /^v?\d+\.\d+\.\d+/i;
+    if (!semverRe.test(cur) || !semverRe.test(tgt)) {
+      return false;
+    }
+    return !isNewerSemver(tgt, cur);
+  }
+
   function formatBytesHuman(bytes) {
     if (Overlay && typeof Overlay.formatUpdateBytes === "function") {
       return Overlay.formatUpdateBytes(bytes);
@@ -2278,6 +2294,14 @@
       window.clearTimeout(ctx.waitTimer);
       ctx.waitTimer = 0;
     }
+    if (ctx.pollTimer) {
+      window.clearInterval(ctx.pollTimer);
+      ctx.pollTimer = 0;
+    }
+    if (ctx.restartTimeoutTimer) {
+      window.clearTimeout(ctx.restartTimeoutTimer);
+      ctx.restartTimeoutTimer = 0;
+    }
     if (typeof ctx.unlisten === "function") {
       try {
         ctx.unlisten();
@@ -2305,13 +2329,12 @@
     var ctx = activeMainRemoteUpdate;
     if (!ctx || !device || ctx.deviceId !== device.id) return;
     if (
-      ctx.stage === "restarting" &&
+      (ctx.stage === "restarting" || ctx.stage === "restarting_timeout") &&
       device.online &&
       device.appVersion &&
-      !isNewerSemver(ctx.targetVersion, device.appVersion)
+      isVersionAtLeast(device.appVersion, ctx.targetVersion)
     ) {
-      ctx.stage = "succeeded";
-      if (ctx.onSucceeded) ctx.onSucceeded(device.appVersion);
+      if (ctx.complete) ctx.complete(device.appVersion);
     }
   }
 
@@ -2434,6 +2457,7 @@
       if (
         activeMainRemoteUpdate &&
         activeMainRemoteUpdate.stage !== "restarting" &&
+        activeMainRemoteUpdate.stage !== "restarting_timeout" &&
         activeMainRemoteUpdate.stage !== "succeeded" &&
         activeMainRemoteUpdate.stage !== "installing"
       ) {
@@ -2452,6 +2476,16 @@
     });
 
     okBtn.addEventListener("click", function () {
+      if (activeMainRemoteUpdate && activeMainRemoteUpdate.stage === "restarting_timeout") {
+        activeMainRemoteUpdate.stage = "restarting";
+        okBtn.disabled = true;
+        okBtn.textContent = "检查中…";
+        stageEl.textContent = "正在重新检查被控端版本与在线状态…";
+        if (activeMainRemoteUpdate.restartCheck) {
+          activeMainRemoteUpdate.restartCheck();
+        }
+        return;
+      }
       if (!resolvedRelease || !resolvedRelease.version) {
         loadLatestRelease();
         return;
@@ -2488,21 +2522,132 @@
         triggered: false,
         stage: "connecting",
         waitTimer: 0,
+        pollTimer: 0,
+        pollInFlight: false,
+        restartTimeoutTimer: 0,
+        restartCheck: null,
         unlisten: null,
-        onSucceeded: function (newVer) {
-          if (modalClosed) return;
+        complete: function (newVer) {
+          if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx || ctx.stage === "succeeded") {
+            return;
+          }
+          var cleanVer = String(newVer || ctx.targetVersion || "").replace(/^v/i, "");
+          ctx.stage = "succeeded";
+          if (cleanVer) {
+            device.appVersion = cleanVer;
+            device.online = true;
+            var listed = findMyDeviceById(device.deviceId || device.id);
+            if (listed) {
+              listed.appVersion = cleanVer;
+              listed.online = true;
+            }
+          }
+          paintSidebarRows();
+          if (state.route === "p3") renderP3();
+          if (state.route === "p1") {
+            renderP1();
+            renderTitlebar();
+          }
           progWrap.hidden = false;
+          errEl.hidden = true;
           fill.style.width = "100%";
-          stageEl.textContent = "升级完成，设备已上线（v" + newVer + "）";
+          stageEl.textContent = "升级完成，设备已上线（v" + cleanVer + "）";
           bytesEl.textContent = "100%";
           okBtn.hidden = true;
           cancelBtn.disabled = false;
           cancelBtn.textContent = "完成";
-          cleanupMainRemoteUpdate(false);
-          toast("设备「" + device.name + "」已升级至 v" + newVer);
+          cleanupMainRemoteUpdate(true);
+          refreshMyDevices();
+          toast("设备「" + device.name + "」已升级至 v" + cleanVer);
         }
       };
       activeMainRemoteUpdate = ctx;
+
+      function checkPostRestartStatus() {
+        if (
+          modalClosed ||
+          ctx.cancelled ||
+          activeMainRemoteUpdate !== ctx ||
+          (ctx.stage !== "restarting" && ctx.stage !== "restarting_timeout")
+        ) {
+          return;
+        }
+        var latest = findMyDeviceById(ctx.deviceId);
+        if (
+          latest &&
+          latest.online &&
+          latest.appVersion &&
+          isVersionAtLeast(latest.appVersion, ctx.targetVersion)
+        ) {
+          ctx.complete(latest.appVersion);
+          return;
+        }
+        if (ctx.pollInFlight) return;
+        ctx.pollInFlight = true;
+        var hvPromise =
+          typeof Bridge.getSessionHostVersion === "function" && hasActiveSessionForDevice(device)
+            ? Bridge.getSessionHostVersion().catch(function () {
+                return null;
+              })
+            : Promise.resolve(null);
+        Promise.all([
+          hvPromise,
+          refreshMyDevices().catch(function () {
+            return null;
+          })
+        ])
+          .then(function (results) {
+            ctx.pollInFlight = false;
+            if (
+              modalClosed ||
+              ctx.cancelled ||
+              activeMainRemoteUpdate !== ctx ||
+              ctx.stage === "succeeded"
+            ) {
+              return;
+            }
+            var hv = results[0];
+            if (hv && hv.version && isVersionAtLeast(hv.version, ctx.targetVersion)) {
+              ctx.complete(hv.version);
+            }
+          })
+          .catch(function () {
+            ctx.pollInFlight = false;
+          });
+      }
+
+      function startRestartPolling() {
+        if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx) return;
+        checkPostRestartStatus();
+        if (!ctx.pollTimer) {
+          ctx.pollTimer = window.setInterval(checkPostRestartStatus, 3000);
+        }
+        if (!ctx.restartTimeoutTimer) {
+          ctx.restartTimeoutTimer = window.setTimeout(function () {
+            ctx.restartTimeoutTimer = 0;
+            if (
+              modalClosed ||
+              ctx.cancelled ||
+              activeMainRemoteUpdate !== ctx ||
+              ctx.stage !== "restarting"
+            ) {
+              return;
+            }
+            if (ctx.pollTimer) {
+              window.clearInterval(ctx.pollTimer);
+              ctx.pollTimer = 0;
+            }
+            ctx.stage = "restarting_timeout";
+            stageEl.textContent = "等待被控端恢复在线超时，若目标已重启可点击「刷新状态」或关闭弹窗";
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = "关闭";
+            okBtn.hidden = false;
+            okBtn.disabled = false;
+            okBtn.textContent = "刷新状态";
+          }, 120000);
+        }
+      }
+      ctx.restartCheck = startRestartPolling;
 
       function tryTriggerWithHostVersion(hv) {
         if (modalClosed || ctx.cancelled || activeMainRemoteUpdate !== ctx || ctx.triggered) return;
@@ -2543,7 +2688,28 @@
         if (!ctx.openResolved && upd.kind === "ended") return;
         var data = upd.data || upd;
         if (upd.kind === "host_version") {
+          if (ctx.stage === "restarting" || ctx.stage === "restarting_timeout") {
+            if (data && data.version && isVersionAtLeast(data.version, ctx.targetVersion)) {
+              ctx.complete(data.version);
+            }
+            return;
+          }
           tryTriggerWithHostVersion(data);
+          return;
+        }
+        if (upd.kind === "negotiated") {
+          if (
+            (ctx.stage === "restarting" || ctx.stage === "restarting_timeout") &&
+            typeof Bridge.getSessionHostVersion === "function"
+          ) {
+            Bridge.getSessionHostVersion()
+              .then(function (hv) {
+                if (hv && hv.version && isVersionAtLeast(hv.version, ctx.targetVersion)) {
+                  ctx.complete(hv.version);
+                }
+              })
+              .catch(function () {});
+          }
           return;
         }
         if (upd.kind === "remote_update_status") {
@@ -2566,15 +2732,26 @@
           if (st === "installing" || st === "restarting") {
             cancelBtn.textContent = st === "restarting" ? "后台等待" : "安装中…";
             cancelBtn.disabled = st === "installing";
+            if (st === "restarting") {
+              startRestartPolling();
+            }
+          } else if (st === "succeeded") {
+            ctx.complete(data.targetVersion || ctx.targetVersion);
           } else if (st === "failed") {
             cleanupMainRemoteUpdate(true);
             showErr(data.error || data.message || "被控端更新失败");
           }
           return;
         }
-        if (upd.kind === "ended" && ctx.stage !== "restarting" && ctx.stage !== "succeeded") {
-          cleanupMainRemoteUpdate(false);
-          showErr("远程连接已断开：" + String(data.reason || "请稍后重试"));
+        if (upd.kind === "ended") {
+          if (ctx.stage === "restarting") {
+            startRestartPolling();
+            return;
+          }
+          if (ctx.stage !== "restarting_timeout" && ctx.stage !== "succeeded") {
+            cleanupMainRemoteUpdate(false);
+            showErr("远程连接已断开：" + String(data.reason || "请稍后重试"));
+          }
         }
       }
 

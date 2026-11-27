@@ -1657,6 +1657,12 @@ pub async fn open_session(
         meta.media_active = true;
     }
 
+    let signal_client = state
+        .server
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_client
+        .clone();
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password,
@@ -1681,6 +1687,8 @@ pub async fn open_session(
         owner_grant: security.owner_grant,
         owner_signer: security.owner_signer,
         lan_direct_addr: security.lan_direct_addr,
+        signal_client,
+        target_device_id: relay_target_id,
     };
 
     let preallocated_override = if upgraded_to_desktop_while_connecting {
@@ -1871,6 +1879,12 @@ pub async fn set_session_connection_mode(
     } else {
         (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT)
     };
+    let signal_client = state
+        .server
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_client
+        .clone();
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password: meta.password.clone(),
@@ -1895,6 +1909,8 @@ pub async fn set_session_connection_mode(
         owner_grant: security.owner_grant,
         owner_signer: security.owner_signer,
         lan_direct_addr: security.lan_direct_addr,
+        signal_client,
+        target_device_id: meta.relay_target_id.clone(),
     };
 
     activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)?;
@@ -2114,6 +2130,12 @@ pub async fn set_session_mtls_mode(
     } else {
         (DEFAULT_SESSION_WIDTH, DEFAULT_SESSION_HEIGHT)
     };
+    let signal_client = state
+        .server
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_client
+        .clone();
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password: meta.password.clone(),
@@ -2138,6 +2160,8 @@ pub async fn set_session_mtls_mode(
         owner_grant: security.owner_grant,
         owner_signer: security.owner_signer,
         lan_direct_addr: security.lan_direct_addr,
+        signal_client,
+        target_device_id: meta.relay_target_id.clone(),
     };
 
     activate_session_with_cfg(&app, &state, my_epoch, ui_cfg, watch_only, meta, None)?;
@@ -2604,6 +2628,12 @@ pub(crate) fn start_host_service_with_policy(
     let owner_verifier = build_owner_verifier(state);
     let mtls_config = build_session_mtls_bundle(state, None, None);
     let accept_mtls_lan = default_encrypt;
+    let signal_client = state
+        .server
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_client
+        .clone();
 
     let mut host = state.host.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = host.handle.as_ref() {
@@ -2634,6 +2664,7 @@ pub(crate) fn start_host_service_with_policy(
             forbid_passwordless_auto_approve: false,
             file_transfer_dir: Some(file_transfer_dir),
             allow_assist_file_transfer,
+            signal_client,
         })?;
         host.allow_remote_assist = allow_remote_assist;
         let actual = handle.listen_addr();
@@ -3748,6 +3779,7 @@ fn save_terminal_prefs_to_path(
         prefs.clone()
     };
     app_prefs::save_to_path(path, &next)?;
+    notify_background_services_reload(state, false);
     Ok(next)
 }
 
@@ -5961,6 +5993,74 @@ pub async fn terminal_clear_saved_password(
     Ok(())
 }
 
+const MAX_DISK_CACHED_TERMINAL_FONTS: usize = 8;
+
+fn sanitize_cached_font_id(font_id: &str) -> Result<&str, String> {
+    let clean = font_id.trim();
+    if clean.is_empty()
+        || clean.len() > 64
+        || !clean
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("非法的终端字体缓存标识".to_string());
+    }
+    Ok(clean)
+}
+
+fn terminal_font_cache_dir() -> PathBuf {
+    config_paths::config_dir().join("terminal-fonts")
+}
+
+fn terminal_font_cache_path(dir: &Path, font_id: &str) -> Result<PathBuf, String> {
+    let clean = sanitize_cached_font_id(font_id)?;
+    Ok(dir.join(format!("{clean}.font")))
+}
+
+fn save_cached_remote_font_to_dir(dir: &Path, font_id: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() as u64 > rc_tools::fonts::MAX_REMOTE_FONT_BYTES {
+        return Err("终端字体缓存体积非法".to_string());
+    }
+    let path = terminal_font_cache_path(dir, font_id)?;
+    config_paths::write_private_file(&path, bytes)?;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("font") {
+                    return None;
+                }
+                let meta = e.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                Some((mtime, p))
+            })
+            .collect();
+        if files.len() > MAX_DISK_CACHED_TERMINAL_FONTS {
+            files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let excess = files.len() - MAX_DISK_CACHED_TERMINAL_FONTS;
+            for (_, old_path) in files.into_iter().take(excess) {
+                if old_path != path {
+                    let _ = std::fs::remove_file(old_path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_cached_remote_font_from_dir(dir: &Path, font_id: &str) -> Result<Vec<u8>, String> {
+    let path = terminal_font_cache_path(dir, font_id)?;
+    let meta = std::fs::metadata(&path).map_err(|_| "本地尚未缓存该远程字体".to_string())?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > rc_tools::fonts::MAX_REMOTE_FONT_BYTES {
+        return Err("本地缓存的远程字体已损坏".to_string());
+    }
+    std::fs::read(&path).map_err(|e| format!("读取本地缓存字体失败：{e}"))
+}
+
 /// IPC 命令：扫描本机系统字体（用于 W3 终端本地字体选择）。
 #[tauri::command]
 pub async fn terminal_list_local_fonts(
@@ -5970,6 +6070,38 @@ pub async fn terminal_list_local_fonts(
     tauri::async_runtime::spawn_blocking(rc_tools::fonts::list_local_fonts)
         .await
         .map_err(|e| format!("扫描本机字体任务异常：{e}"))
+}
+
+/// IPC 命令：读取本机已安装的字体二进制流，用于 `WKWebView` 通过 `FontFace` 直接渲染用户安装字体。
+#[tauri::command]
+pub async fn terminal_get_local_font_bytes(
+    font_id: String,
+    family: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    state.require_authenticated()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let cat = rc_tools::fonts::FontCatalog::scan_system();
+        let trimmed_id = font_id.trim();
+        if !trimmed_id.is_empty() {
+            if let Ok((_info, _fmt, bytes)) = cat.load_font_bytes(trimmed_id) {
+                return Ok(tauri::ipc::Response::new(bytes));
+            }
+        }
+        if let Some(fam) = family.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(matched) = cat
+                .list()
+                .into_iter()
+                .find(|info| info.family.eq_ignore_ascii_case(fam))
+            {
+                let (_info, _fmt, bytes) = cat.load_font_bytes(&matched.id)?;
+                return Ok(tauri::ipc::Response::new(bytes));
+            }
+        }
+        Err("未找到匹配的本机系统字体".to_string())
+    })
+    .await
+    .map_err(|e| format!("读取本机字体数据任务异常：{e}"))?
 }
 
 /// IPC 命令：请求被控端列举其已安装的系统字体（结果经 `"terminal://event"` 推送）。
@@ -5987,13 +6119,21 @@ pub fn terminal_fetch_remote_font(
     active_session_tools(&state)?.terminal_fetch_remote_font(font_id)
 }
 
-/// IPC 命令：读取已缓存的远程字体原始二进制（避免 Base64 膨胀与 DOM 重写开销）。
+/// IPC 命令：读取已缓存的远程字体原始二进制（先查活动会话内存缓存并落盘，未命中时回退本机持久化缓存）。
 #[tauri::command]
 pub fn terminal_get_remote_font_bytes(
     font_id: String,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let bytes = active_session_tools(&state)?.terminal_get_cached_remote_font(&font_id)?;
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    if let Ok(tools) = active_session_tools(&state) {
+        if let Ok(bytes) = tools.terminal_get_cached_remote_font(&font_id) {
+            let _ = save_cached_remote_font_to_dir(&terminal_font_cache_dir(), &font_id, &bytes);
+            return Ok(tauri::ipc::Response::new(bytes));
+        }
+    }
+    let bytes = load_cached_remote_font_from_dir(&terminal_font_cache_dir(), &font_id)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -7940,6 +8080,12 @@ async fn reconnect_with_saved_params(
     meta.phase = "connecting".to_string();
     meta.tool_permissions = state::ToolPermissionsSnapshot::default();
 
+    let signal_client = state
+        .server
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_client
+        .clone();
     let ui_cfg = UiSessionConfig {
         connect_addr,
         password: meta.password.clone(),
@@ -7964,6 +8110,8 @@ async fn reconnect_with_saved_params(
         owner_grant: security.owner_grant,
         owner_signer: security.owner_signer,
         lan_direct_addr: security.lan_direct_addr,
+        signal_client,
+        target_device_id: meta.relay_target_id.clone(),
     };
 
     activate_session_with_cfg(app, state, my_epoch, ui_cfg, watch_only, meta, None)
@@ -8512,6 +8660,9 @@ pub fn save_privacy_custom_image(
             .unwrap_or_else(|e| e.into_inner());
         let _file_lock = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
         let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
         let prev = prefs.clone();
         prefs.privacy_custom_image = Some(filename.clone());
         if let Err(err) = app_prefs::save_to_path(&prefs_path, &prefs) {
@@ -8568,6 +8719,9 @@ pub fn set_session_privacy_mode(
                         .unwrap_or_else(|e| e.into_inner());
                     let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
                     let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.is_service_proxy() && prefs_path.exists() {
+                        *prefs = app_prefs::load_from_path(&prefs_path);
+                    }
                     prefs.privacy_custom_image = Some(fname);
                     let _ = app_prefs::save_to_path(&prefs_path, &prefs);
                 }
@@ -8597,6 +8751,9 @@ pub fn set_session_privacy_mode(
             .unwrap_or_else(|e| e.into_inner());
         let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
         let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
         let prev = prefs.clone();
         if let Err(err) = prefs.apply_privacy_patch(app_prefs::PrivacyPrefsPatch {
             privacy_mode: Some(norm_mode.to_string()),
@@ -8654,6 +8811,9 @@ pub fn set_session_host_mute(
             .unwrap_or_else(|e| e.into_inner());
         let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
         let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
         let prev = prefs.clone();
         if let Err(err) = prefs.apply_privacy_patch(app_prefs::PrivacyPrefsPatch {
             privacy_mode: None,
@@ -8824,6 +8984,9 @@ pub fn set_session_peripherals(
             .unwrap_or_else(|e| e.into_inner());
         let _fl = config_paths::acquire_file_lock(&prefs_path, Duration::from_secs(3));
         let mut prefs = state.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_service_proxy() && prefs_path.exists() {
+            *prefs = app_prefs::load_from_path(&prefs_path);
+        }
         let prev = prefs.clone();
         if let Err(err) = prefs.apply_peripherals_patch(app_prefs::PeripheralsPrefsPatch {
             send_system_shortcuts,
@@ -11231,5 +11394,145 @@ mod tests {
             "unexpected code: {}",
             err_unauth.ui_error.code
         );
+    }
+
+    #[test]
+    fn save_terminal_prefs_to_path_persists_local_remote_size_and_reset() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-term-font-prefs-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let prefs_path = base.join("prefs.json");
+        let state = AppState::new_for_test();
+
+        let local_saved = save_terminal_prefs_to_path(
+            &state,
+            TerminalPrefsPatch {
+                terminal_font_source: Some("local".to_string()),
+                terminal_font_family: Some("MesloLGS NF".to_string()),
+                terminal_font_id: Some("0123456789abcdef".to_string()),
+                clear_font: Some(false),
+                terminal_font_size: Some(16),
+            },
+            &prefs_path,
+        )
+        .expect("save local terminal font prefs");
+        assert_eq!(local_saved.terminal_font_source, "local");
+        assert_eq!(
+            local_saved.terminal_font_family.as_deref(),
+            Some("MesloLGS NF")
+        );
+        assert_eq!(
+            local_saved.terminal_font_id.as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(local_saved.terminal_font_size, 16);
+
+        let reloaded_local = app_prefs::load_from_path(&prefs_path);
+        assert_eq!(reloaded_local.terminal_font_source, "local");
+        assert_eq!(
+            reloaded_local.terminal_font_family.as_deref(),
+            Some("MesloLGS NF")
+        );
+        assert_eq!(
+            reloaded_local.terminal_font_id.as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(reloaded_local.terminal_font_size, 16);
+
+        let remote_saved = save_terminal_prefs_to_path(
+            &state,
+            TerminalPrefsPatch {
+                terminal_font_source: Some("remote".to_string()),
+                terminal_font_family: Some("JetBrains Mono".to_string()),
+                terminal_font_id: Some("fedcba9876543210".to_string()),
+                clear_font: Some(false),
+                terminal_font_size: Some(15),
+            },
+            &prefs_path,
+        )
+        .expect("save remote terminal font prefs");
+        assert_eq!(remote_saved.terminal_font_source, "remote");
+        let reloaded_remote = app_prefs::load_from_path(&prefs_path);
+        assert_eq!(reloaded_remote.terminal_font_source, "remote");
+        assert_eq!(
+            reloaded_remote.terminal_font_family.as_deref(),
+            Some("JetBrains Mono")
+        );
+        assert_eq!(
+            reloaded_remote.terminal_font_id.as_deref(),
+            Some("fedcba9876543210")
+        );
+        assert_eq!(reloaded_remote.terminal_font_size, 15);
+
+        let reset_saved = save_terminal_prefs_to_path(
+            &state,
+            TerminalPrefsPatch {
+                terminal_font_source: Some("default".to_string()),
+                terminal_font_family: Some(String::new()),
+                terminal_font_id: Some(String::new()),
+                clear_font: Some(true),
+                terminal_font_size: Some(13),
+            },
+            &prefs_path,
+        )
+        .expect("reset terminal font prefs");
+        assert_eq!(reset_saved.terminal_font_source, "default");
+        assert_eq!(reset_saved.terminal_font_family, None);
+        assert_eq!(reset_saved.terminal_font_id, None);
+        assert_eq!(reset_saved.terminal_font_size, 13);
+
+        let reloaded_reset = app_prefs::load_from_path(&prefs_path);
+        assert_eq!(reloaded_reset.terminal_font_source, "default");
+        assert_eq!(reloaded_reset.terminal_font_family, None);
+        assert_eq!(reloaded_reset.terminal_font_id, None);
+        assert_eq!(reloaded_reset.terminal_font_size, 13);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn terminal_font_disk_cache_roundtrip_eviction_and_rejects_traversal() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-term-font-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        assert!(terminal_font_cache_path(&base, "../evil").is_err());
+        assert!(terminal_font_cache_path(&base, "bad/id").is_err());
+        assert!(terminal_font_cache_path(&base, "").is_err());
+
+        for i in 0..10 {
+            let id = format!("font_id_{i:02}");
+            let data = vec![b'A' + (i as u8); 32];
+            save_cached_remote_font_to_dir(&base, &id, &data).expect("save cached font");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let loaded_latest =
+            load_cached_remote_font_from_dir(&base, "font_id_09").expect("latest must exist");
+        assert_eq!(loaded_latest, vec![b'A' + 9; 32]);
+
+        let cached_count = std::fs::read_dir(&base)
+            .expect("read cache dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("font"))
+            .count();
+        assert_eq!(
+            cached_count, MAX_DISK_CACHED_TERMINAL_FONTS,
+            "cache must evict oldest files down to MAX_DISK_CACHED_TERMINAL_FONTS"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

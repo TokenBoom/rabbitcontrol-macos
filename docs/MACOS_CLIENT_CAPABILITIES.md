@@ -8,9 +8,9 @@
 
 | 组件 / 仓库 | 参考基线版本 / Commit | 关键依赖与说明 |
 |---|---|---|
-| `rabbitcontrol-macos` | Tag `v0.2.2`（`46b7d9e`，workspace `0.2.2`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
-| `rabbitcontrol-core` | Tag `v0.2.3`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、QUIC/mTLS、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
-| `rabbitcontrol-apple-media` | Tag `v0.2.1`（`e5f9aac`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
+| `rabbitcontrol-macos` | Tag `v0.2.3`（跨仓联调基线，workspace `0.2.3`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`，plist FD 上限 `4096/8192`）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
+| `rabbitcontrol-core` | Tag `v0.2.4`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、P2P v2.1 / `SwitchableTransport`、QUIC/mTLS、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
+| `rabbitcontrol-apple-media` | Tag `v0.2.2`（`8df0d34`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
 | `rabbitcontrol-spec` | Tag `v1.0.0` | 统一错误目录（116 个规范错误码、127 个线协议别名、17 个域、4 端平台覆写）与多语言代码生成 |
 
 ---
@@ -31,14 +31,14 @@
 | 组件 | 形态与职责 | 跨端借鉴重点 |
 |---|---|---|
 | `rc-ui`（前台 GUI） | 按需开合的桌面主界面、远控渲染窗与工具窗；经 Unix Domain Socket 与后台服务通信；未安装系统服务时平滑回退为**单进程嵌入式托管模式** | Windows 对标 Electron/WinUI/Tauri 主进程 + Windows Service IPC；移动端走单进程嵌入式 |
-| `rc-daemon`（系统级守护） | 随系统开机常驻：**单点串行刷新 Refresh Token**（防止多进程/多开重放吊销整族会话）、设备证书自动续签、独立复核升级包 SHA-256 与签名后原子替换 `.app`、`boot-marker` 与 `manual-stop` 防误重启标记 | Windows 对应 System Windows Service 负责开机在线与提权升级；移动端无独立 daemon |
-| `rc-host-agent`（双会话被控代理） | 同时覆盖 `LoginWindow`（重启未输密码登录界面，只放行同账号 `OwnerTicket` Ed25519 自控或固定自定义密码，严禁无密码与随机临时码）与 `Aqua`（登录后桌面上下文，经 `ByeReason::SessionSwitching` 无缝交接并接管顶部状态栏）；使用 `ipc.secret` 256-bit 随机十六进制共享密钥做常量时间鉴权 | Windows 对应 Session 0 / Winlogon 桌面前置接管，保证重启/锁屏/UAC 界面均可控 |
+| `rc-daemon`（系统级守护） | 随系统开机常驻：**单点串行刷新 Refresh Token**（防止多进程/多开重放吊销整族会话）、设备证书自动续签、独立复核升级包 SHA-256 与签名后原子替换 `.app`、`boot-marker` 与 `manual-stop` 防误重启标记；`LaunchDaemon` plist 默认配置 `SoftResourceLimits.NumberOfFiles = 4096`、`HardResourceLimits.NumberOfFiles = 8192` | Windows 对应 System Windows Service 负责开机在线与提权升级；移动端无独立 daemon |
+| `rc-host-agent`（双会话被控代理） | 同时覆盖 `LoginWindow`（重启未输密码登录界面，只放行同账号 `OwnerTicket` Ed25519 自控或固定自定义密码，严禁无密码与随机临时码）与 `Aqua`（登录后桌面上下文，经 `ByeReason::SessionSwitching` 无缝交接并接管顶部状态栏）；使用 `ipc.secret` 256-bit 随机十六进制共享密钥做常量时间鉴权；`LaunchAgent` plist 同步配置 FD 上限 `4096/8192` 并向 `UiHostConfig` 注入 `signal_client` 支持运行期 `Relay -> P2P` 复探 | Windows 对应 Session 0 / Winlogon 桌面前置接管，保证重启/锁屏/UAC 界面均可控 |
 | `rc-host-macos`（托盘与审批弹窗） | 状态栏（`NSStatusItem`）：展示当前状态、**「断开当前会话」**（仅会话中启用）、**「退出」**；非阻塞模态连接审批弹窗（支持拒绝/放行与超时自动撤窗） | Windows 托盘与来电审批气泡/弹窗须提供对等控制权 |
 | `rc-cli`（诊断 CLI） | 提供 `probe`（权限与后端 JSON 探测）、`version`、`host`、`client`、`loopback`、`bench` 等命令行能力，便于自动化回归与排障 | 桌面端建议保留轻量无头诊断子命令 |
 
 ### 1.3 六大 UI 窗口与前端 IPC 契约
 
-macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::command]`）与 **15 个实时推送事件**，支撑 6 个独立 HTML 视图：
+macOS 桌面端（`crates/rc-ui`）共暴露 **118 个 IPC 命令**（`#[tauri::command]`）与 **15 个实时推送事件**，支撑 6 个独立 HTML 视图：
 
 | 窗口 / 视图 | 文件路径 | 核心用途 |
 |---|---|---|
@@ -105,8 +105,11 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 
 ## 四、网络路由、断网自愈、代理与 Wake-on-LAN
 
-1. **三层路由与分级回退（含 #4 握手修复）**
-   - 路由优先级：**静默局域网发现（UDP LAN）→ P2P UDP 打洞 → 强制 TLS 1.3 mTLS TCP 中继（`:21117`）**；局域网设备仅在连接路由决策时静默使用，**默认不在设备列表暴露**；
+1. **三层路由、P2P v2.1 与双端 `Relay-first` 无损热切（含 #4 握手修复 & `v0.2.3` / `core v0.2.4` 升级）**
+   - 路由优先级：**静默局域网发现（UDP LAN，全网卡 IPv4 扫描）→ P2P v2.1 UDP 打洞（全网卡 IPv4 + 全球单播 IPv6 Happy Eyeballs）→ 强制 TLS 1.3 mTLS TCP 中继（`:21117`）**；局域网设备仅在连接路由决策时静默使用，**默认不在设备列表暴露**；
+   - **100% 纯私有 STUN 4 样本 NAT 画像（零第三方公共 STUN）**：仅使用自有 `rc-server` 的 `RCSP`/`RCSA` 双端口（含可选第二公网 IP `udp_probe_alt_ip_addr`）4 样本探测，精准细分 `Public` / `ConeVerified` / `ConeUnverified` / `AdmSeq` / `AdmRandom` / `ApdmSeq` / `ApdmRandom` / `UdpBlocked`，并通过信令透传扩展 `nat_type` 与 `nat_port_range`；
+   - **`RCP2 v2` HMAC-SHA256 认证打洞与梯度两波次生日碰撞**：`PunchCoord` 下发会话共享 128-bit `punch_secret`（48 字节 `RCP2 v2` HMAC-SHA256 报文，恒定时间验签 + 1.0x 等长 Ack 防放大，兼容回退 `v1` 29 字节）与 `start_after_ms`（快侧 `0..=500ms` RTT 同步起跑）；按 6 类 NAT 组合执行策略矩阵（`UdpBlocked` / 双端 `ApdmRandom` 0ms 快退、`ApdmSeq ↔ ApdmSeq` 定向会师、`Cone* ↔ ApdmRandom` 两波次滚动释放 `<=96` aux + `<=200 pps` 512 端口采样、`ConeUnverified` 三级渐进探测），并内置 `96` 辅助 socket 硬上限与 `EMFILE`/`ENFILE` FD 守卫；
+   - **双端 `Relay-first 400ms` + `SwitchableTransport` 无损热切**：`Auto` 模式下首包 `relay_fallback_after_ms`（默认 `400ms`）后并行拨号 `:21117` mTLS 中继秒通保底，P2P 直连就绪或运行期 60s `Relay -> P2P` 复探成功后通过 `SwitchableTransport` 无损平滑热切至直连（`UiHostConfig` / `UiSessionConfig` 注入 `signal_client` 与 `target_device_id` 支撑运行期刷新打洞与按需 `request_relay`）；
    - **#4 握手稳定性**：解耦 QUIC Accept 短分片与 TLS 握手超时，`Welcome` 收到前遇到底层超时/断连自动回退下一级链路；**严守红线**：一旦对方拒绝 mTLS/鉴权、处于 `AuthChallenge` 审批等待期或模式为 `P2pOnly`，绝不误降级。
 2. **三档持久化「连接模式」（热切换不断流恢复）**
    - `AppPrefs.connection_mode`（`Auto` 自动 / `P2pOnly` 仅 P2P / `TcpRelay` TCP 中继），持久化在 `prefs.json`；
@@ -116,8 +119,8 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
    - `ClientSession` 6s / `HostSession` 8s 双向活性看门狗、QUIC `10s` 空闲超时、Relay `10s/3s` 保活、信令 `10s/25s` 心跳；
    - 被控端支持同对端/失活会话入站即时抢占（消灭占线黑屏）；
    - 控制端 `AutoReconnectTask` 支持 8 次指数退避重连 + `trigger_reconnect_now` / `reconnect_last_session` 手动秒重试；**S1 会话窗口遇到错误时常驻展示失败原因与「重新连接 / 关闭窗口」，绝不自动关闭弹窗**。
-4. **UPnP IGD v1/v2 + NAT-PMP 自动端口映射**
-   - `rc_client_core::upnp`：纯安全 Rust 实现，启动与切网时自动将本地 QUIC UDP 端口映射至网关公网端口、半租期自动续租、退网/退出发送退租删除映射；严格内置 **SSRF 拦截**（只允许私有 LAN IPv4 + 禁止 HTTP 3xx 跳转）与 **CGNAT（`100.64.0.0/10`）过滤**；可在 W1 设置「网络」实时查看映射协议/公网端口/状态。
+4. **UPnP IGD v1/v2 + NAT-PMP + PCP v2（RFC 6887）自动端口映射**
+   - `rc_client_core::upnp`：纯安全 Rust 实现，启动与切网时自动按 **PCP v2（RFC 6887）→ NAT-PMP → UPnP IGD v1/v2** 优先级将本地 QUIC UDP 端口映射至网关公网端口、半租期自动续租、退网/退出发送退租删除映射；严格内置 **SSRF 拦截**（只允许私有 LAN IPv4 + 禁止 HTTP 3xx 跳转）与 **CGNAT（`100.64.0.0/10`）过滤**；可在 W1 设置「网络」实时查看映射协议/公网端口/状态。
 5. **出站网络代理（#5）**
    - 支持 **`none`（不使用） / `system`（跟随系统） / `manual`（手动 SOCKS5 或 HTTP CONNECT + 可选认证）**；
    - 覆盖全部出站 TCP 链路：REST（`:21118`）、信令（`:21116`）、TCP 中继（`:21117`）与自更新下载器；
@@ -193,10 +196,10 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 - **双向并发传输**：支持多选全选、批量上传（`file_upload`）、下载（`file_download`）、单任务取消（`file_cancel`）、清理已完成（`file_clear_finished`）与移除记录（`file_remove_transfer`）；
 - **存储与拖拽增强**：支持在 W1 设置接收目录（`pick_transfer_storage_dir` / `open_transfer_storage_dir`）与拖拽文件浮窗开关；实时受 `ToolPermissions.allow_file_transfer` 门控。
 
-### 7.2 W3 远程终端（17 个 Tauri 命令 + `terminal://event`）
-- **浅色会话列表首屏**：展示当前活跃 PTY 会话与历史列表，`...` 溢出菜单支持**「重命名（`terminal_rename`）」**与**「终止会话（`terminal_close`）」**；
+### 7.2 W3 远程终端（18 个 Tauri 命令 + `terminal://event`）
+- **浅色会话列表首屏与状态横幅修复（`v0.2.3`）**：展示当前活跃 PTY 会话与历史列表，`...` 溢出菜单支持**「重命名（`terminal_rename`）」**与**「终止会话（`terminal_close`）」**；准确区分初始连接中（「连接中…」/「正在检查远控连接状态…」）与真实断连提示，统一由 `.tm-mgr-banner` CSS 类渲染且严禁 `.innerHTML` / `.insertAdjacentHTML` 与内联 `style.display`；
 - **多会话后台保活**：同会话最多同时保活 `8` 个后台 PTY，断线重附着（`terminal_attach`）自动回放最近 **`256 KiB` 滚动输出**，`xterm.js` 渲染并严禁 `.innerHTML`；支持脱离保留后台（`terminal_detach`）、新建（`terminal_open`）、输入（`terminal_input`）与窗口大小同步（`terminal_resize`）；
-- **字体体验同步**：支持读取本机字体与拉取/缓存远端字体字节流（`terminal_list_local_fonts` / `terminal_list_remote_fonts` / `terminal_fetch_remote_font` / `terminal_get_remote_font_bytes` / `terminal_set_font_prefs`），支持等宽过滤与字号调节；
+- **字体体验同步与持久化（`v0.2.3` 增强）**：支持读取并 `@font-face` 加载本机字体字节流（`terminal_list_local_fonts` / `terminal_get_local_font_bytes`）与拉取/磁盘缓存远端字体（`terminal_list_remote_fonts` / `terminal_fetch_remote_font` / `terminal_get_remote_font_bytes`），通过 `terminal_set_font_prefs` + 前端 `localStorage`（`rc.terminal.fontPrefs.v1`）双重持久化本机/远端字体选择与字号（`10..=28`）并支持一键恢复默认，支持等宽过滤与字号调节；
 - **按 `user_id` 持久化归属者终端**：同一登录用户重连自动认领已有终端会话，与访客隔离；
 - **锁屏状态系统口令验证解锁（`v0.2.1` 新增）**：
   - 当被控端处于锁屏或 `LoginWindow` 时打开终端，先通过 `terminal_get_lock_state` 获知锁定态与系统用户名，弹出「验证系统密码」门禁（`terminal_unlock` 经 `verify_system_password` 真实验证 OS 口令，内置错误重试退避冷却）；
@@ -222,13 +225,14 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 1. **本机应用自更新与镜像加速**
    - `check_for_updates` / `get_cached_release` / `get_update_mirror_url` / `save_update_mirror_url` / `start_self_update` / `cancel_self_update`；
    - 支持 HTTPS 更新镜像前缀、遵循代理配置、下载进度实时事件（`updater://progress`）、**防降级 SemVer 校验 + `SHA256SUMS` 校验 + 代码签名/证书钉扎复核 + 守护进程提权原子替换**。
-2. **远程升级同账号被控端（Owner-Only）**
-   - S1 顶栏与「更多」菜单在检测到对端版本落后时亮起「升级被控端」（`get_session_host_version` / `trigger_remote_update` / `cancel_remote_update`），支持仅同账号归属者触发，弱网下可由控制端直接通过工具通道中转推送安装包分片。
+2. **远程升级同账号被控端（Owner-Only，含 `v0.2.3` 主窗自动收口修复）**
+   - S1 顶栏与「更多」菜单及主窗口设备卡片在检测到对端版本落后时亮起「升级被控端」（`get_session_host_version` / `trigger_remote_update` / `cancel_remote_update`），支持仅同账号归属者触发，弱网下可由控制端直接通过工具通道中转推送安装包分片；
+   - 主窗口远程升级弹窗完善了重启后版本与在线态轮询（`restarting` / `restarting_timeout` 手动复查 + `isVersionAtLeast` 判定），升级达标上线后自动清理定时器、刷新设备版本号与在线状态并完成弹窗收口。
 3. **版本与构建元数据透出（#8-1）**
    - `get_app_info` 统一暴露 `CoreBuildInfo`（`coreVersion`、`gitCommit`、`buildTimestamp`、`sessionProtocolVersion`、`punchVersion`、`beaconVersion`、`abiVersion`），供「关于」与排障报告消费。
 4. **系统后台服务生命周期（macOS 系统服务 / Windows Service 对标）**
    - `get_service_status` / `install_system_service` / `uninstall_system_service` / `quit_app_completely`；
-   - 自动探测 FileVault 全盘加密状态并给出提示（冷重启磁盘解锁后免登录即可被控）；检测到磁盘可执行文件 SHA-256 升级后触发 `RestartForUpgrade` 平滑重启接管。
+   - 自动探测 FileVault 全盘加密状态并给出提示（冷重启磁盘解锁后免登录即可被控）；检测到磁盘可执行文件 SHA-256 升级后触发 `RestartForUpgrade` 平滑重启接管；`LaunchDaemon` 与 `LaunchAgent` plist（运行时生成及打包模板）均显式配置 `SoftResourceLimits.NumberOfFiles = 4096` 与 `HardResourceLimits.NumberOfFiles = 8192`。
 
 ---
 
@@ -248,7 +252,7 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 | **安全** | 本机 mTLS 设备证书（状态与有效期 / 立即续签） | `CertManager` + REST CSR 签发 |
 | **键盘** | 快捷键扩展配置（当前桌面侧栏空态预留，核心快捷键已在 S1 外设子菜单就绪） | — |
 | **网络** | 启用中继服务器 / 服务器地址 / 信令端口 / 中继端口 / 连接状态测试与保存 | `server.json` + 信令热重连 |
-| **网络** | UPnP / NAT-PMP 端口映射开关与实时外网映射状态 | `AppPrefs.upnp_enabled` |
+| **网络** | PCP v2 / UPnP / NAT-PMP 端口映射开关与实时外网映射状态 | `AppPrefs.upnp_enabled` |
 | **网络** | 代理设置（不使用 / 系统代理 / 手动 SOCKS5 & HTTP CONNECT + 认证脱敏 + 清除已存密码） | `AppPrefs.proxy` + 活跃信令即时重连 |
 | **网络** | 更新镜像加速前缀 | HTTPS 前缀校验落盘 |
 
@@ -263,8 +267,8 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 | **启动门禁 / 账号 / ECC PKI / `OwnerTicket`** | ✅ 已落地 | ✅ 全量对齐 | ✅ 全量对齐（Keychain） | ✅ 全量对齐（Keystore） |
 | **客户端本地锁屏** | ✅ 已落地 | ✅ 全量对齐 | 🟡 生物识别/PIN 锁（推荐） | 🟡 生物识别/PIN 锁（推荐） |
 | **P1 我的设备 / P2 协助 / P3 全部设备** | ✅ 已落地 | ✅ 全量对齐 | ✅ 全量对齐（侧栏过滤/P3 只读/默认 `allow_remote_control=false`） | ✅ 全量对齐（P1 仅受控端、P3 全部设备、默认仅协助模式） |
-| **三层路由 + 三档连接模式 + 自动重连** | ✅ 已落地 | ✅ 全量对齐 | ✅ 全量对齐（前后台切网刷新 + 重连面板） | ✅ 全量对齐（ConnectivityManager 切网监听 + 重连面板） |
-| **UPnP IGD / NAT-PMP + 出站代理（#5）** | ✅ 已落地 | ✅ 系统等价实现（WinHTTP 系统代理 + 手动 SOCKS5/HTTP） | ✅ `rc_proxy_set_config_json` 接入（#3 跟进中） | ✅ JNI 代理 + UPnP 开关（`android#1` 后已可接） |
+| **三层路由 + P2P v2.1 + `Relay-first 400ms` 热切 + 自动重连** | ✅ 已落地（纯私有 4 样本 STUN / `RCP2 v2` / `SwitchableTransport`） | ✅ 全量对齐 | ✅ 全量对齐（前后台切网刷新 + 重连面板） | ✅ 全量对齐（ConnectivityManager 切网监听 + 重连面板） |
+| **PCP v2 / UPnP IGD / NAT-PMP + 出站代理（#5）** | ✅ 已落地 | ✅ 系统等价实现（WinHTTP 系统代理 + 手动 SOCKS5/HTTP） | ✅ `rc_proxy_set_config_json` 接入（#3 跟进中） | ✅ JNI 代理 + UPnP 开关（`android#1` 后已可接） |
 | **Wake-on-LAN 远程开机（#7）** | ✅ 已落地 | ✅ 系统等价实现（主网卡 MAC 上报 + 离线按钮） | ✅ 主控发 WOL（#3 跟进中） | ✅ 主控发 WOL + 可选本地 MAC 上报 |
 | **硬件零拷贝管线 + 非对称 AV1/HEVC/H.264** | ✅ SCK + VT + Metal（M3+ AV1 硬解） | ✅ DXGI + NVENC/QSV/AMF（可接入 AV1 硬编/硬解）+ D3D11 | ✅ Metal + VT（A17 Pro+ AV1 硬解，`apple-media v0.2.0`） | ✅ MediaCodec AV1/HEVC/H.264 硬解 + ANativeWindow |
 | **多屏切换 / 改分辨率 / 虚拟屏 / 熄屏唤醒** | ✅ 已落地 | ✅ DXGI 多屏 + 虚拟屏驱动 + 唤醒防休眠 | 🟡 远端屏幕切换与分辨率菜单（控别人可用） | 🟡 远端屏幕切换与分辨率菜单（控别人可用） |
@@ -272,10 +276,10 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **117 个 IPC 命令**（`#[tauri::
 | **精确光标 / 快捷键映射 / 常用组合键** | ✅ 已落地 | ✅ 系统等价实现（`SendInput` + `Win`/组合键映射） | 🟡 触控/虚拟鼠标/蓝牙键鼠 + 快捷功能条 | 🟡 触控/虚拟鼠标/全虚拟键盘 + 快捷组合键 |
 | **音频 48kHz + 静音门控 + 采集自愈** | ✅ 已落地 | ✅ WASAPI（覆写 `AudioCapture::is_stopped` 实现设备热插拔自愈） | ✅ 远端音频播放与静音 | ✅ 远端音频播放 + `AAudio` 采集（协助被控） |
 | **W2 文件传输 + #6 权限硬闸门** | ✅ 已落地 | ✅ 全量对齐 | ✅ 全量对齐（`tool_permissions` 实时禁用 + Files 导入导出） | ✅ 全量对齐（SAF/下载目录 + 权限门控） |
-| **W3 远程终端（8 PTY / 256KiB / 字体 / 锁屏验证）** | ✅ 已落地（`v0.2.1`） | ✅ 全量对齐（ConPTY 被控 + xterm + DPAPI 凭据） | ✅ 远程终端主控面板 + 锁屏口令弹窗 | ✅ 远程终端主控面板 + 锁屏口令弹窗 |
+| **W3 远程终端（8 PTY / 256KiB / 本机+远端字体缓存 / 横幅修复 / 锁屏验证）** | ✅ 已落地（`v0.2.3`） | ✅ 全量对齐（ConPTY 被控 + xterm + DPAPI 凭据） | ✅ 远程终端主控面板 + 锁屏口令弹窗 | ✅ 远程终端主控面板 + 锁屏口令弹窗 |
 | **W4 端口映射 + 纯工具热升级（`tools_only`）** | ✅ 已落地 | ✅ 全量对齐 | ✅ 工具页秒开 + 热切全屏桌面 | ✅ 工具页秒开 + 热切全屏桌面 |
 | **统一 `UiError` 4 级 Presenter（`spec v1.0.0`）** | ✅ 已落地 | ⬜ `#1` 跟进中（替换 `format_auth_error`） | ⬜ `#3` 跟进中（`RCErrorModels.swift` + 4 级 Presenter） | ✅ 已合入 `47b476a` |
-| **系统后台开机服务 + 提权自更新 + 远程升级被控** | ✅ `launchd` + 证书钉扎 | ✅ Windows Service + 签名校验 MSI/NSIS | 🔵 受 App Store 2.5.2 限制，CI 绑定 `core` 发布静态版本 | ✅ 运行期 `release-manifest.json` + `.sig` 热更新 `.so` + APK 自更新 |
+| **系统后台开机服务（FD 4096/8192）+ 提权自更新 + 远程升级自动收口** | ✅ `launchd` + 证书钉扎 | ✅ Windows Service + 签名校验 MSI/NSIS | 🔵 受 App Store 2.5.2 限制，CI 绑定 `core` 发布静态版本 | ✅ 运行期 `release-manifest.json` + `.sig` 热更新 `.so` + APK 自更新 |
 
 ---
 

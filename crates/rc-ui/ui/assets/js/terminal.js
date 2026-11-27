@@ -404,6 +404,7 @@
     if (!winEl || !listViewEl || !liveViewEl || !screenEl) return;
 
     /* ── 状态管理 ──────────────────────────────────────────── */
+    var initialSessionLoaded = !IS_TAURI;
     var sessionState = {
       active: !IS_TAURI,
       connected: !IS_TAURI,
@@ -559,8 +560,8 @@
         scrollback: 5000,
         convertEol: false,
         macOptionClickForcesSelection: true,
-        fontFamily: DEFAULT_FONT_FAMILY,
-        fontSize: fontState ? fontState.size : 13,
+        fontFamily: resolveActiveFontFamilyCss(),
+        fontSize: clampFontSize(fontState ? fontState.size : 13),
         lineHeight: 1.32,
         theme: buildXtermTheme()
       });
@@ -665,6 +666,7 @@
         screenEl.textContent = '';
         t.open(screenEl);
         xtermMounted = true;
+        applyActiveFontFromState();
       }
       return t;
     }
@@ -1120,23 +1122,11 @@
     function ensureMgrBanner() {
       if (mgrBannerEl || !listViewEl) return mgrBannerEl;
       var box = document.createElement('div');
-      box.style.display = 'flex';
-      box.style.alignItems = 'center';
-      box.style.justifyContent = 'space-between';
-      box.style.gap = '12px';
-      box.style.marginBottom = '14px';
-      box.style.padding = '10px 14px';
-      box.style.border = '1px solid var(--stroke)';
-      box.style.borderRadius = 'var(--r-card)';
-      box.style.background = 'var(--bg-card)';
+      box.className = 'tm-mgr-banner';
       box.hidden = true;
 
       var txt = document.createElement('span');
-      txt.style.fontSize = 'var(--size-secondary)';
-      txt.style.color = 'var(--text-primary)';
-      txt.style.lineHeight = '20px';
-      txt.style.minWidth = '0';
-      txt.style.overflowWrap = 'anywhere';
+      txt.className = 'tm-mgr-banner__text';
       box.appendChild(txt);
 
       var btn = document.createElement('button');
@@ -1162,7 +1152,7 @@
     function syncMgrBanner() {
       var banner = ensureMgrBanner();
       if (!banner || !mgrBannerTextEl || !mgrBannerBtnEl) return;
-      if (!IS_TAURI || isSessionReady() || sessionState.watchOnly) {
+      if (!IS_TAURI || !initialSessionLoaded || isSessionReady() || sessionState.watchOnly) {
         banner.hidden = true;
         return;
       }
@@ -1217,6 +1207,8 @@
         } else if (sessionState.active && !sessionState.connected) {
           mgrDotEl.classList.add('is-warning');
           mgrStatusTextEl.textContent = '正在建立安全连接…';
+        } else if (!initialSessionLoaded) {
+          mgrStatusTextEl.textContent = '连接中…';
         } else {
           mgrStatusTextEl.textContent = '未连接';
         }
@@ -1258,6 +1250,8 @@
               ')…';
           } else if (sessionState.active && !sessionState.connected) {
             emptyTextEl.textContent = '正在建立安全连接，请稍候…';
+          } else if (!initialSessionLoaded) {
+            emptyTextEl.textContent = '正在检查远控连接状态…';
           } else if (!sessionState.active) {
             emptyTextEl.textContent = lastEndedReason || '远控会话未连接，可点击上方「重新连接」恢复';
           } else {
@@ -1399,6 +1393,33 @@
     }
 
     /* ── 终端字体管理（本机 / 远程机器字体 + 字号） ───────────── */
+    var FONT_STORAGE_KEY = 'rc.terminal.fontPrefs.v1';
+
+    function clampFontSize(raw) {
+      var n = Math.round(Number(raw) || 13);
+      if (!isFinite(n)) return 13;
+      return Math.max(10, Math.min(28, n));
+    }
+
+    function readCachedFontPrefs() {
+      try {
+        var raw = window.localStorage ? window.localStorage.getItem(FONT_STORAGE_KEY) : null;
+        if (!raw) return null;
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        var src = String(parsed.source || 'default');
+        if (src !== 'local' && src !== 'remote' && src !== 'default') src = 'default';
+        return {
+          source: src,
+          family: src === 'default' || !parsed.family ? '' : String(parsed.family),
+          fontId: src === 'default' || !parsed.fontId ? '' : String(parsed.fontId),
+          size: clampFontSize(parsed.size)
+        };
+      } catch (_e) {
+        return null;
+      }
+    }
+
     var fontState = {
       source: 'default', /* 'default' | 'local' | 'remote' */
       family: '',
@@ -1414,9 +1435,35 @@
       localLoading: false,
       remoteLoading: false,
       loadedAliases: Object.create(null),
+      loadingLocalFaces: Object.create(null),
       pendingFetch: null,
       autoRestoredRemote: false
     };
+
+    var cachedFontInit = readCachedFontPrefs();
+    if (cachedFontInit) {
+      fontState.source = cachedFontInit.source;
+      fontState.family = cachedFontInit.family;
+      fontState.fontId = cachedFontInit.fontId;
+      fontState.size = cachedFontInit.size;
+    }
+
+    function writeCachedFontPrefs() {
+      try {
+        if (!window.localStorage) return;
+        window.localStorage.setItem(
+          FONT_STORAGE_KEY,
+          JSON.stringify({
+            source: fontState.source,
+            family: fontState.source === 'default' ? '' : fontState.family || '',
+            fontId: fontState.source === 'default' ? '' : fontState.fontId || '',
+            size: clampFontSize(fontState.size)
+          })
+        );
+      } catch (_e) {
+        /* ignore storage restrictions */
+      }
+    }
 
     function sanitizeFontFamilyCss(name) {
       return String(name || '').replace(/['"\\;\r\n{}]/g, '').trim();
@@ -1424,6 +1471,17 @@
 
     function remoteFontAlias(fontId) {
       return 'rc-remote-' + String(fontId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32);
+    }
+
+    function localAliasKey(fontId, family) {
+      if (fontId) return 'local:' + String(fontId);
+      if (family) return 'local-fam:' + String(family).toLowerCase();
+      return '';
+    }
+
+    function localFontAlias(fontId, family) {
+      var raw = String(fontId || family || 'font').replace(/[^a-zA-Z0-9_-]/g, '');
+      return 'rc-local-' + (raw || 'font').slice(0, 32);
     }
 
     function toArrayBuffer(raw) {
@@ -1441,38 +1499,112 @@
       if (fontStatusEl) fontStatusEl.textContent = msg ? String(msg) : '';
     }
 
+    function resolveActiveFontFamilyCss() {
+      if (fontState.source === 'local' && (fontState.family || fontState.fontId)) {
+        var locKey = localAliasKey(fontState.fontId, fontState.family);
+        var locAlias = locKey ? fontState.loadedAliases[locKey] : '';
+        var safeLoc = sanitizeFontFamilyCss(fontState.family);
+        var parts = [];
+        if (locAlias) parts.push('"' + locAlias + '"');
+        if (safeLoc) parts.push('"' + safeLoc + '"');
+        if (parts.length > 0) {
+          return parts.join(', ') + ', ' + DEFAULT_FONT_FAMILY;
+        }
+      }
+      if (fontState.source === 'remote' && fontState.fontId) {
+        var alias = fontState.loadedAliases[fontState.fontId];
+        if (alias) {
+          return '"' + alias + '", ' + DEFAULT_FONT_FAMILY;
+        }
+        var safeRem = sanitizeFontFamilyCss(fontState.family);
+        if (safeRem) {
+          return '"' + safeRem + '", ' + DEFAULT_FONT_FAMILY;
+        }
+      }
+      return DEFAULT_FONT_FAMILY;
+    }
+
     function applyFontToXterm(fontFamilyCss, sizePx) {
-      var sz = Math.max(10, Math.min(28, Math.round(Number(sizePx) || 13)));
+      var sz = clampFontSize(sizePx);
       var fam = fontFamilyCss || DEFAULT_FONT_FAMILY;
       var t = ensureXterm();
       if (t) {
         t.options.fontFamily = fam;
         t.options.fontSize = sz;
-        if (viewMode === 'terminal') {
+        if (xtermMounted && viewMode === 'terminal') {
           window.requestAnimationFrame(function () {
             computeAndFitGrid(true);
+            if (xterm && typeof xterm.refresh === 'function') {
+              xterm.refresh(0, Math.max(0, xterm.rows - 1));
+            }
           });
+          if (
+            document.fonts &&
+            document.fonts.ready &&
+            typeof document.fonts.ready.then === 'function'
+          ) {
+            document.fonts.ready.then(function () {
+              if (xterm && xtermMounted && viewMode === 'terminal') {
+                computeAndFitGrid(true);
+                if (typeof xterm.refresh === 'function') {
+                  xterm.refresh(0, Math.max(0, xterm.rows - 1));
+                }
+              }
+            });
+          }
         }
       }
     }
 
     function applyActiveFontFromState() {
-      if (fontState.source === 'local' && fontState.family) {
-        var safe = sanitizeFontFamilyCss(fontState.family);
-        applyFontToXterm('"' + safe + '", ' + DEFAULT_FONT_FAMILY, fontState.size);
-        return;
+      applyFontToXterm(resolveActiveFontFamilyCss(), fontState.size);
+    }
+
+    function ensureLocalFontFaceLoaded(fontId, family) {
+      var key = localAliasKey(fontId, family);
+      if (!key || fontState.loadedAliases[key] || fontState.loadingLocalFaces[key]) {
+        return Promise.resolve();
       }
-      if (fontState.source === 'remote' && fontState.fontId) {
-        var alias = fontState.loadedAliases[fontState.fontId];
-        if (alias) {
-          applyFontToXterm('"' + alias + '", ' + DEFAULT_FONT_FAMILY, fontState.size);
-          return;
-        }
+      if (
+        !IS_TAURI ||
+        typeof Bridge.terminalGetLocalFontBytes !== 'function' ||
+        typeof window.FontFace !== 'function'
+      ) {
+        return Promise.resolve();
       }
-      applyFontToXterm(DEFAULT_FONT_FAMILY, fontState.size);
+      fontState.loadingLocalFaces[key] = true;
+      return Bridge.terminalGetLocalFontBytes(fontId || '', family || null)
+        .then(function (raw) {
+          var buf = toArrayBuffer(raw);
+          if (!buf || buf.byteLength === 0) return;
+          var targetAlias = localFontAlias(fontId, family);
+          var face = new window.FontFace(targetAlias, buf);
+          return face.load().then(function (loadedFace) {
+            if (document.fonts && typeof document.fonts.add === 'function') {
+              document.fonts.add(loadedFace);
+            }
+            fontState.loadedAliases[key] = targetAlias;
+            if (
+              fontState.source === 'local' &&
+              localAliasKey(fontState.fontId, fontState.family) === key
+            ) {
+              applyActiveFontFromState();
+            }
+            if (fontBackdropEl && !fontBackdropEl.hidden) {
+              updateFontPreview();
+            }
+          });
+        })
+        .catch(function () {
+          /* 本机系统字体名称 fallback 仍可用，静默降级 */
+        })
+        .then(function () {
+          delete fontState.loadingLocalFaces[key];
+        });
     }
 
     function persistFontPrefs() {
+      writeCachedFontPrefs();
       if (!IS_TAURI || typeof Bridge.terminalSetFontPrefs !== 'function') {
         return Promise.resolve();
       }
@@ -1481,18 +1613,40 @@
         terminalFontFamily: fontState.family || '',
         terminalFontId: fontState.fontId || '',
         clearFont: fontState.source === 'default',
-        terminalFontSize: fontState.size
-      }).catch(function () {});
+        terminalFontSize: clampFontSize(fontState.size)
+      })
+        .then(function (saved) {
+          if (saved && typeof saved === 'object') {
+            var src = String(saved.terminalFontSource || fontState.source);
+            if (src === 'local' || src === 'remote' || src === 'default') {
+              fontState.source = src;
+            }
+            fontState.family = saved.terminalFontFamily ? String(saved.terminalFontFamily) : '';
+            fontState.fontId = saved.terminalFontId ? String(saved.terminalFontId) : '';
+            fontState.size = clampFontSize(saved.terminalFontSize);
+            writeCachedFontPrefs();
+          }
+          return saved;
+        })
+        .catch(function (err) {
+          showToast('保存终端字体设置失败：' + errMessage(err, '写入配置失败'));
+          throw err;
+        });
     }
 
     function updateFontPreview() {
       if (!fontPreviewEl) return;
-      var sz = Math.max(10, Math.min(28, Math.round(Number(fontState.draftSize) || 13)));
+      var sz = clampFontSize(fontState.draftSize);
       if (fontSizeValEl) fontSizeValEl.textContent = sz + ' px';
       fontPreviewEl.style.setProperty('--tm-preview-font-size', sz + 'px');
       var cssFam = 'var(--font-mono)';
-      if (fontState.draftSource === 'local' && fontState.draftFamily) {
-        cssFam = "'" + sanitizeFontFamilyCss(fontState.draftFamily) + "', var(--font-mono)";
+      if (fontState.draftSource === 'local' && (fontState.draftFamily || fontState.draftFontId)) {
+        var locAlias = fontState.loadedAliases[localAliasKey(fontState.draftFontId, fontState.draftFamily)];
+        var safeLoc = sanitizeFontFamilyCss(fontState.draftFamily);
+        var parts = [];
+        if (locAlias) parts.push("'" + locAlias + "'");
+        if (safeLoc) parts.push("'" + safeLoc + "'");
+        if (parts.length > 0) cssFam = parts.join(', ') + ', var(--font-mono)';
       } else if (fontState.draftSource === 'remote' && fontState.draftFontId) {
         var alias = fontState.loadedAliases[fontState.draftFontId];
         if (alias) cssFam = "'" + alias + "', var(--font-mono)";
@@ -1528,6 +1682,12 @@
       }
 
       var items = Array.isArray(rawList) ? rawList : [];
+      var hasExactDraftId = Boolean(
+        fontState.draftFontId &&
+          items.some(function (f) {
+            return f && f.id === fontState.draftFontId;
+          })
+      );
       var q = fontSearchEl ? fontSearchEl.value.trim().toLowerCase() : '';
       var monoOnly = fontMonoOnlyEl ? Boolean(fontMonoOnlyEl.checked) : true;
       var filtered = items.filter(function (f) {
@@ -1552,8 +1712,8 @@
         btn.setAttribute('role', 'option');
         var selected =
           fontState.draftSource === tab &&
-          ((fontState.draftFontId && fontState.draftFontId === item.id) ||
-            (!fontState.draftFontId && fontState.draftFamily === item.family));
+          ((hasExactDraftId && fontState.draftFontId === item.id) ||
+            (!hasExactDraftId && fontState.draftFamily === item.family));
         btn.classList.toggle('is-selected', Boolean(selected));
         btn.setAttribute('aria-selected', selected ? 'true' : 'false');
 
@@ -1573,6 +1733,9 @@
           renderFontList();
           updateFontPreview();
           setFontStatus('已选择：' + fontState.draftFamily);
+          if (tab === 'local') {
+            ensureLocalFontFaceLoaded(fontState.draftFontId, fontState.draftFamily);
+          }
         });
         fontListEl.appendChild(btn);
       });
@@ -1634,16 +1797,22 @@
       });
     }
 
-    function installAndUseRemoteFont(fontId, family, size, showSuccessToast) {
+    function installAndUseRemoteFont(fontId, family, size, showSuccessToast, shouldPersist) {
+      var doPersist = shouldPersist !== false;
       var alias = fontState.loadedAliases[fontId];
       if (alias) {
         fontState.source = 'remote';
         fontState.fontId = fontId;
         fontState.family = family || fontState.family;
-        fontState.size = size;
+        fontState.size = clampFontSize(size);
         applyActiveFontFromState();
-        persistFontPrefs();
-        if (showSuccessToast) showToast('已应用远程字体：' + (family || fontId));
+        var finishCached = function () {
+          if (showSuccessToast) showToast('已应用远程字体：' + (fontState.family || fontId));
+        };
+        if (doPersist) {
+          return persistFontPrefs().then(finishCached);
+        }
+        finishCached();
         return Promise.resolve();
       }
       if (!IS_TAURI || typeof Bridge.terminalGetRemoteFontBytes !== 'function') {
@@ -1651,7 +1820,7 @@
         fontState.source = 'remote';
         fontState.fontId = fontId;
         fontState.family = family || fontState.family;
-        fontState.size = size;
+        fontState.size = clampFontSize(size);
         applyActiveFontFromState();
         return Promise.resolve();
       }
@@ -1670,10 +1839,15 @@
           fontState.source = 'remote';
           fontState.fontId = fontId;
           fontState.family = family || loadedFace.family || fontState.family;
-          fontState.size = size;
+          fontState.size = clampFontSize(size);
           applyActiveFontFromState();
-          persistFontPrefs();
-          if (showSuccessToast) showToast('已加载并应用远程字体：' + fontState.family);
+          var finishLoaded = function () {
+            if (showSuccessToast) showToast('已加载并应用远程字体：' + fontState.family);
+          };
+          if (doPersist) {
+            return persistFontPrefs().then(finishLoaded);
+          }
+          finishLoaded();
         });
       });
     }
@@ -1681,15 +1855,21 @@
     function fetchAndApplyRemoteFont(fontId, family, size, userInitiated) {
       if (!fontId) return;
       if (fontState.loadedAliases[fontId]) {
-        installAndUseRemoteFont(fontId, family, size, userInitiated).then(function () {
-          if (userInitiated && fontBackdropEl && !fontBackdropEl.hidden) {
-            closeFontModal();
-          }
-        });
+        installAndUseRemoteFont(fontId, family, size, userInitiated, true)
+          .then(function () {
+            if (userInitiated && fontBackdropEl && !fontBackdropEl.hidden) {
+              closeFontModal();
+            }
+          })
+          .catch(function () {
+            if (userInitiated && fontBackdropEl && !fontBackdropEl.hidden) {
+              closeFontModal();
+            }
+          });
         return;
       }
       if (!IS_TAURI || typeof Bridge.terminalFetchRemoteFont !== 'function') {
-        installAndUseRemoteFont(fontId, family, size, userInitiated).then(function () {
+        installAndUseRemoteFont(fontId, family, size, userInitiated, true).then(function () {
           if (userInitiated && fontBackdropEl && !fontBackdropEl.hidden) {
             closeFontModal();
           }
@@ -1715,6 +1895,7 @@
           };
         })
         .catch(function (err) {
+          if (!userInitiated) fontState.autoRestoredRemote = false;
           if (fontApplyBtn) fontApplyBtn.disabled = false;
           if (userInitiated) setFontStatus('下载远程字体失败：' + String(err || '未知错误'));
         });
@@ -1810,9 +1991,12 @@
         fontState.draftFontId = '';
         fontState.draftSize = 13;
         applyActiveFontFromState();
-        persistFontPrefs();
         closeFontModal();
-        showToast('已恢复默认终端字体');
+        persistFontPrefs()
+          .then(function () {
+            showToast('已恢复默认终端字体');
+          })
+          .catch(function () {});
       });
     }
     if (fontCancelBtn) {
@@ -1831,16 +2015,21 @@
     }
     if (fontApplyBtn) {
       fontApplyBtn.addEventListener('click', function () {
-        var nextSize = Math.max(10, Math.min(28, Math.round(Number(fontState.draftSize) || 13)));
+        var nextSize = clampFontSize(fontState.draftSize);
         if (fontState.draftSource === 'local' && fontState.draftFamily) {
           fontState.source = 'local';
           fontState.family = fontState.draftFamily;
           fontState.fontId = fontState.draftFontId;
           fontState.size = nextSize;
           applyActiveFontFromState();
-          persistFontPrefs();
+          ensureLocalFontFaceLoaded(fontState.fontId, fontState.family);
           closeFontModal();
-          showToast('已应用本机字体：' + fontState.family);
+          var appliedFamily = fontState.family;
+          persistFontPrefs()
+            .then(function () {
+              showToast('已应用本机字体：' + appliedFamily);
+            })
+            .catch(function () {});
           return;
         }
         if (fontState.draftSource === 'remote' && fontState.draftFontId) {
@@ -1854,9 +2043,12 @@
         }
         fontState.size = nextSize;
         applyActiveFontFromState();
-        persistFontPrefs();
         closeFontModal();
-        showToast('已更新终端字号：' + nextSize + 'px');
+        persistFontPrefs()
+          .then(function () {
+            showToast('已更新终端字号：' + nextSize + 'px');
+          })
+          .catch(function () {});
       });
     }
 
@@ -2429,6 +2621,9 @@
           fontState.pendingFetch = null;
         }
         if (!ev.ok) {
+          if (!pf || !pf.userInitiated) {
+            fontState.autoRestoredRemote = false;
+          }
           if (fontApplyBtn) fontApplyBtn.disabled = false;
           setFontStatus('远程字体下载失败：' + String(ev.error || '未知错误'));
           if (pf && pf.userInitiated) {
@@ -2439,7 +2634,7 @@
         var targetSize = pf ? pf.size : fontState.size;
         var targetFamily = ev.family || (pf ? pf.family : fontState.family);
         var userInitiated = pf ? pf.userInitiated : false;
-        installAndUseRemoteFont(ev.fontId, targetFamily, targetSize, userInitiated)
+        installAndUseRemoteFont(ev.fontId, targetFamily, targetSize, userInitiated, true)
           .then(function () {
             if (userInitiated && fontBackdropEl && !fontBackdropEl.hidden) {
               closeFontModal();
@@ -2654,6 +2849,7 @@
 
     function handleDisconnectState(reasonText, opts) {
       var options = opts || {};
+      fontState.autoRestoredRemote = false;
       pendingOpenKinds = [];
       finishBgCreate();
       finishAttachCreate();
@@ -2696,6 +2892,7 @@
     }
 
     function applySessionInfo(raw) {
+      initialSessionLoaded = true;
       var s = raw && typeof raw === 'object' ? raw : {};
       var wasReady = isSessionReady();
       sessionState.active = Boolean(s.active);
@@ -2776,6 +2973,7 @@
 
     function handleSessionUpdate(upd) {
       if (!upd || !upd.kind) return;
+      initialSessionLoaded = true;
       var data = upd.data || {};
       if (upd.kind === 'tool_permissions_updated') {
         if (typeof data.allow_terminal === 'boolean') {
@@ -2859,6 +3057,7 @@
           showToast('系统密码验证通过');
           fetchTerminalLockState();
           refreshSessionList();
+          maybeAutoRestoreRemoteFont();
           if (viewMode === 'terminal' && activeTermId != null) {
             var activeTab = getActiveTab();
             if (!activeTab || (!activeTab.connected && !activeTab.opening)) {
@@ -2994,15 +3193,35 @@
         .then(function (prefs) {
           if (!prefs || typeof prefs !== 'object') return;
           var src = String(prefs.terminalFontSource || 'default');
-          if (src === 'local' || src === 'remote' || src === 'default') {
-            fontState.source = src;
-          }
-          if (prefs.terminalFontFamily) fontState.family = String(prefs.terminalFontFamily);
-          if (prefs.terminalFontId) fontState.fontId = String(prefs.terminalFontId);
+          fontState.source =
+            src === 'local' || src === 'remote' || src === 'default' ? src : 'default';
+          fontState.family =
+            fontState.source !== 'default' && prefs.terminalFontFamily
+              ? String(prefs.terminalFontFamily)
+              : '';
+          fontState.fontId =
+            fontState.source !== 'default' && prefs.terminalFontId
+              ? String(prefs.terminalFontId)
+              : '';
           var sz = Number(prefs.terminalFontSize);
-          if (isFinite(sz) && sz >= 10 && sz <= 28) fontState.size = Math.round(sz);
+          fontState.size = isFinite(sz) && sz >= 10 && sz <= 28 ? Math.round(sz) : 13;
+          writeCachedFontPrefs();
           applyActiveFontFromState();
-          maybeAutoRestoreRemoteFont();
+          if (fontState.source === 'local' && (fontState.fontId || fontState.family)) {
+            ensureLocalFontFaceLoaded(fontState.fontId, fontState.family);
+          } else if (fontState.source === 'remote' && fontState.fontId) {
+            if (!fontState.loadedAliases[fontState.fontId]) {
+              installAndUseRemoteFont(
+                fontState.fontId,
+                fontState.family,
+                fontState.size,
+                false,
+                false
+              ).catch(function () {
+                maybeAutoRestoreRemoteFont();
+              });
+            }
+          }
         })
         .catch(function () {});
     }
@@ -3024,9 +3243,11 @@
         Bridge.getActiveSessionInfo()
           .then(applySessionInfo)
           .catch(function () {
+            initialSessionLoaded = true;
             renderManagerView();
           });
       } else {
+        initialSessionLoaded = true;
         sessionState.active = true;
         sessionState.connected = true;
         refreshSessionList();

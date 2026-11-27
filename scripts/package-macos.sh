@@ -197,6 +197,16 @@ cat > "$APP_BUNDLE/Contents/Resources/com.rabbitcontrol.daemon.plist.template" <
     </dict>
     <key>ProcessType</key>
     <string>Adaptive</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>/Library/Application Support/RabbitControl/logs/daemon.stdout.log</string>
     <key>StandardErrorPath</key>
@@ -234,6 +244,16 @@ cat > "$APP_BUNDLE/Contents/Resources/com.rabbitcontrol.agent.plist.template" <<
     </array>
     <key>ProcessType</key>
     <string>Interactive</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

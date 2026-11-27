@@ -130,6 +130,7 @@ body.is-tauri .tm-titlebar {
 /* ── 通用显隐保护 ───────────────────────────────────────────── */
 
 .tm-manager[hidden],
+.tm-mgr-banner[hidden],
 .tm-body[hidden],
 .tm-session-list[hidden],
 .tm-empty[hidden],
@@ -143,6 +144,26 @@ body.is-tauri .tm-titlebar {
 .tm-modal-backdrop[hidden],
 .tm-modal__error[hidden] {
   display: none;
+}
+
+.tm-mgr-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-card);
+  background: var(--bg-card);
+}
+
+.tm-mgr-banner__text {
+  font-size: var(--size-secondary);
+  color: var(--text-primary);
+  line-height: 20px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* ── 视图 1：会话管理列表（亮色质感，对齐截图） ──────────────── */

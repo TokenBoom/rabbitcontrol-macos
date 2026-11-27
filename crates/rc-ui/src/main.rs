@@ -1750,6 +1750,7 @@ fn main() {
             commands::terminal_try_auto_unlock,
             commands::terminal_clear_saved_password,
             commands::terminal_list_local_fonts,
+            commands::terminal_get_local_font_bytes,
             commands::terminal_list_remote_fonts,
             commands::terminal_fetch_remote_font,
             commands::terminal_get_remote_font_bytes,

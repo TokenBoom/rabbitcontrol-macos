@@ -284,6 +284,16 @@ pub fn render_daemon_plist(
     </dict>
     <key>ProcessType</key>
     <string>Adaptive</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
     <key>AssociatedBundleIdentifiers</key>
     <array>
         <string>{APP_BUNDLE_ID}</string>
@@ -339,6 +349,16 @@ pub fn render_agent_plist(
     </array>
     <key>ProcessType</key>
     <string>Interactive</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -1078,12 +1098,29 @@ mod tests {
         let log_dir = Path::new("/Library/Application Support/RabbitControl/logs");
         let cfg_dir = Path::new("/Library/Application Support/RabbitControl");
 
+        let expected_soft_limits = concat!(
+            "<key>SoftResourceLimits</key>\n",
+            "    <dict>\n",
+            "        <key>NumberOfFiles</key>\n",
+            "        <integer>4096</integer>\n",
+            "    </dict>",
+        );
+        let expected_hard_limits = concat!(
+            "<key>HardResourceLimits</key>\n",
+            "    <dict>\n",
+            "        <key>NumberOfFiles</key>\n",
+            "        <integer>8192</integer>\n",
+            "    </dict>",
+        );
+
         let d = render_daemon_plist(daemon_bin, stop_path, log_dir, cfg_dir);
         assert!(d.contains(DAEMON_LABEL));
         assert!(d.contains("RabbitControl &amp; Dev.app"));
         assert!(d.contains("<key>PathState</key>"));
         assert!(d.contains("<false/>"));
         assert!(d.contains(APP_BUNDLE_ID));
+        assert!(d.contains(expected_soft_limits));
+        assert!(d.contains(expected_hard_limits));
 
         let a = render_agent_plist(agent_bin, stop_path, log_dir, cfg_dir);
         assert!(a.contains(AGENT_LABEL));
@@ -1091,6 +1128,29 @@ mod tests {
         assert!(a.contains("<string>Aqua</string>"));
         assert!(a.contains("<string>Interactive</string>"));
         assert!(a.contains(ENV_DAEMON_MODE));
+        assert!(a.contains(expected_soft_limits));
+        assert!(a.contains(expected_hard_limits));
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            for (name, xml) in [("daemon", &d), ("agent", &a)] {
+                let mut child = Command::new("plutil")
+                    .args(["-lint", "-s", "-"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .expect("spawn plutil");
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("plutil stdin")
+                    .write_all(xml.as_bytes())
+                    .expect("write plist to plutil");
+                let status = child.wait().expect("wait plutil");
+                assert!(status.success(), "{name} plist XML must pass plutil -lint");
+            }
+        }
     }
 
     #[test]
