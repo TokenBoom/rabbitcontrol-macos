@@ -184,6 +184,27 @@ pub fn open_tool_window(
     if kind != ToolWindow::Settings {
         state.require_authenticated()?;
     }
+    if matches!(
+        kind,
+        ToolWindow::Transfer | ToolWindow::Terminal | ToolWindow::PortMap
+    ) {
+        let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = guard.as_ref().filter(|s| !s.disconnecting) {
+            let perms = active.meta.tool_permissions;
+            match kind {
+                ToolWindow::Transfer if !perms.allow_file_transfer => {
+                    return Err("被控端已禁止本次远程协助使用文件传输".to_string());
+                }
+                ToolWindow::Terminal if !perms.allow_terminal => {
+                    return Err("远程终端仅限本人账号使用".to_string());
+                }
+                ToolWindow::PortMap if !perms.allow_port_map => {
+                    return Err("端口映射仅限本人账号使用".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
     show_tool_window(&app, kind)
 }
 

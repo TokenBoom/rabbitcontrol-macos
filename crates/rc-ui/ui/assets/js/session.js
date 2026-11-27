@@ -268,13 +268,33 @@
       if (!toolsEl) return;
       var transferBtn = toolsEl.querySelector('[data-tool="transfer"]');
       if (transferBtn) {
-        var allowed = toolPermissions.allowFileTransfer !== false;
-        transferBtn.disabled = !allowed;
-        transferBtn.classList.toggle('is-disabled', !allowed);
-        transferBtn.setAttribute('aria-disabled', allowed ? 'false' : 'true');
-        transferBtn.title = allowed
+        var transferAllowed = toolPermissions.allowFileTransfer !== false;
+        transferBtn.disabled = !transferAllowed;
+        transferBtn.classList.toggle('is-disabled', !transferAllowed);
+        transferBtn.setAttribute('aria-disabled', transferAllowed ? 'false' : 'true');
+        transferBtn.title = transferAllowed
           ? '文件传输'
           : '被控端已禁止本次远程协助使用文件传输';
+      }
+      var terminalBtn = toolsEl.querySelector('[data-tool="terminal"]');
+      if (terminalBtn) {
+        var terminalAllowed = toolPermissions.allowTerminal !== false;
+        terminalBtn.disabled = !terminalAllowed;
+        terminalBtn.classList.toggle('is-disabled', !terminalAllowed);
+        terminalBtn.setAttribute('aria-disabled', terminalAllowed ? 'false' : 'true');
+        terminalBtn.title = terminalAllowed
+          ? '远程终端'
+          : '远程终端仅限本人账号使用';
+      }
+      var portmapBtn = toolsEl.querySelector('[data-tool="portmap"]');
+      if (portmapBtn) {
+        var portmapAllowed = toolPermissions.allowPortMap !== false;
+        portmapBtn.disabled = !portmapAllowed;
+        portmapBtn.classList.toggle('is-disabled', !portmapAllowed);
+        portmapBtn.setAttribute('aria-disabled', portmapAllowed ? 'false' : 'true');
+        portmapBtn.title = portmapAllowed
+          ? '端口映射'
+          : '端口映射仅限本人账号使用';
       }
     }
     function applyToolPermissionsData(raw) {
@@ -3255,6 +3275,14 @@
             toast('被控端已禁止本次远程协助使用文件传输');
             return;
           }
+          if (kind === 'terminal' && toolPermissions.allowTerminal === false) {
+            toast('远程终端仅限本人账号使用');
+            return;
+          }
+          if (kind === 'portmap' && toolPermissions.allowPortMap === false) {
+            toast('端口映射仅限本人账号使用');
+            return;
+          }
           closePopover();
           if (IS_TAURI && typeof Bridge.openToolWindow === 'function') {
             Bridge.openToolWindow(kind).catch(function (err) {
@@ -3826,10 +3854,8 @@
           return;
         }
         if (sessionLifecycleState !== 'active') return;
-        if (hostScreenLocked) {
-          showStageOverlay('notice', '被控端已锁屏，解锁后将自动恢复画面', '');
-          return;
-        }
+        /* 对齐 UU 远程：被控端锁屏期间不遮挡桌面远控画面（允许直接看到锁屏画面并输入密码解锁桌面）；
+         * 仅在显示器熄屏恢复采集过渡或降级模式下提示。 */
         if (hostCaptureSuspended) {
           showStageOverlay('notice', '正在唤醒被控端显示器并恢复画面…', '');
           return;
@@ -4339,6 +4365,12 @@
           var deniedUi = (data && (data.ui_error || data.uiError)) || null;
           if (data && data.channel === 1) {
             toolPermissions.allowFileTransfer = false;
+            syncToolPermissionsUi();
+          } else if (data && data.channel === 2) {
+            toolPermissions.allowTerminal = false;
+            syncToolPermissionsUi();
+          } else if (data && data.channel === 3) {
+            toolPermissions.allowPortMap = false;
             syncToolPermissionsUi();
           }
           if (ErrorDisplay && deniedUi) {

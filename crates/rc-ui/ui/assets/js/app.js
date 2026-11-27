@@ -823,24 +823,39 @@
     };
   }
 
-  function isActiveFileTransferForbiddenForDevice(device) {
+  function isActiveToolForbiddenForDevice(tool, device) {
     var active = state.activeSession;
     if (!active || !active.active) return false;
     var perms = active.toolPermissions;
-    if (!perms || perms.allowFileTransfer !== false) return false;
-    if (!device) return true;
-    return hasActiveSessionForDevice(device);
+    if (!perms) return false;
+    var matchesDevice = !device || hasActiveSessionForDevice(device);
+    if (!matchesDevice) return false;
+    if (tool === "transfer") return perms.allowFileTransfer === false;
+    if (tool === "terminal") return perms.allowTerminal === false;
+    if (tool === "portmap") return perms.allowPortMap === false;
+    return false;
+  }
+
+  function isActiveFileTransferForbiddenForDevice(device) {
+    return isActiveToolForbiddenForDevice("transfer", device);
   }
 
   function syncP1ToolPermissions() {
     var device = findDevice(state.deviceId);
-    var forbidden = isActiveFileTransferForbiddenForDevice(device);
-    var transferBtns = document.querySelectorAll('.p1__tool[data-tool="transfer"]');
-    Array.prototype.forEach.call(transferBtns, function (btn) {
-      btn.disabled = forbidden;
-      btn.classList.toggle("is-disabled", forbidden);
-      btn.setAttribute("aria-disabled", forbidden ? "true" : "false");
-      btn.title = forbidden ? "被控端已禁止本次远程协助使用文件传输" : "文件传输";
+    var specs = [
+      { tool: "transfer", titleOk: "文件传输", titleDenied: "被控端已禁止本次远程协助使用文件传输" },
+      { tool: "terminal", titleOk: "远程终端", titleDenied: "远程终端仅限本人账号使用" },
+      { tool: "portmap", titleOk: "端口映射", titleDenied: "端口映射仅限本人账号使用" }
+    ];
+    specs.forEach(function (spec) {
+      var forbidden = isActiveToolForbiddenForDevice(spec.tool, device);
+      var btns = document.querySelectorAll('.p1__tool[data-tool="' + spec.tool + '"]');
+      Array.prototype.forEach.call(btns, function (btn) {
+        btn.disabled = forbidden;
+        btn.classList.toggle("is-disabled", forbidden);
+        btn.setAttribute("aria-disabled", forbidden ? "true" : "false");
+        btn.title = forbidden ? spec.titleDenied : spec.titleOk;
+      });
     });
   }
 
@@ -1049,6 +1064,14 @@
         }
         if (tool === "transfer" && isActiveFileTransferForbiddenForDevice(device)) {
           toast("被控端已禁止本次远程协助使用文件传输");
+          return;
+        }
+        if (tool === "terminal" && isActiveToolForbiddenForDevice("terminal", device)) {
+          toast("远程终端仅限本人账号使用");
+          return;
+        }
+        if (tool === "portmap" && isActiveToolForbiddenForDevice("portmap", device)) {
+          toast("端口映射仅限本人账号使用");
           return;
         }
         return openWindow(tool);
@@ -2844,7 +2867,12 @@
 
       var terminalBtn = el("button", "rc-ctx-menu__item", "远程终端");
       terminalBtn.type = "button";
-      terminalBtn.disabled = Boolean(device.isLocal || !device.online);
+      terminalBtn.disabled = Boolean(
+        device.isLocal || !device.online || isActiveToolForbiddenForDevice("terminal", device)
+      );
+      if (isActiveToolForbiddenForDevice("terminal", device)) {
+        terminalBtn.title = "远程终端仅限本人账号使用";
+      }
       terminalBtn.addEventListener("click", function () {
         closeDeviceContextMenu();
         openTool("terminal", device);
@@ -2852,7 +2880,12 @@
 
       var portmapBtn = el("button", "rc-ctx-menu__item", "端口映射");
       portmapBtn.type = "button";
-      portmapBtn.disabled = Boolean(device.isLocal || !device.online);
+      portmapBtn.disabled = Boolean(
+        device.isLocal || !device.online || isActiveToolForbiddenForDevice("portmap", device)
+      );
+      if (isActiveToolForbiddenForDevice("portmap", device)) {
+        portmapBtn.title = "端口映射仅限本人账号使用";
+      }
       portmapBtn.addEventListener("click", function () {
         closeDeviceContextMenu();
         openTool("portmap", device);
@@ -2956,10 +2989,22 @@
       }
     }
     var canTools = Boolean(state.activeSession.active && !state.activeSession.watchOnly);
-    [p2OpenTransfer, p2OpenTerminal, p2OpenPortmap].forEach(function (btn) {
-      if (!btn) return;
-      btn.hidden = !canTools;
-      btn.disabled = !canTools;
+    var perms = state.activeSession.toolPermissions || {
+      allowFileTransfer: true,
+      allowTerminal: true,
+      allowPortMap: true
+    };
+    [
+      { btn: p2OpenTransfer, allowed: perms.allowFileTransfer !== false, okTitle: "文件传输", deniedTitle: "被控端已禁止本次远程协助使用文件传输" },
+      { btn: p2OpenTerminal, allowed: perms.allowTerminal !== false, okTitle: "终端", deniedTitle: "远程终端仅限本人账号使用" },
+      { btn: p2OpenPortmap, allowed: perms.allowPortMap !== false, okTitle: "端口映射", deniedTitle: "端口映射仅限本人账号使用" }
+    ].forEach(function (entry) {
+      if (!entry.btn) return;
+      entry.btn.hidden = !canTools;
+      var enabled = canTools && entry.allowed;
+      entry.btn.disabled = !enabled;
+      entry.btn.classList.toggle("is-disabled", canTools && !entry.allowed);
+      entry.btn.title = canTools && !entry.allowed ? entry.deniedTitle : entry.okTitle;
     });
   }
 

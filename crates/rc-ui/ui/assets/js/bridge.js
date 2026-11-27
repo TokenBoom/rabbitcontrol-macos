@@ -245,6 +245,24 @@
     terminalClose: function (termId) {
       return invoke("terminal_close", { termId: Number(termId) });
     },
+    terminalGetLockState: function () {
+      return invoke("terminal_get_lock_state");
+    },
+    terminalUnlock: function (password, username, remember) {
+      return invoke("terminal_unlock", {
+        password: String(password || ""),
+        username: username ? String(username) : null,
+        remember: Boolean(remember)
+      });
+    },
+    terminalTryAutoUnlock: function () {
+      return invoke("terminal_try_auto_unlock");
+    },
+    terminalClearSavedPassword: function (deviceKey) {
+      return invoke("terminal_clear_saved_password", {
+        deviceKey: deviceKey ? String(deviceKey) : null
+      });
+    },
     terminalListLocalFonts: function () {
       return invoke("terminal_list_local_fonts");
     },

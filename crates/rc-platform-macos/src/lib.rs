@@ -406,6 +406,33 @@ impl ClientPlatformHooks for MacosClientPlatformHooks {
         }
     }
 
+    fn current_system_username(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::current_system_username()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn verify_system_password(
+        &self,
+        username: Option<&str>,
+        password: &str,
+    ) -> std::result::Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        {
+            rc_capture_macos::verify_system_password(username, password)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (username, password);
+            Err("system password verification is only supported on macOS".to_string())
+        }
+    }
+
     fn set_privacy_curtain(
         &self,
         mode: &str,

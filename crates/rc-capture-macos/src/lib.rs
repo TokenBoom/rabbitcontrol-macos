@@ -257,6 +257,95 @@ pub fn promote_current_thread_qos() {
     }
 }
 
+/// 查询当前 macOS 桌面会话用户名（过滤 `root` / `loginwindow` 等系统伪账号）。
+///
+/// 非 macOS 平台返回 `None`。
+pub fn current_system_username() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::current_system_username()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 使用原生 OpenDirectory 校验 macOS 系统登录密码（**绝不解锁物理屏幕**）。
+///
+/// 非 macOS 平台返回 `Err`。
+pub fn verify_system_password(username: Option<&str>, password: &str) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::verify_system_password(username, password)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (username, password);
+        Err("system password verification is only supported on macOS".to_string())
+    }
+}
+
+/// 将设备对应的被控端系统密码写入（或更新）本机登录钥匙串。
+///
+/// 非 macOS 平台返回 `Err`。
+pub fn keychain_save_terminal_password(device_key: &str, password: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::keychain_save_terminal_password(device_key, password)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (device_key, password);
+        Err("keychain storage is only supported on macOS".to_string())
+    }
+}
+
+/// 从本机登录钥匙串读取设备对应的被控端系统密码。
+///
+/// 非 macOS 平台返回 `Ok(None)`。
+pub fn keychain_load_terminal_password(device_key: &str) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::keychain_load_terminal_password(device_key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device_key;
+        Ok(None)
+    }
+}
+
+/// 从本机登录钥匙串删除设备对应的被控端系统密码（不存在视为成功）。
+///
+/// 非 macOS 平台直接返回 `Ok(())`。
+pub fn keychain_delete_terminal_password(device_key: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::keychain_delete_terminal_password(device_key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device_key;
+        Ok(())
+    }
+}
+
+/// 检查本机登录钥匙串是否存有该设备的已记忆密码（仅查属性，绝不触发读取密文弹窗）。
+///
+/// 非 macOS 平台固定返回 `false`。
+pub fn keychain_has_terminal_password(device_key: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::system_auth::keychain_has_terminal_password(device_key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device_key;
+        false
+    }
+}
+
 /// 立即锁定当前 macOS 桌面会话（仅 macOS 有效，非 macOS 平台返回 `false`）。
 pub fn lock_screen_now() -> bool {
     #[cfg(target_os = "macos")]

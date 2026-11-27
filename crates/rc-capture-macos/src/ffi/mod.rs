@@ -16,6 +16,7 @@
 #![allow(unsafe_code)]
 
 pub(crate) mod privacy_and_virtual;
+pub(crate) mod system_auth;
 
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};

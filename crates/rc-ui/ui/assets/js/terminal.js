@@ -386,6 +386,19 @@
     var fontCancelBtn = document.getElementById('tm-font-cancel');
     var fontApplyBtn = document.getElementById('tm-font-apply');
 
+    var lockGateEl = document.getElementById('tm-lock-gate');
+    var lockUserBadgeEl = document.getElementById('tm-lock-user-badge');
+    var lockUserNameEl = document.getElementById('tm-lock-user-name');
+    var lockFormEl = document.getElementById('tm-lock-form');
+    var lockUserRowEl = document.getElementById('tm-lock-user-row');
+    var lockUsernameEl = document.getElementById('tm-lock-username');
+    var lockPasswordEl = document.getElementById('tm-lock-password');
+    var lockToggleVisBtn = document.getElementById('tm-lock-toggle-vis');
+    var lockRememberEl = document.getElementById('tm-lock-remember');
+    var lockErrorEl = document.getElementById('tm-lock-error');
+    var lockClearSavedBtn = document.getElementById('tm-lock-clear-saved');
+    var lockSubmitBtn = document.getElementById('tm-lock-submit');
+
     var toastEl = document.getElementById('tm-toast');
 
     if (!winEl || !listViewEl || !liveViewEl || !screenEl) return;
@@ -402,6 +415,22 @@
       deviceName: IS_TAURI ? '' : 'yii’s MacBook Pro'
     };
     var lastEndedReason = '';
+    var terminalLockState = {
+      required: false,
+      unlocked: false,
+      pending: false,
+      username: '',
+      retryAfterSecs: 0,
+      hasSavedPassword: false,
+      deviceKey: '',
+      allowTerminal: true,
+      submitting: false,
+      autoAttempted: false,
+      autoInFlight: false,
+      cooldownUntilMs: 0
+    };
+    var lockStateSeq = 0;
+    var lockCooldownTimer = 0;
     var mgrBannerEl = null;
     var mgrBannerTextEl = null;
     var mgrBannerBtnEl = null;
@@ -514,6 +543,7 @@
     function isAnyModalOpen() {
       if (renameBackdropEl && !renameBackdropEl.hidden) return true;
       if (fontBackdropEl && !fontBackdropEl.hidden) return true;
+      if (lockGateEl && !lockGateEl.hidden) return true;
       return false;
     }
 
@@ -693,8 +723,250 @@
       }, 2000);
     }
 
+    var lockGateWasVisible = false;
+    var lockGateWasAutoInFlight = false;
+
     function isSessionReady() {
-      return Boolean(sessionState.active && sessionState.connected && !sessionState.watchOnly);
+      return Boolean(
+        sessionState.active &&
+          sessionState.connected &&
+          !sessionState.watchOnly &&
+          terminalLockState.allowTerminal !== false &&
+          !terminalLockState.pending &&
+          (!terminalLockState.required || terminalLockState.unlocked)
+      );
+    }
+
+    function resetLockPasswordVisibility() {
+      if (lockPasswordEl) lockPasswordEl.type = 'password';
+      if (lockToggleVisBtn) lockToggleVisBtn.textContent = '显示';
+    }
+
+    function focusLockGateInput() {
+      if (!lockGateEl || lockGateEl.hidden || terminalLockState.autoInFlight) return;
+      if (lockUserRowEl && !lockUserRowEl.hidden && lockUsernameEl && !lockUsernameEl.value) {
+        lockUsernameEl.focus();
+      } else if (lockPasswordEl) {
+        lockPasswordEl.focus();
+      }
+    }
+
+    function remainingCooldownSecs() {
+      if (!terminalLockState.cooldownUntilMs) return 0;
+      var diff = Math.ceil((terminalLockState.cooldownUntilMs - Date.now()) / 1000);
+      return diff > 0 ? diff : 0;
+    }
+
+    function stopLockCooldownTimer() {
+      if (lockCooldownTimer) {
+        window.clearInterval(lockCooldownTimer);
+        lockCooldownTimer = 0;
+      }
+      terminalLockState.cooldownUntilMs = 0;
+    }
+
+    function setLockCooldown(secs) {
+      var n = Math.max(0, Math.round(Number(secs) || 0));
+      if (n <= 0) {
+        stopLockCooldownTimer();
+        return;
+      }
+      terminalLockState.cooldownUntilMs = Date.now() + n * 1000;
+      if (!lockCooldownTimer) {
+        lockCooldownTimer = window.setInterval(function () {
+          if (remainingCooldownSecs() <= 0) {
+            stopLockCooldownTimer();
+          }
+          syncLockGateUi();
+        }, 500);
+      }
+    }
+
+    function setLockError(msg) {
+      if (!lockErrorEl) return;
+      if (msg) {
+        lockErrorEl.textContent = String(msg);
+        lockErrorEl.hidden = false;
+      } else {
+        lockErrorEl.textContent = '';
+        lockErrorEl.hidden = true;
+      }
+    }
+
+    function syncLockGateUi() {
+      if (!lockGateEl) return;
+      var blockedByPolicy =
+        terminalLockState.allowTerminal === false ||
+        !sessionState.active ||
+        !sessionState.connected ||
+        sessionState.watchOnly;
+      var shouldShow = Boolean(
+        !blockedByPolicy && terminalLockState.required && !terminalLockState.unlocked
+      );
+      lockGateEl.hidden = !shouldShow;
+      if (!shouldShow) {
+        lockGateWasVisible = false;
+        lockGateWasAutoInFlight = false;
+        stopLockCooldownTimer();
+        resetLockPasswordVisibility();
+        if (terminalLockState.unlocked && lockPasswordEl) {
+          lockPasswordEl.value = '';
+          setLockError('');
+        }
+        return;
+      }
+
+      var justBecameVisible = !lockGateWasVisible;
+      if (justBecameVisible) {
+        lockGateWasVisible = true;
+        if (renameBackdropEl && !renameBackdropEl.hidden) {
+          closeRenameModal();
+        }
+        if (fontBackdropEl && !fontBackdropEl.hidden) {
+          closeFontModal();
+        }
+      }
+      var autoJustEnded = lockGateWasAutoInFlight && !terminalLockState.autoInFlight;
+      lockGateWasAutoInFlight = Boolean(terminalLockState.autoInFlight);
+
+      if (lockUserBadgeEl && lockUserNameEl && lockUserRowEl) {
+        if (terminalLockState.username) {
+          lockUserNameEl.textContent = terminalLockState.username;
+          lockUserBadgeEl.hidden = false;
+          lockUserRowEl.hidden = true;
+        } else {
+          lockUserBadgeEl.hidden = true;
+          lockUserRowEl.hidden = false;
+        }
+      }
+      if (lockClearSavedBtn) {
+        lockClearSavedBtn.hidden = !terminalLockState.hasSavedPassword;
+        lockClearSavedBtn.disabled =
+          terminalLockState.submitting || terminalLockState.autoInFlight;
+      }
+      if (lockSubmitBtn) {
+        var rem = remainingCooldownSecs();
+        if (terminalLockState.autoInFlight) {
+          lockSubmitBtn.disabled = true;
+          lockSubmitBtn.textContent = '正在自动验证已保存密码…';
+        } else if (terminalLockState.submitting) {
+          lockSubmitBtn.disabled = true;
+          lockSubmitBtn.textContent = '验证中…';
+        } else if (rem > 0) {
+          lockSubmitBtn.disabled = true;
+          lockSubmitBtn.textContent = '请等待 ' + rem + 's';
+        } else {
+          lockSubmitBtn.disabled = false;
+          lockSubmitBtn.textContent = '验证并进入';
+        }
+      }
+      if (justBecameVisible || autoJustEnded) {
+        focusLockGateInput();
+      }
+    }
+
+    function maybeTriggerAutoUnlock() {
+      if (
+        !IS_TAURI ||
+        !sessionState.active ||
+        !sessionState.connected ||
+        sessionState.watchOnly ||
+        terminalLockState.allowTerminal === false ||
+        !terminalLockState.required ||
+        terminalLockState.unlocked ||
+        !terminalLockState.hasSavedPassword ||
+        terminalLockState.autoAttempted ||
+        terminalLockState.autoInFlight ||
+        remainingCooldownSecs() > 0 ||
+        typeof Bridge.terminalTryAutoUnlock !== 'function'
+      ) {
+        return;
+      }
+      terminalLockState.autoAttempted = true;
+      terminalLockState.autoInFlight = true;
+      var autoSeq = lockStateSeq;
+      setLockError('');
+      syncLockGateUi();
+      Bridge.terminalTryAutoUnlock()
+        .then(function (submitted) {
+          if (autoSeq !== lockStateSeq) return;
+          if (!submitted) {
+            terminalLockState.autoInFlight = false;
+            syncLockGateUi();
+          }
+        })
+        .catch(function () {
+          if (autoSeq !== lockStateSeq) return;
+          terminalLockState.autoInFlight = false;
+          syncLockGateUi();
+        });
+    }
+
+    function resetLockGateSessionState(resetAllowTerminal) {
+      lockStateSeq += 1;
+      terminalLockState.required = false;
+      terminalLockState.unlocked = false;
+      terminalLockState.pending = false;
+      terminalLockState.username = '';
+      terminalLockState.hasSavedPassword = false;
+      terminalLockState.deviceKey = '';
+      terminalLockState.submitting = false;
+      terminalLockState.autoAttempted = false;
+      terminalLockState.autoInFlight = false;
+      if (resetAllowTerminal) {
+        terminalLockState.allowTerminal = true;
+      }
+      if (lockPasswordEl) lockPasswordEl.value = '';
+      if (lockUsernameEl) lockUsernameEl.value = '';
+      setLockError('');
+      resetLockPasswordVisibility();
+      stopLockCooldownTimer();
+      syncLockGateUi();
+    }
+
+    function fetchTerminalLockState() {
+      var reqSeq = ++lockStateSeq;
+      if (!IS_TAURI || typeof Bridge.terminalGetLockState !== 'function') {
+        terminalLockState.pending = false;
+        return Promise.resolve(null);
+      }
+      if (!terminalLockState.required && !terminalLockState.unlocked) {
+        terminalLockState.pending = true;
+      }
+      return Bridge.terminalGetLockState()
+        .then(function (snap) {
+          if (reqSeq !== lockStateSeq) return null;
+          terminalLockState.pending = false;
+          if (!sessionState.active || !sessionState.connected) return null;
+          if (!snap || typeof snap !== 'object') return null;
+          if (typeof snap.allowTerminal === 'boolean') {
+            terminalLockState.allowTerminal = snap.allowTerminal;
+          }
+          if (typeof snap.required === 'boolean') {
+            terminalLockState.required = snap.required;
+          }
+          if (typeof snap.unlocked === 'boolean') {
+            terminalLockState.unlocked = snap.unlocked;
+          }
+          terminalLockState.username = snap.username ? String(snap.username) : '';
+          terminalLockState.hasSavedPassword = Boolean(snap.hasSavedPassword);
+          terminalLockState.deviceKey = snap.deviceKey ? String(snap.deviceKey) : '';
+          var retrySecs = Number(snap.retryAfterSecs || 0);
+          if (retrySecs > 0) {
+            setLockCooldown(retrySecs);
+          }
+          syncLockGateUi();
+          if (viewMode === 'list') renderManagerView();
+          else syncLiveChrome();
+          maybeTriggerAutoUnlock();
+          return snap;
+        })
+        .catch(function () {
+          if (reqSeq === lockStateSeq) {
+            terminalLockState.pending = false;
+          }
+          return null;
+        });
     }
 
     function findSession(termId) {
@@ -925,7 +1197,10 @@
       var ready = isSessionReady();
       if (mgrDotEl && mgrStatusTextEl) {
         mgrDotEl.classList.remove('is-online', 'is-warning');
-        if (ready) {
+        if (terminalLockState.allowTerminal === false && sessionState.active) {
+          mgrDotEl.classList.add('is-warning');
+          mgrStatusTextEl.textContent = '仅限本人使用';
+        } else if (ready) {
           mgrDotEl.classList.add('is-online');
           mgrStatusTextEl.textContent = '已连接';
         } else if (sessionState.watchOnly) {
@@ -955,7 +1230,11 @@
       }
 
       if (createBtn) {
-        createBtn.disabled = !ready || bgCreating || sessions.length >= MAX_SESSIONS;
+        createBtn.disabled =
+          !ready ||
+          bgCreating ||
+          sessions.length >= MAX_SESSIONS ||
+          (terminalLockState.required && !terminalLockState.unlocked);
         createBtn.textContent = bgCreating ? '创建中…' : '创建会话';
       }
 
@@ -966,7 +1245,9 @@
         sessionListEl.hidden = true;
         emptyStateEl.hidden = false;
         if (emptyTextEl) {
-          if (sessionState.watchOnly) {
+          if (terminalLockState.allowTerminal === false && sessionState.active) {
+            emptyTextEl.textContent = '远程终端仅限本人账号使用，当前为他人协助会话';
+          } else if (sessionState.watchOnly) {
             emptyTextEl.textContent = '当前为只读观看模式，无法管理或打开远程终端';
           } else if (sessionState.phase === 'reconnecting') {
             emptyTextEl.textContent =
@@ -1722,7 +2003,11 @@
         });
       }
       if (newTabBtn) {
-        newTabBtn.disabled = !isSessionReady() || attachCreating || sessions.length >= MAX_SESSIONS;
+        newTabBtn.disabled =
+          !isSessionReady() ||
+          attachCreating ||
+          sessions.length >= MAX_SESSIONS ||
+          (terminalLockState.required && !terminalLockState.unlocked);
       }
     }
 
@@ -2019,6 +2304,109 @@
     }
     if (noticeReconnectBtn) {
       noticeReconnectBtn.addEventListener('click', reattachCurrentSession);
+    }
+
+    if (lockToggleVisBtn && lockPasswordEl) {
+      lockToggleVisBtn.addEventListener('click', function () {
+        var showing = lockPasswordEl.type === 'text';
+        lockPasswordEl.type = showing ? 'password' : 'text';
+        lockToggleVisBtn.textContent = showing ? '显示' : '隐藏';
+        lockPasswordEl.focus();
+      });
+    }
+
+    if (lockClearSavedBtn) {
+      lockClearSavedBtn.addEventListener('click', function () {
+        if (!IS_TAURI || typeof Bridge.terminalClearSavedPassword !== 'function') return;
+        Bridge.terminalClearSavedPassword(terminalLockState.deviceKey || null)
+          .then(function () {
+            terminalLockState.hasSavedPassword = false;
+            syncLockGateUi();
+            showToast('已清除本机保存的设备系统密码');
+          })
+          .catch(function (err) {
+            showToast(errMessage(err, '清除已保存密码失败'));
+          });
+      });
+    }
+
+    if (lockGateEl) {
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Tab' || !lockGateEl || lockGateEl.hidden) return;
+        var candidates = [
+          lockUsernameEl,
+          lockPasswordEl,
+          lockToggleVisBtn,
+          lockRememberEl,
+          lockClearSavedBtn,
+          lockSubmitBtn
+        ].filter(function (item) {
+          return item && !item.disabled && !item.hidden && item.offsetParent !== null;
+        });
+        if (!candidates.length) return;
+        var first = candidates[0];
+        var last = candidates[candidates.length - 1];
+        var cur = document.activeElement;
+        if (!lockGateEl.contains(cur)) {
+          ev.preventDefault();
+          (ev.shiftKey ? last : first).focus();
+          return;
+        }
+        if (ev.shiftKey && cur === first) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && cur === last) {
+          ev.preventDefault();
+          first.focus();
+        }
+      });
+    }
+
+    if (lockFormEl) {
+      lockFormEl.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        if (terminalLockState.submitting || terminalLockState.autoInFlight) return;
+        var rem = remainingCooldownSecs();
+        if (rem > 0) {
+          setLockError('验证过于频繁，请 ' + rem + ' 秒后再试');
+          syncLockGateUi();
+          return;
+        }
+        var pw = lockPasswordEl ? lockPasswordEl.value : '';
+        if (!pw) {
+          setLockError('请输入被控端系统登录密码');
+          if (lockPasswordEl) lockPasswordEl.focus();
+          return;
+        }
+        var userArg = null;
+        if (lockUserRowEl && !lockUserRowEl.hidden && lockUsernameEl) {
+          var uTrim = lockUsernameEl.value.trim();
+          if (!uTrim) {
+            setLockError('当前处于登录界面，请输入系统用户名');
+            lockUsernameEl.focus();
+            return;
+          }
+          userArg = uTrim;
+        }
+        var remember = Boolean(lockRememberEl && lockRememberEl.checked);
+        terminalLockState.submitting = true;
+        var submitSeq = lockStateSeq;
+        setLockError('');
+        syncLockGateUi();
+        if (!IS_TAURI || typeof Bridge.terminalUnlock !== 'function') {
+          terminalLockState.submitting = false;
+          terminalLockState.required = false;
+          terminalLockState.unlocked = true;
+          syncLockGateUi();
+          return;
+        }
+        Bridge.terminalUnlock(pw, userArg, remember).catch(function (err) {
+          if (submitSeq !== lockStateSeq) return;
+          terminalLockState.submitting = false;
+          setLockError(errMessage(err, '发送密码验证请求失败'));
+          syncLockGateUi();
+        });
+      });
     }
 
     /* ── 远端事件与会话状态处理 ─────────────────────────────── */
@@ -2321,13 +2709,23 @@
       if (s.deviceName || s.device_name || s.target) {
         sessionState.deviceName = String(s.deviceName || s.device_name || s.target);
       }
+      var permsRaw = s.toolPermissions || s.tool_permissions || null;
+      if (permsRaw && typeof permsRaw === 'object') {
+        if (typeof permsRaw.allowTerminal === 'boolean') {
+          terminalLockState.allowTerminal = permsRaw.allowTerminal;
+        } else if (typeof permsRaw.allow_terminal === 'boolean') {
+          terminalLockState.allowTerminal = permsRaw.allow_terminal;
+        }
+      }
 
       if (!sessionState.active) {
+        resetLockGateSessionState(true);
         handleDisconnectState(lastEndedReason || '远控会话已断开', { reconnectLabel: '重新连接' });
         return;
       }
 
       if (sessionState.phase === 'reconnecting') {
+        resetLockGateSessionState(false);
         var recMsg =
           '连接中断，正在自动重连 (' +
           (sessionState.reconnectingAttempt || 1) +
@@ -2341,32 +2739,149 @@
       lastEndedReason = '';
 
       if (sessionState.watchOnly) {
+        syncLockGateUi();
         handleDisconnectState('当前为只读观看模式，无法使用远程终端', { showNotice: false });
         return;
       }
 
+      if (terminalLockState.allowTerminal === false) {
+        syncLockGateUi();
+        handleDisconnectState('远程终端仅限本人账号使用，当前为他人协助会话', {
+          showNotice: viewMode === 'terminal'
+        });
+        return;
+      }
+
       if (!sessionState.connected) {
+        syncLockGateUi();
         if (viewMode === 'list') renderManagerView();
         else syncLiveChrome();
         return;
       }
 
       hideNotice();
-      if (!wasReady) {
-        resetSessionTimer();
-        refreshSessionList();
-        if (viewMode === 'terminal' && activeTermId != null) {
-          openSessionTerminal(activeTermId);
+      fetchTerminalLockState().then(function () {
+        if (!wasReady && isSessionReady()) {
+          resetSessionTimer();
+          refreshSessionList();
+          if (viewMode === 'terminal' && activeTermId != null) {
+            openSessionTerminal(activeTermId);
+          }
+          maybeAutoRestoreRemoteFont();
         }
-        maybeAutoRestoreRemoteFont();
-      }
-      if (viewMode === 'list') renderManagerView();
-      else syncLiveChrome();
+        if (viewMode === 'list') renderManagerView();
+        else syncLiveChrome();
+      });
     }
 
     function handleSessionUpdate(upd) {
       if (!upd || !upd.kind) return;
       var data = upd.data || {};
+      if (upd.kind === 'tool_permissions_updated') {
+        if (typeof data.allow_terminal === 'boolean') {
+          terminalLockState.allowTerminal = data.allow_terminal;
+        } else if (typeof data.allowTerminal === 'boolean') {
+          terminalLockState.allowTerminal = data.allowTerminal;
+        }
+        if (terminalLockState.allowTerminal === false) {
+          sessions = [];
+          handleDisconnectState('远程终端仅限本人账号使用，当前为他人协助会话', {
+            showNotice: viewMode === 'terminal'
+          });
+        }
+        syncLockGateUi();
+        if (viewMode === 'list') renderManagerView();
+        else syncLiveChrome();
+        return;
+      }
+      if (upd.kind === 'tool_permission_denied') {
+        if (data && data.channel === 2) {
+          terminalLockState.allowTerminal = false;
+          syncLockGateUi();
+          showToast('远程终端仅限本人账号使用');
+          if (viewMode === 'list') renderManagerView();
+          else syncLiveChrome();
+        }
+        return;
+      }
+      if (upd.kind === 'terminal_lock_state') {
+        var prevUnlocked = terminalLockState.unlocked;
+        lockStateSeq += 1;
+        terminalLockState.pending = false;
+        terminalLockState.required = Boolean(data.required);
+        terminalLockState.unlocked = Boolean(data.unlocked);
+        terminalLockState.username = data.username ? String(data.username) : '';
+        var retryLockSecs = Number(data.retry_after_secs || 0);
+        if (retryLockSecs > 0) setLockCooldown(retryLockSecs);
+        if (!terminalLockState.required || terminalLockState.unlocked) {
+          terminalLockState.submitting = false;
+          terminalLockState.autoInFlight = false;
+          setLockError('');
+          if (lockPasswordEl) lockPasswordEl.value = '';
+        }
+        syncLockGateUi();
+        if (!terminalLockState.required || terminalLockState.unlocked) {
+          if (!prevUnlocked && isSessionReady()) {
+            refreshSessionList();
+            if (viewMode === 'terminal' && activeTermId != null) {
+              var curTab = getActiveTab();
+              if (!curTab || (!curTab.connected && !curTab.opening)) {
+                openSessionTerminal(activeTermId);
+              }
+            }
+            maybeAutoRestoreRemoteFont();
+          }
+        } else {
+          Object.keys(tabByTermId).forEach(function (k) {
+            if (tabByTermId[k]) tabByTermId[k].opening = false;
+          });
+          fetchTerminalLockState();
+        }
+        if (viewMode === 'list') renderManagerView();
+        else syncLiveChrome();
+        return;
+      }
+      if (upd.kind === 'terminal_unlock_result') {
+        var wasAuto = terminalLockState.autoInFlight;
+        lockStateSeq += 1;
+        terminalLockState.submitting = false;
+        terminalLockState.autoInFlight = false;
+        var resRetrySecs = Number(data.retry_after_secs || 0);
+        if (resRetrySecs > 0) setLockCooldown(resRetrySecs);
+        if (data.ok) {
+          terminalLockState.pending = false;
+          terminalLockState.required = false;
+          terminalLockState.unlocked = true;
+          terminalLockState.autoAttempted = false;
+          if (lockPasswordEl) lockPasswordEl.value = '';
+          setLockError('');
+          syncLockGateUi();
+          showToast('系统密码验证通过');
+          fetchTerminalLockState();
+          refreshSessionList();
+          if (viewMode === 'terminal' && activeTermId != null) {
+            var activeTab = getActiveTab();
+            if (!activeTab || (!activeTab.connected && !activeTab.opening)) {
+              openSessionTerminal(activeTermId);
+            } else {
+              focusTerminal();
+            }
+          }
+        } else {
+          if (wasAuto) {
+            terminalLockState.hasSavedPassword = false;
+            setLockError('已保存的系统密码已失效，请重新输入');
+          } else {
+            setLockError(data.error ? String(data.error) : '系统密码错误，请重试');
+          }
+          syncLockGateUi();
+          if (lockPasswordEl) {
+            lockPasswordEl.focus();
+            lockPasswordEl.select();
+          }
+        }
+        return;
+      }
       if (upd.kind === 'connecting') {
         sessionState.active = true;
         sessionState.connected = false;
@@ -2383,6 +2898,7 @@
         sessionState.active = true;
         sessionState.connected = false;
         sessionState.phase = 'reconnecting';
+        resetLockGateSessionState(false);
         sessionState.reconnectingAttempt = Number(data.attempt) || 1;
         sessionState.reconnectingMax = Number(data.max_attempts || data.maxAttempts) || 8;
         sessionState.reconnectingReason = data.reason ? String(data.reason) : '';
@@ -2402,6 +2918,7 @@
         sessionState.connected = false;
         sessionState.watchOnly = false;
         sessionState.phase = 'ended';
+        resetLockGateSessionState(true);
         handleDisconnectState(reason, { reconnectLabel: '重新连接' });
         return;
       }
@@ -2418,20 +2935,23 @@
           sessionState.deviceName = String(data.device_name || data.device);
         }
         if (sessionState.watchOnly) {
+          syncLockGateUi();
           handleDisconnectState('当前为只读观看模式，无法使用远程终端', { showNotice: false });
           return;
         }
         hideNotice();
-        if (!wasReady) {
-          resetSessionTimer();
-          refreshSessionList();
-          if (viewMode === 'terminal' && activeTermId != null) {
-            openSessionTerminal(activeTermId);
+        fetchTerminalLockState().then(function () {
+          if (!wasReady && isSessionReady()) {
+            resetSessionTimer();
+            refreshSessionList();
+            if (viewMode === 'terminal' && activeTermId != null) {
+              openSessionTerminal(activeTermId);
+            }
+            maybeAutoRestoreRemoteFont();
           }
-          maybeAutoRestoreRemoteFont();
-        }
-        if (viewMode === 'list') renderManagerView();
-        else syncLiveChrome();
+          if (viewMode === 'list') renderManagerView();
+          else syncLiveChrome();
+        });
       }
     }
 

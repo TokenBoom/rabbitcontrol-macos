@@ -5730,6 +5730,237 @@ pub fn terminal_close(term_id: u32, state: State<'_, AppState>) -> Result<(), St
     active_session_tools(&state)?.terminal_close(term_id)
 }
 
+/// IPC 命令：读取当前会话 W3 远程终端锁屏验证状态（含本机钥匙串是否存有已记忆系统密码）。
+#[tauri::command]
+pub async fn terminal_get_lock_state(
+    state: State<'_, AppState>,
+) -> Result<crate::state::TerminalLockStateSnapshot, String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let (mut snap, device_key, keychain) = {
+        let guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        let kc = state.keychain.clone();
+        match guard.as_ref().filter(|s| !s.disconnecting) {
+            Some(active) => {
+                let snap = active.terminal_lock_snapshot_at(std::time::Instant::now());
+                let dk = if !active.meta.device_key.trim().is_empty() {
+                    active.meta.device_key.trim().to_string()
+                } else {
+                    active.meta.target.trim().to_string()
+                };
+                (snap, dk, kc)
+            }
+            None => (
+                crate::state::TerminalLockStateSnapshot::default(),
+                String::new(),
+                kc,
+            ),
+        }
+    };
+    snap.has_saved_password = if !device_key.is_empty() {
+        let dk_for_kc = device_key.clone();
+        tauri::async_runtime::spawn_blocking(move || keychain.has_password(dk_for_kc))
+            .await
+            .map_err(|e| format!("查询钥匙串状态任务异常：{e}"))?
+    } else {
+        false
+    };
+    snap.device_key = (!device_key.is_empty()).then_some(device_key);
+    Ok(snap)
+}
+
+/// IPC 命令：向被控端提交 W3 远程终端系统密码校验请求（可选记忆到本机登录钥匙串）。
+#[tauri::command]
+pub fn terminal_unlock(
+    password: String,
+    username: Option<String>,
+    remember: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut password = zeroize::Zeroizing::new(password);
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    if password.is_empty() || password.len() > 512 {
+        return Err("系统密码不能为空且长度不能超过 512 字节".to_string());
+    }
+    let clean_username = username
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+
+    let mut guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_mut() else {
+        return Err("请先建立远控会话".to_string());
+    };
+    if active.disconnecting || !active.handle.is_running() {
+        return Err("请先建立远控会话".to_string());
+    }
+    if active.watch_only {
+        return Err("当前为只读观看模式，无法使用远程终端".to_string());
+    }
+    if !active.meta.tool_permissions.allow_terminal {
+        return Err("远程终端仅限本人账号使用".to_string());
+    }
+
+    let device_key = if !active.meta.device_key.trim().is_empty() {
+        active.meta.device_key.trim().to_string()
+    } else {
+        active.meta.target.trim().to_string()
+    };
+    if remember && !device_key.is_empty() {
+        active.pending_terminal_remember = Some((
+            zeroize::Zeroizing::new(device_key),
+            zeroize::Zeroizing::new((*password).clone()),
+        ));
+    } else {
+        active.clear_pending_terminal_remember();
+    }
+    active.terminal_auto_unlock_in_flight = false;
+    active.terminal_unlock_seq = active.terminal_unlock_seq.wrapping_add(1);
+    if let Err(err) = active
+        .handle
+        .submit_terminal_unlock(std::mem::take(&mut *password), clean_username)
+    {
+        active.clear_pending_terminal_remember();
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// IPC 命令：尝试从本机登录钥匙串读取已记忆密码并静默完成 W3 终端校验（有密码提交返回 `true`）。
+#[tauri::command]
+pub async fn terminal_try_auto_unlock(state: State<'_, AppState>) -> Result<bool, String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let (sid, seq, device_key, username, keychain) = {
+        let mut guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if active.disconnecting
+            || !active.handle.is_running()
+            || active.watch_only
+            || !active.meta.tool_permissions.allow_terminal
+            || !active.terminal_lock_state.required
+            || active.terminal_lock_state.unlocked
+            || active.terminal_auto_unlock_in_flight
+        {
+            return Ok(false);
+        }
+        let dk = if !active.meta.device_key.trim().is_empty() {
+            active.meta.device_key.trim().to_string()
+        } else {
+            active.meta.target.trim().to_string()
+        };
+        if dk.is_empty() {
+            return Ok(false);
+        }
+        active.clear_pending_terminal_remember();
+        active.terminal_unlock_seq = active.terminal_unlock_seq.wrapping_add(1);
+        let seq = active.terminal_unlock_seq;
+        active.terminal_auto_unlock_in_flight = true;
+        (
+            active.id,
+            seq,
+            dk,
+            active.terminal_lock_state.username.clone(),
+            state.keychain.clone(),
+        )
+    };
+
+    let load_task =
+        tauri::async_runtime::spawn_blocking(move || keychain.load_password(device_key)).await;
+    let mut guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_mut() else {
+        return Ok(false);
+    };
+    if active.id != sid
+        || active.terminal_unlock_seq != seq
+        || !active.terminal_auto_unlock_in_flight
+    {
+        return Ok(false);
+    }
+    if active.disconnecting
+        || !active.handle.is_running()
+        || active.watch_only
+        || !active.meta.tool_permissions.allow_terminal
+        || !active.terminal_lock_state.required
+        || active.terminal_lock_state.unlocked
+    {
+        active.terminal_auto_unlock_in_flight = false;
+        return Ok(false);
+    }
+    let loaded = match load_task {
+        Ok(res) => res,
+        Err(e) => {
+            active.terminal_auto_unlock_in_flight = false;
+            return Err(format!("读取钥匙串密码任务异常：{e}"));
+        }
+    };
+    match loaded {
+        Ok(Some(pw)) => {
+            if let Err(err) = active
+                .handle
+                .submit_terminal_unlock((*pw).clone(), username)
+            {
+                active.terminal_auto_unlock_in_flight = false;
+                return Err(err);
+            }
+            Ok(true)
+        }
+        Ok(None) => {
+            active.terminal_auto_unlock_in_flight = false;
+            Ok(false)
+        }
+        Err(e) => {
+            eprintln!("[rc-ui] 钥匙串自动填充读取失败: {e}");
+            active.terminal_auto_unlock_in_flight = false;
+            Ok(false)
+        }
+    }
+}
+
+/// IPC 命令：清除本机登录钥匙串中保存的设备终端系统密码。
+#[tauri::command]
+pub async fn terminal_clear_saved_password(
+    device_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.require_unlocked()?;
+    state.require_authenticated()?;
+    let (resolved, keychain) = {
+        let kc = state.keychain.clone();
+        let explicit = device_key
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mut guard = state.session.lock().unwrap_or_else(|e| e.into_inner());
+        let active_dk = guard.as_ref().and_then(|active| {
+            let dk = if !active.meta.device_key.trim().is_empty() {
+                active.meta.device_key.trim().to_string()
+            } else {
+                active.meta.target.trim().to_string()
+            };
+            (!dk.is_empty()).then_some(dk)
+        });
+        let res = explicit.or(active_dk.clone());
+        if let (Some(ref target_dk), Some(active)) = (&res, guard.as_mut()) {
+            if active
+                .pending_terminal_remember
+                .as_ref()
+                .is_some_and(|(pending_dk, _)| pending_dk.as_str() == target_dk.as_str())
+            {
+                active.clear_pending_terminal_remember();
+            }
+        }
+        (res, kc)
+    };
+    if let Some(dk) = resolved {
+        tauri::async_runtime::spawn_blocking(move || keychain.delete_password(dk))
+            .await
+            .map_err(|e| format!("删除钥匙串密码任务异常：{e}"))??;
+    }
+    Ok(())
+}
+
 /// IPC 命令：扫描本机系统字体（用于 W3 终端本地字体选择）。
 #[tauri::command]
 pub async fn terminal_list_local_fonts(

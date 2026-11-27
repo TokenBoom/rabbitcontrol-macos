@@ -83,6 +83,44 @@
         </div>
       </div>
     </main>
+
+    <!-- 锁屏状态本人终端系统密码验证浮层（仅校验被控端系统登录密码，不解锁被控端屏幕） -->
+    <div class="tm-lock-gate" id="tm-lock-gate" hidden>
+      <div class="tm-lock-card" role="dialog" aria-modal="true" aria-labelledby="tm-lock-title">
+        <h2 class="tm-lock-card__title" id="tm-lock-title">被控端已锁屏，请验证系统密码</h2>
+        <p class="tm-lock-card__sub" id="tm-lock-sub">仅校验被控端系统登录密码，不会解锁被控端屏幕</p>
+        <div class="tm-lock-user-badge" id="tm-lock-user-badge" hidden>
+          <span>系统账号：</span>
+          <strong id="tm-lock-user-name"></strong>
+        </div>
+        <form class="tm-lock-form" id="tm-lock-form">
+          <div class="tm-lock-field" id="tm-lock-user-row" hidden>
+            <label class="tm-lock-label" for="tm-lock-username">系统用户名</label>
+            <input type="text" class="tm-modal__input" id="tm-lock-username" maxlength="128"
+                   autocomplete="off" placeholder="请输入被控端 macOS 登录用户名" />
+          </div>
+          <div class="tm-lock-field">
+            <label class="tm-lock-label" for="tm-lock-password">系统登录密码</label>
+            <div class="tm-lock-pw-wrap">
+              <input type="password" class="tm-modal__input tm-lock-pw-input" id="tm-lock-password"
+                     maxlength="512" autocomplete="off" placeholder="请输入被控端 macOS 登录密码" />
+              <button type="button" class="tm-btn-light tm-lock-vis-btn" id="tm-lock-toggle-vis"
+                      aria-label="显示或隐藏密码">显示</button>
+            </div>
+          </div>
+          <label class="tm-lock-remember">
+            <input type="checkbox" id="tm-lock-remember" />
+            <span>记住此设备系统密码（仅本机钥匙串加密保存）</span>
+          </label>
+          <p class="tm-modal__error" id="tm-lock-error" hidden></p>
+          <div class="tm-lock-actions">
+            <button type="button" class="tm-btn-light" id="tm-lock-clear-saved" hidden>清除已保存密码</button>
+            <span class="tm-lock-spacer"></span>
+            <button type="submit" class="tm-btn-light tm-btn-light--primary" id="tm-lock-submit">验证并进入</button>
+          </div>
+        </form>
+      </div>
+    </div>
   </div>
 
   <!-- 「...」浮层菜单：重命名 / 终止会话 -->

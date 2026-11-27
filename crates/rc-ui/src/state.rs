@@ -137,6 +137,40 @@ impl From<rc_session::ToolPermissions> for ToolPermissionsSnapshot {
     }
 }
 
+/// W3 远程终端锁屏验证状态快照（IPC `camelCase`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalLockStateSnapshot {
+    /// 当前是否要求输入系统密码后才可使用 W3 远程终端。
+    pub required: bool,
+    /// 本会话内是否已完成系统密码验证（或本就在未锁屏下连接/已物理解锁）。
+    pub unlocked: bool,
+    /// 被控端当前桌面用户名（LoginWindow 阶段可能为 `None`）。
+    pub username: Option<String>,
+    /// 失败次数触发退避冷却时，剩余等待秒数（`0` 表示可立即提交）。
+    pub retry_after_secs: u32,
+    /// 本机登录钥匙串中是否已存有该设备的系统密码。
+    pub has_saved_password: bool,
+    /// 当前会话设备键（用于清除钥匙串记住条目）。
+    pub device_key: Option<String>,
+    /// 当前会话是否允许使用远程终端（非 Owner 远程协助固定为 `false`）。
+    pub allow_terminal: bool,
+}
+
+impl Default for TerminalLockStateSnapshot {
+    fn default() -> Self {
+        Self {
+            required: false,
+            unlocked: false,
+            username: None,
+            retry_after_secs: 0,
+            has_saved_password: false,
+            device_key: None,
+            allow_terminal: true,
+        }
+    }
+}
+
 /// 当前活动远控会话的控制端元数据（用于主窗状态显示、壁纸归档与中继热切换）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveSessionMeta {
@@ -315,6 +349,17 @@ pub struct ActiveSession<H = SessionHandle> {
     pub portmaps_restored: bool,
     /// 最近一次收到的被控端锁屏与采集挂起状态 `(locked, capture_suspended)`（供晚挂载 S1 窗口同步）。
     pub host_screen_state: Option<(bool, bool)>,
+    /// W3 远程终端锁屏密码验证状态快照。
+    pub terminal_lock_state: TerminalLockStateSnapshot,
+    /// 若失败次数触发冷却退避，记录本地单调截止时刻（每次查询按当前时刻动态计算剩余秒数）。
+    pub terminal_cooldown_until: Option<std::time::Instant>,
+    /// 待在 `TerminalUnlockResult { ok: true }` 确认后才写入钥匙串的 `(device_key, password)`。
+    /// 两者均使用 `Zeroizing<String>` 托管，析构/拆解字段时自动擦除堆内存，无需为 `ActiveSession` 手写 `Drop`。
+    pub pending_terminal_remember: Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>,
+    /// 当前是否有一笔静默自动填充（钥匙串）校验正在进行中。
+    pub terminal_auto_unlock_in_flight: bool,
+    /// 单调递增终端解锁操作代际号：防止自动解锁异步读钥匙串间隙被手动提交或状态切换竞争复用。
+    pub terminal_unlock_seq: u64,
     /// 会话控制端元数据。
     pub meta: ActiveSessionMeta,
 }
@@ -332,8 +377,47 @@ impl<H> ActiveSession<H> {
             video_size: None,
             portmaps_restored: false,
             host_screen_state: None,
+            terminal_lock_state: TerminalLockStateSnapshot::default(),
+            terminal_cooldown_until: None,
+            pending_terminal_remember: None,
+            terminal_auto_unlock_in_flight: false,
+            terminal_unlock_seq: 0,
             meta: ActiveSessionMeta::default(),
         }
+    }
+
+    /// 设置或清除终端密码防爆破冷却截止时刻。
+    pub fn set_terminal_cooldown(&mut self, retry_after_secs: u32, now: std::time::Instant) {
+        if retry_after_secs > 0 {
+            self.terminal_cooldown_until =
+                Some(now + std::time::Duration::from_secs(u64::from(retry_after_secs)));
+            self.terminal_lock_state.retry_after_secs = retry_after_secs;
+        } else {
+            self.terminal_cooldown_until = None;
+            self.terminal_lock_state.retry_after_secs = 0;
+        }
+    }
+
+    /// 按指定时刻计算当前会话的终端锁屏验证状态快照（动态递减冷却剩余秒数）。
+    pub fn terminal_lock_snapshot_at(&self, now: std::time::Instant) -> TerminalLockStateSnapshot {
+        let mut snap = self.terminal_lock_state.clone();
+        snap.allow_terminal = self.meta.tool_permissions.allow_terminal;
+        snap.retry_after_secs = match self.terminal_cooldown_until {
+            Some(until) if until > now => {
+                let rem = until.saturating_duration_since(now);
+                let secs = rem
+                    .as_secs()
+                    .saturating_add(u64::from(rem.subsec_nanos() > 0));
+                u32::try_from(secs).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
+        snap
+    }
+
+    /// 清空并擦除内存中的待记忆终端系统密码。
+    pub fn clear_pending_terminal_remember(&mut self) {
+        let _ = self.pending_terminal_remember.take();
     }
 
     /// 写入会话元数据。
@@ -1013,6 +1097,8 @@ pub struct AppState {
     pub self_update_cancel: Arc<AtomicBool>,
     /// 当前活动会话对端被控端上报的版本与更新能力元数据（绑定会话代际号 `sid`）。
     pub host_version: Mutex<Option<(u64, rc_ui::updater::RemoteHostVersion)>>,
+    /// W3 终端密码登录钥匙串异步串行工作器。
+    pub keychain: rc_ui::keychain::KeychainWorker,
     /// 单调递增会话代际号分配器（从 1 开始）。
     next_session_id: AtomicU64,
     /// §6.0 mock 设备表（侧栏 3 台）。
@@ -1149,6 +1235,7 @@ impl AppState {
             self_update_running: Arc::new(AtomicBool::new(false)),
             self_update_cancel: Arc::new(AtomicBool::new(false)),
             host_version: Mutex::new(None),
+            keychain: rc_ui::keychain::KeychainWorker::new(),
             next_session_id: AtomicU64::new(1),
             devices: default_mock_devices(),
             dropped_unmapped_keys: AtomicU64::new(0),
@@ -2320,5 +2407,51 @@ mod tests {
         // Clearing connecting_epoch restores inactive when slot is None.
         state.clear_connecting_epoch(epoch);
         assert!(!state.active_session_info().active);
+    }
+
+    #[test]
+    fn terminal_lock_state_snapshot_defaults_and_camel_case_serialization() {
+        let snap = TerminalLockStateSnapshot::default();
+        assert!(!snap.required);
+        assert!(!snap.unlocked);
+        assert!(snap.allow_terminal);
+        let json = serde_json::to_value(&snap).expect("serialize TerminalLockStateSnapshot");
+        assert_eq!(json["required"], serde_json::Value::Bool(false));
+        assert_eq!(json["unlocked"], serde_json::Value::Bool(false));
+        assert_eq!(json["retryAfterSecs"], serde_json::Value::Number(0.into()));
+        assert_eq!(json["hasSavedPassword"], serde_json::Value::Bool(false));
+        assert_eq!(json["allowTerminal"], serde_json::Value::Bool(true));
+
+        let mut active = ActiveSession::new(10, FakeSessionHandle::default(), false);
+        active.pending_terminal_remember = Some((
+            zeroize::Zeroizing::new("604928235".to_string()),
+            zeroize::Zeroizing::new("secret-pw".to_string()),
+        ));
+        active.clear_pending_terminal_remember();
+        assert!(active.pending_terminal_remember.is_none());
+
+        let t0 = std::time::Instant::now();
+        active.set_terminal_cooldown(30, t0);
+        assert_eq!(active.terminal_lock_snapshot_at(t0).retry_after_secs, 30);
+        assert_eq!(
+            active
+                .terminal_lock_snapshot_at(t0 + std::time::Duration::from_secs(12))
+                .retry_after_secs,
+            18
+        );
+        assert_eq!(
+            active
+                .terminal_lock_snapshot_at(
+                    t0 + std::time::Duration::from_secs(12) + std::time::Duration::from_millis(500)
+                )
+                .retry_after_secs,
+            18
+        );
+        assert_eq!(
+            active
+                .terminal_lock_snapshot_at(t0 + std::time::Duration::from_secs(30))
+                .retry_after_secs,
+            0
+        );
     }
 }

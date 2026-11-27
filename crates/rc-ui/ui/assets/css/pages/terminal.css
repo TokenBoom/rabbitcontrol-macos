@@ -19,6 +19,7 @@ body[data-page="terminal"] {
 }
 
 .tm-window {
+  position: relative;
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -1098,6 +1099,134 @@ body.is-tauri .tm-titlebar {
 
 .tm-font-spacer {
   flex: 1;
+}
+
+/* ── 锁屏终端系统密码验证浮层（全 Token 化，零裸色） ──────────── */
+
+.tm-lock-gate {
+  position: absolute;
+  inset: 38px 0 0 0;
+  z-index: 9300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--mask);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+
+.tm-lock-gate[hidden] {
+  display: none;
+}
+
+.tm-lock-card {
+  width: 100%;
+  max-width: 396px;
+  padding: 22px 24px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tm-lock-card__title {
+  margin: 0;
+  font-size: var(--size-h2);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.tm-lock-card__sub {
+  margin: 0;
+  font-size: var(--size-secondary);
+  color: var(--text-secondary);
+  line-height: 18px;
+}
+
+.tm-lock-user-badge {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--stroke-soft);
+  border-radius: var(--r-pill);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+}
+
+.tm-lock-user-badge strong {
+  color: var(--text-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+.tm-lock-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tm-lock-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tm-lock-label {
+  font-size: var(--size-caption);
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
+.tm-lock-pw-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tm-lock-pw-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.tm-lock-vis-btn {
+  flex: none;
+  height: 36px;
+  padding: 0 12px;
+}
+
+.tm-lock-remember {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--size-secondary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.tm-lock-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.tm-lock-spacer {
+  flex: 1;
+}
+
+.tm-btn-light[hidden],
+.tm-lock-user-badge[hidden],
+.tm-lock-field[hidden],
+#tm-lock-error[hidden] {
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

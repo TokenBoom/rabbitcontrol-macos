@@ -309,6 +309,7 @@ fn start_background_poller(app: AppHandle) {
                 let mut negotiated_record: Option<(String, String)> = None;
                 let mut restore_portmaps_req: Option<(u64, String)> = None;
                 let mut wallpaper_updates: Vec<(String, String, String)> = Vec::new();
+                let mut keychain_sync_op: Option<rc_ui::keychain::KeychainSyncOp> = None;
                 let mut ended_session = None;
                 let mut auto_reconnect_req: Option<(u64, String)> = None;
 
@@ -453,6 +454,14 @@ fn start_background_poller(app: AppHandle) {
                                 SessionUpdate::Reconnecting { .. } => {
                                     active.meta.phase = "reconnecting".to_string();
                                     active.meta.connected = false;
+                                    active.terminal_auto_unlock_in_flight = false;
+                                    active.terminal_unlock_seq =
+                                        active.terminal_unlock_seq.wrapping_add(1);
+                                    active.clear_pending_terminal_remember();
+                                    active.terminal_lock_state.required = false;
+                                    active.terminal_lock_state.unlocked = false;
+                                    active.terminal_lock_state.username = None;
+                                    active.set_terminal_cooldown(0, std::time::Instant::now());
                                     emit_active_state = true;
                                 }
                                 SessionUpdate::DisplayConfig { width, height, .. }
@@ -511,7 +520,76 @@ fn start_background_poller(app: AppHandle) {
                                 }
                                 SessionUpdate::ToolPermissionsUpdated(perms) => {
                                     active.meta.tool_permissions = perms.into();
+                                    active.terminal_lock_state.allow_terminal =
+                                        perms.allow_terminal;
                                     emit_active_state = true;
+                                }
+                                SessionUpdate::TerminalLockState {
+                                    required,
+                                    unlocked,
+                                    ref username,
+                                    retry_after_secs,
+                                } => {
+                                    active.terminal_lock_state.required = required;
+                                    active.terminal_lock_state.unlocked = unlocked;
+                                    active.terminal_lock_state.username = username.clone();
+                                    active.set_terminal_cooldown(
+                                        retry_after_secs,
+                                        std::time::Instant::now(),
+                                    );
+                                    if required && !unlocked {
+                                        active.clear_pending_terminal_remember();
+                                    }
+                                    if !required || unlocked {
+                                        active.terminal_cooldown_until = None;
+                                        active.terminal_auto_unlock_in_flight = false;
+                                        active.terminal_unlock_seq =
+                                            active.terminal_unlock_seq.wrapping_add(1);
+                                    }
+                                }
+                                SessionUpdate::TerminalUnlockResult {
+                                    ok,
+                                    ref error,
+                                    retry_after_secs,
+                                } => {
+                                    let _ = error;
+                                    let was_auto = std::mem::replace(
+                                        &mut active.terminal_auto_unlock_in_flight,
+                                        false,
+                                    );
+                                    let dk = if !active.meta.device_key.trim().is_empty() {
+                                        active.meta.device_key.trim().to_string()
+                                    } else {
+                                        active.meta.target.trim().to_string()
+                                    };
+                                    if ok {
+                                        active.terminal_lock_state.required = false;
+                                        active.terminal_lock_state.unlocked = true;
+                                        active.set_terminal_cooldown(0, std::time::Instant::now());
+                                        if let Some((save_dk, pw)) =
+                                            active.pending_terminal_remember.take()
+                                        {
+                                            rc_ui::keychain::KeychainSyncOp::set_latest(
+                                                &mut keychain_sync_op,
+                                                rc_ui::keychain::KeychainSyncOp::Save(
+                                                    save_dk.as_str().to_string(),
+                                                    pw,
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        active.set_terminal_cooldown(
+                                            retry_after_secs,
+                                            std::time::Instant::now(),
+                                        );
+                                        active.clear_pending_terminal_remember();
+                                        if was_auto && !dk.is_empty() {
+                                            rc_ui::keychain::KeychainSyncOp::set_latest(
+                                                &mut keychain_sync_op,
+                                                rc_ui::keychain::KeychainSyncOp::Delete(dk),
+                                            );
+                                        }
+                                    }
                                 }
                                 SessionUpdate::Ended {
                                     ref reason,
@@ -578,6 +656,8 @@ fn start_background_poller(app: AppHandle) {
                                     | SessionUpdate::MediaState { .. }
                                     | SessionUpdate::ToolPermissionsUpdated(_)
                                     | SessionUpdate::ToolPermissionDenied { .. }
+                                    | SessionUpdate::TerminalLockState { .. }
+                                    | SessionUpdate::TerminalUnlockResult { .. }
                             )
                         }) {
                             // Review M8 + U-H3：在 `session` 锁内绑定 `sid` 缓存最新快照，跳过纯控制元数据帧。
@@ -626,6 +706,11 @@ fn start_background_poller(app: AppHandle) {
                             drop(lease);
                         });
                     }
+                }
+
+                if let Some(op) = keychain_sync_op.take() {
+                    let st = app.state::<AppState>();
+                    st.keychain.enqueue_sync(op);
                 }
 
                 // U-H3 + H11：发射 `"session://update"` 与 W2/W3/W4 工具事件前复核 `sid` 未被替换，
@@ -1650,6 +1735,10 @@ fn main() {
             commands::terminal_input,
             commands::terminal_resize,
             commands::terminal_close,
+            commands::terminal_get_lock_state,
+            commands::terminal_unlock,
+            commands::terminal_try_auto_unlock,
+            commands::terminal_clear_saved_password,
             commands::terminal_list_local_fonts,
             commands::terminal_list_remote_fonts,
             commands::terminal_fetch_remote_font,

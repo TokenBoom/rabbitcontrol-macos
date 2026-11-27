@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod keychain;
 pub mod metal_attach;
 pub mod network_monitor;
 pub mod permissions;
