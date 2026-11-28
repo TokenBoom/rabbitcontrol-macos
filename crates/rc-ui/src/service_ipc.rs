@@ -164,6 +164,25 @@ pub enum ServiceRequest {
     GetWolCapableSnapshot,
     /// 排空后台信令连接收到的设备 Wake-on-LAN 能力增量事件批次。
     DrainDeviceWolEvents,
+    /// 向后台 `rc-host-agent` 申请临时暂停并借用指定本地 UDP 探测端口的租约（供跨进程 P2P 打洞/直连复用）。
+    AcquireP2pUdpPort {
+        /// 需要借用的本地 UDP 端口号。
+        port: u16,
+        /// 租约有效期（毫秒，服务端将按 `5_000..=60_000` 夹紧）。
+        lease_ttl_ms: u64,
+    },
+    /// 续期已持有的跨进程 P2P UDP 端口租约。
+    RenewP2pUdpPort {
+        /// `AcquireP2pUdpPort` 返回的租约 ID。
+        lease_id: u64,
+        /// 续期后的租约有效期（毫秒）。
+        lease_ttl_ms: u64,
+    },
+    /// 主动释放跨进程 P2P UDP 端口租约并立即恢复后台 UDP 探测槽位。
+    ReleaseP2pUdpPort {
+        /// `AcquireP2pUdpPort` 返回的租约 ID。
+        lease_id: u64,
+    },
 }
 
 /// 后台服务返回的 IPC 响应消息。
@@ -217,6 +236,11 @@ pub enum ServiceResponse {
     ReloginRequired {
         /// 需要重新登录的原因。
         message: String,
+    },
+    /// 跨进程 P2P UDP 端口租约申请成功应答。
+    P2pUdpPortLease {
+        /// 后台 `rc-host-agent` 分配的租约唯一 ID。
+        lease_id: u64,
     },
     /// 请求被拒绝或执行失败。
     Error {
@@ -1205,5 +1229,30 @@ mod tests {
         let dec_events: ServiceResponse =
             serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
         assert_eq!(dec_events, events);
+    }
+
+    #[test]
+    fn p2p_udp_port_lease_ipc_messages_roundtrip() {
+        let reqs = [
+            ServiceRequest::AcquireP2pUdpPort {
+                port: 54321,
+                lease_ttl_ms: 30_000,
+            },
+            ServiceRequest::RenewP2pUdpPort {
+                lease_id: 7,
+                lease_ttl_ms: 30_000,
+            },
+            ServiceRequest::ReleaseP2pUdpPort { lease_id: 7 },
+        ];
+        for req in reqs {
+            let encoded = serde_json::to_string(&req).unwrap();
+            let decoded: ServiceRequest = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, req);
+        }
+
+        let resp = ServiceResponse::P2pUdpPortLease { lease_id: 7 };
+        let dec_resp: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(dec_resp, resp);
     }
 }

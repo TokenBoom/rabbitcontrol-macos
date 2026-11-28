@@ -9,7 +9,7 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,12 +39,32 @@ use rc_ui::service_ipc::{
 #[cfg(target_os = "macos")]
 use rc_ui::service_manager;
 use rc_ui::signal_client::{
-    DeviceStatusEvent, DeviceWolCapabilityEvent, SignalClientHandle, SignalClientOptions,
+    acquire_local_udp_port_for_p2p, DeviceStatusEvent, DeviceWolCapabilityEvent,
+    LocalUdpPortHoldGuard, SignalClientHandle, SignalClientOptions,
 };
 use rc_ui::ui_error::{self, codes, ErrorPlatform};
 
 const MAX_PENDING_DEVICE_EVENTS: usize = 64;
 const DEFAULT_REQUEST_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const MAX_EXTERNAL_P2P_PORT_LEASES: usize = 16;
+const MIN_EXTERNAL_P2P_LEASE_TTL_MS: u64 = 5_000;
+const MAX_EXTERNAL_P2P_LEASE_TTL_MS: u64 = 60_000;
+const DEFAULT_EXTERNAL_P2P_LEASE_TTL_MS: u64 = 30_000;
+
+struct ExternalP2pPortLease {
+    port: u16,
+    _hold: LocalUdpPortHoldGuard,
+    expires_at: Instant,
+}
+
+fn clamp_p2p_lease_ttl(lease_ttl_ms: u64) -> Duration {
+    let ms = if lease_ttl_ms == 0 {
+        DEFAULT_EXTERNAL_P2P_LEASE_TTL_MS
+    } else {
+        lease_ttl_ms.clamp(MIN_EXTERNAL_P2P_LEASE_TTL_MS, MAX_EXTERNAL_P2P_LEASE_TTL_MS)
+    };
+    Duration::from_millis(ms)
+}
 
 fn resolve_request_connect_timeout(timeout_ms: u64) -> Duration {
     let effective_ms = if timeout_ms == 0 {
@@ -390,6 +410,8 @@ struct AgentInner {
     permissions: PermissionSnapshot,
     degraded_permissions: bool,
     last_offline_disk_check: std::time::Instant,
+    p2p_port_leases: HashMap<u64, ExternalP2pPortLease>,
+    next_p2p_lease_id: u64,
     #[cfg(test)]
     signal_sync_log: Option<Arc<Mutex<Vec<Option<usize>>>>>,
 }
@@ -437,6 +459,8 @@ impl AgentInner {
             permissions,
             degraded_permissions: false,
             last_offline_disk_check: std::time::Instant::now(),
+            p2p_port_leases: HashMap::new(),
+            next_p2p_lease_id: 1,
             #[cfg(test)]
             signal_sync_log: None,
         })
@@ -971,6 +995,7 @@ impl AgentInner {
     }
 
     fn pump_events(&mut self) -> (bool, RetiredHandles) {
+        self.prune_expired_p2p_port_leases(Instant::now());
         let mut changed = false;
         let mut retired_host = None;
         let mut revoked_reason: Option<String> = None;
@@ -1351,8 +1376,78 @@ impl AgentInner {
         Ok((self.password.clone(), false))
     }
 
+    fn prune_expired_p2p_port_leases(&mut self, now: Instant) {
+        self.p2p_port_leases.retain(|id, lease| {
+            let keep = lease.expires_at > now;
+            if !keep {
+                eprintln!(
+                    "[rc-host-agent] 跨进程 P2P UDP 端口租约已过期释放: lease_id={id}, port={}",
+                    lease.port
+                );
+            }
+            keep
+        });
+    }
+
+    fn acquire_p2p_port_lease(&mut self, port: u16, lease_ttl_ms: u64) -> ServiceResponse {
+        let now = Instant::now();
+        self.prune_expired_p2p_port_leases(now);
+        if port == 0 {
+            return ServiceResponse::Error {
+                message: "无效 UDP 端口号 0".to_string(),
+            };
+        }
+        if self.p2p_port_leases.len() >= MAX_EXTERNAL_P2P_PORT_LEASES {
+            return ServiceResponse::Error {
+                message: format!(
+                    "跨进程 P2P UDP 端口租约数已达上限（{MAX_EXTERNAL_P2P_PORT_LEASES}）"
+                ),
+            };
+        }
+        let hold = acquire_local_udp_port_for_p2p(Some(port));
+        if !hold.is_holding_local_slot() {
+            return ServiceResponse::Error {
+                message: format!("后台进程当前未持有 UDP 端口 {port} 的探测槽位"),
+            };
+        }
+        let mut lease_id = self.next_p2p_lease_id.max(1);
+        while self.p2p_port_leases.contains_key(&lease_id) {
+            lease_id = lease_id.wrapping_add(1).max(1);
+        }
+        self.next_p2p_lease_id = lease_id.wrapping_add(1).max(1);
+        let expires_at = now + clamp_p2p_lease_ttl(lease_ttl_ms);
+        self.p2p_port_leases.insert(
+            lease_id,
+            ExternalP2pPortLease {
+                port,
+                _hold: hold,
+                expires_at,
+            },
+        );
+        ServiceResponse::P2pUdpPortLease { lease_id }
+    }
+
+    fn renew_p2p_port_lease(&mut self, lease_id: u64, lease_ttl_ms: u64) -> ServiceResponse {
+        let now = Instant::now();
+        self.prune_expired_p2p_port_leases(now);
+        let Some(lease) = self.p2p_port_leases.get_mut(&lease_id) else {
+            return ServiceResponse::Error {
+                message: format!("UDP 端口租约 {lease_id} 不存在或已过期"),
+            };
+        };
+        lease.expires_at = now + clamp_p2p_lease_ttl(lease_ttl_ms);
+        ServiceResponse::Ok
+    }
+
+    fn release_p2p_port_lease(&mut self, lease_id: u64) -> ServiceResponse {
+        let _ = self.p2p_port_leases.remove(&lease_id);
+        self.prune_expired_p2p_port_leases(Instant::now());
+        ServiceResponse::Ok
+    }
+
     #[must_use]
     fn take_all_handles(&mut self) -> RetiredHandles {
+        self.p2p_port_leases.clear();
         if let Some(ref s) = self.signal {
             s.request_stop();
         }
@@ -1658,6 +1753,21 @@ fn main() {
                 stop_ipc.store(true, Ordering::Release);
                 ServiceResponse::Ok
             }
+            ServiceRequest::AcquireP2pUdpPort { port, lease_ttl_ms } => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                guard.acquire_p2p_port_lease(port, lease_ttl_ms)
+            }
+            ServiceRequest::RenewP2pUdpPort {
+                lease_id,
+                lease_ttl_ms,
+            } => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                guard.renew_p2p_port_lease(lease_id, lease_ttl_ms)
+            }
+            ServiceRequest::ReleaseP2pUdpPort { lease_id } => {
+                let mut guard = agent_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                guard.release_p2p_port_lease(lease_id)
+            }
             ServiceRequest::EnsureAccessToken { .. }
             | ServiceRequest::InstallVerifiedUpdate { .. } => ServiceResponse::Error {
                 message: "该请求仅由 rc-daemon 处理".to_string(),
@@ -1960,6 +2070,8 @@ mod tests {
             permissions: permissions::check_permissions(),
             degraded_permissions: false,
             last_offline_disk_check: std::time::Instant::now(),
+            p2p_port_leases: HashMap::new(),
+            next_p2p_lease_id: 1,
             signal_sync_log: Some(Arc::clone(&sync_log)),
         };
 
@@ -1985,6 +2097,226 @@ mod tests {
 
         drop(old2);
         drop(old3);
+        let retired = inner.take_all_handles();
+        retired.stop_all(ByeReason::Normal);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn p2p_port_lease_lifecycle_rejects_invalid_enforces_cap_renews_releases_and_expires() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, UdpSocket};
+
+        let base = std::env::temp_dir().join(format!(
+            "rc-agent-p2p-lease-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let certs_dir = base.join("certs");
+        let auth_path = base.join("auth.json");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+
+        // 启动本地明文 TCP/UDP 模拟信令服，使 SignalClientHandle 注册真实 UdpProbeSlot 并秒完成初始探测。
+        let udp_sink = UdpSocket::bind("127.0.0.1:0").expect("bind mock udp probe");
+        let udp_probe_port = udp_sink.local_addr().unwrap().port();
+        let udp_stop = Arc::new(AtomicBool::new(false));
+        let udp_stop_c = Arc::clone(&udp_stop);
+        let udp_jh = std::thread::spawn(move || {
+            let _ = udp_sink.set_read_timeout(Some(Duration::from_millis(20)));
+            let mut buf = [0u8; 64];
+            while !udp_stop_c.load(Ordering::Acquire) {
+                if let Ok((n, from)) = udp_sink.recv_from(&mut buf) {
+                    if n >= 22 && &buf[0..4] == b"RCSP" {
+                        let mut resp = [0u8; 20];
+                        resp[0..4].copy_from_slice(b"RCSA");
+                        resp[4] = 1;
+                        resp[5] = 4;
+                        resp[6..10].copy_from_slice(&[203, 0, 113, 10]);
+                        resp[10..12].copy_from_slice(&from.port().to_be_bytes());
+                        resp[12..20].copy_from_slice(&buf[14..22]);
+                        let _ = udp_sink.send_to(&resp, from);
+                    }
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock tcp signal");
+        let tcp_port = listener.local_addr().unwrap().port();
+        let srv_stop = Arc::new(AtomicBool::new(false));
+        let srv_stop_c = Arc::clone(&srv_stop);
+        let srv_jh = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            while !srv_stop_c.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).is_ok() {
+                            let len = u32::from_be_bytes(len_buf) as usize;
+                            let mut body = vec![0u8; len];
+                            if stream.read_exact(&mut body).is_ok() {
+                                let ack = serde_json::to_vec(&serde_json::json!({
+                                    "type": "registered",
+                                    "device_id": "100000001",
+                                    "formatted_id": "100 000 001",
+                                    "relay_addr": format!("127.0.0.1:{tcp_port}"),
+                                    "udp_probe_addr": format!("127.0.0.1:{udp_probe_port}"),
+                                }))
+                                .unwrap();
+                                let _ = stream.write_all(&(ack.len() as u32).to_be_bytes());
+                                let _ = stream.write_all(&ack);
+                                let _ = stream.flush();
+                                while !srv_stop_c.load(Ordering::Acquire) {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let server_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: tcp_port,
+            relay_port: 21117,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let cert_mgr = Arc::new(CertManager::load_or_init(certs_dir).unwrap());
+        let auth = Arc::new(AuthSessionManager::new(
+            server_cfg.clone(),
+            auth_path,
+            cert_mgr,
+        ));
+        let mut inner = AgentInner {
+            session_type: ServiceSessionType::Aqua,
+            ipc_secret: "secret".to_string(),
+            server_cfg: server_cfg.clone(),
+            prefs: AppPrefs::default(),
+            auth: Arc::new(RwLock::new(auth)),
+            signal: None,
+            lan: None,
+            host: None,
+            allow_owner_control: true,
+            pending_device_events: VecDeque::new(),
+            pending_device_wol_events: VecDeque::new(),
+            password: String::new(),
+            custom_password: false,
+            listen_addr: None,
+            display_addr: None,
+            backend: String::new(),
+            connected_peer: None,
+            pending_approval: None,
+            device_id: None,
+            signal_online: false,
+            permissions: permissions::check_permissions(),
+            degraded_permissions: false,
+            last_offline_disk_check: std::time::Instant::now(),
+            p2p_port_leases: HashMap::new(),
+            next_p2p_lease_id: 1,
+            signal_sync_log: None,
+        };
+
+        let mut sig = SignalClientHandle::spawn(server_cfg, "agent-lease-test".into(), Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probe_port = loop {
+            let (p_opt, addrs, _, _, _) = sig.snapshot_p2p_reprobe_info();
+            if let Some(p) = p_opt {
+                if !addrs.is_empty() {
+                    break p;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SignalClientHandle must bind local_udp_port and complete initial probe"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        };
+
+        // 0) port=0 与未持有端口应拒绝
+        assert!(matches!(
+            inner.acquire_p2p_port_lease(0, 30_000),
+            ServiceResponse::Error { .. }
+        ));
+        let unheld_port = probe_port.checked_add(1).unwrap_or(probe_port - 1);
+        assert!(matches!(
+            inner.acquire_p2p_port_lease(unheld_port, 30_000),
+            ServiceResponse::Error { .. }
+        ));
+
+        // 1) 持槽位期间外部绑定应失败，Acquire 后可绑定且可续期
+        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_err());
+        let lease_id = match inner.acquire_p2p_port_lease(probe_port, 1_000) {
+            ServiceResponse::P2pUdpPortLease { lease_id } => lease_id,
+            other => panic!("unexpected acquire response: {other:?}"),
+        };
+        assert_eq!(inner.p2p_port_leases[&lease_id].port, probe_port);
+        // TTL 下限应被夹紧至 5_000ms
+        assert!(
+            inner.p2p_port_leases[&lease_id].expires_at
+                >= Instant::now() + Duration::from_millis(4_500)
+        );
+        {
+            let rebound = UdpSocket::bind(("0.0.0.0", probe_port))
+                .expect("port must be bindable while lease is active");
+            drop(rebound);
+        }
+
+        // Renew 应延后 expires_at，无效 lease_id 应返回 Error
+        let prev_exp = inner.p2p_port_leases[&lease_id].expires_at;
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            inner.renew_p2p_port_lease(lease_id, 60_000),
+            ServiceResponse::Ok
+        );
+        assert!(inner.p2p_port_leases[&lease_id].expires_at > prev_exp);
+        assert!(matches!(
+            inner.renew_p2p_port_lease(999_999, 30_000),
+            ServiceResponse::Error { .. }
+        ));
+
+        // Release 应立即恢复 UdpProbeSlot 占用
+        assert_eq!(inner.release_p2p_port_lease(lease_id), ServiceResponse::Ok);
+        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_err());
+
+        // 2) 容量上限 MAX_EXTERNAL_P2P_PORT_LEASES = 16 与过期自动清理恢复
+        let mut cap_ids = Vec::new();
+        for _ in 0..MAX_EXTERNAL_P2P_PORT_LEASES {
+            match inner.acquire_p2p_port_lease(probe_port, 30_000) {
+                ServiceResponse::P2pUdpPortLease { lease_id } => cap_ids.push(lease_id),
+                other => panic!("expected lease up to cap, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            inner.acquire_p2p_port_lease(probe_port, 30_000),
+            ServiceResponse::Error { .. }
+        ));
+        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_ok());
+
+        // 将全部租约设为已过期并调用 pump_events() 验证自动清理并恢复槽位
+        let expired_at = Instant::now() - Duration::from_millis(10);
+        for lease in inner.p2p_port_leases.values_mut() {
+            lease.expires_at = expired_at;
+        }
+        let _ = inner.pump_events();
+        assert!(inner.p2p_port_leases.is_empty());
+        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_err());
+
+        srv_stop.store(true, Ordering::Release);
+        udp_stop.store(true, Ordering::Release);
+        sig.stop();
+        let _ = srv_jh.join();
+        let _ = udp_jh.join();
         let retired = inner.take_all_handles();
         retired.stop_all(ByeReason::Normal);
         let _ = std::fs::remove_dir_all(&base);

@@ -1339,6 +1339,9 @@ fn main() {
                 state.set_service_proxy(true);
             }
 
+            // 0.6) 仅在 GUI 主进程注册跨进程 P2P UDP 端口租约钩子：当本地未持有 UdpProbeSlot 时经 agent.sock 协调释放与续期。
+            commands::register_cross_process_udp_port_hold_hook();
+
             // 1) 启动局域网多播发现后台线程（随机非零实例 ID + 本机设备名 + 已缓存 9 位设备码）。
             let mut instance_id = OsRng.next_u64();
             if instance_id == 0 {

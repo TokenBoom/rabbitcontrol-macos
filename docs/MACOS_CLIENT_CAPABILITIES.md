@@ -8,9 +8,9 @@
 
 | 组件 / 仓库 | 参考基线版本 / Commit | 关键依赖与说明 |
 |---|---|---|
-| `rabbitcontrol-macos` | Tag `v0.2.5`（发版基线，workspace `0.2.5`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`，plist FD 上限 `4096/8192`）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
-| `rabbitcontrol-core` | Tag `v0.2.6`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、P2P v2.1 双向协商与自愈 / `SwitchableTransport`、QUIC/mTLS、Relay/LAN 码率对称与突发平滑、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
-| `rabbitcontrol-apple-media` | Tag `v0.2.4`（`d4479ed`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
+| `rabbitcontrol-macos` | Tag `v0.2.6`（发版基线，workspace `0.2.6`） | Tauri GUI（`rc-ui`）+ 系统守护双进程（`rc-daemon` / `rc-host-agent`，plist FD 上限 `4096/8192` + 跨进程 UDP 端口租约 IPC）+ 原生硬件/OS 后端 + 诊断 CLI（`rc-cli`） |
+| `rabbitcontrol-core` | Tag `v0.2.7`（`CORE_ABI_VERSION = 2`） | 18 个纯跨平台 Rust crate（协议、P2P v2.1 单向内网与跨进程端口租约钩子 / `SwitchableTransport`、QUIC/mTLS、Relay/LAN 码率对称与突发平滑、帧调度、工具引擎、通用客户端内核 `rc-client-core`） |
+| `rabbitcontrol-apple-media` | Tag `v0.2.5`（`6109cc4`） | Apple VideoToolbox AV1/HEVC/H.264 硬件解码及移动端 C FFI 适配 |
 | `rabbitcontrol-spec` | Tag `v1.0.0` | 统一错误目录（116 个规范错误码、127 个线协议别名、17 个域、4 端平台覆写）与多语言代码生成 |
 
 ---
@@ -30,9 +30,9 @@
 
 | 组件 | 形态与职责 | 跨端借鉴重点 |
 |---|---|---|
-| `rc-ui`（前台 GUI） | 按需开合的桌面主界面、远控渲染窗与工具窗；经 Unix Domain Socket 与后台服务通信；未安装系统服务时平滑回退为**单进程嵌入式托管模式** | Windows 对标 Electron/WinUI/Tauri 主进程 + Windows Service IPC；移动端走单进程嵌入式 |
+| `rc-ui`（前台 GUI） | 按需开合的桌面主界面、远控渲染窗与工具窗；经 Unix Domain Socket 与后台服务通信；代理模式下在 GUI 启动入口注册 `ExternalUdpPortHoldHook`（`AcquireP2pUdpPort` / `RenewP2pUdpPort` / `ReleaseP2pUdpPort`）向 `rc-host-agent` 协调复用 `local_udp_port`；未安装系统服务时平滑回退为**单进程嵌入式托管模式** | Windows 对标 Electron/WinUI/Tauri 主进程 + Windows Service IPC；移动端走单进程嵌入式 |
 | `rc-daemon`（系统级守护） | 随系统开机常驻：**单点串行刷新 Refresh Token**（防止多进程/多开重放吊销整族会话）、设备证书自动续签、独立复核升级包 SHA-256 与签名后原子替换 `.app`、`boot-marker` 与 `manual-stop` 防误重启标记；`LaunchDaemon` plist 默认配置 `SoftResourceLimits.NumberOfFiles = 4096`、`HardResourceLimits.NumberOfFiles = 8192` | Windows 对应 System Windows Service 负责开机在线与提权升级；移动端无独立 daemon |
-| `rc-host-agent`（双会话被控代理） | 同时覆盖 `LoginWindow`（重启未输密码登录界面，只放行同账号 `OwnerTicket` Ed25519 自控或固定自定义密码，严禁无密码与随机临时码）与 `Aqua`（登录后桌面上下文，经 `ByeReason::SessionSwitching` 无缝交接并接管顶部状态栏）；使用 `ipc.secret` 256-bit 随机十六进制共享密钥做常量时间鉴权；`LaunchAgent` plist 同步配置 FD 上限 `4096/8192` 并通过 `UiHostConfig` / `HostHandle::set_signal_client`（独立模式同步经 `commands.rs::sync_running_host_signal_client`）实时同步最新 `SignalClientHandle`，支持后启动/切换信令后的运行期 `Relay -> P2P` 复探 | Windows 对应 Session 0 / Winlogon 桌面前置接管，保证重启/锁屏/UAC 界面均可控 |
+| `rc-host-agent`（双会话被控代理） | 同时覆盖 `LoginWindow`（重启未输密码登录界面，只放行同账号 `OwnerTicket` Ed25519 自控或固定自定义密码，严禁无密码与随机临时码）与 `Aqua`（登录后桌面上下文，经 `ByeReason::SessionSwitching` 无缝交接并接管顶部状态栏）；使用 `ipc.secret` 256-bit 随机十六进制共享密钥做常量时间鉴权；`LaunchAgent` plist 同步配置 FD 上限 `4096/8192`，通过 `UiHostConfig` / `HostHandle::set_signal_client` 实时同步最新 `SignalClientHandle`，并在 IPC 层管理跨进程 P2P UDP 端口租约（上限 `16`、TTL `5s..=60s`、`pump_events` 与停机自动回收） | Windows 对应 Session 0 / Winlogon 桌面前置接管，保证重启/锁屏/UAC 界面均可控 |
 | `rc-host-macos`（托盘与审批弹窗） | 状态栏（`NSStatusItem`）：展示当前状态、**「断开当前会话」**（仅会话中启用）、**「退出」**；非阻塞模态连接审批弹窗（支持拒绝/放行与超时自动撤窗） | Windows 托盘与来电审批气泡/弹窗须提供对等控制权 |
 | `rc-cli`（诊断 CLI） | 提供 `probe`（权限与后端 JSON 探测）、`version`、`host`、`client`、`loopback`、`bench` 等命令行能力，便于自动化回归与排障 | 桌面端建议保留轻量无头诊断子命令 |
 
@@ -105,10 +105,11 @@ macOS 桌面端（`crates/rc-ui`）共暴露 **118 个 IPC 命令**（`#[tauri::
 
 ## 四、网络路由、断网自愈、代理与 Wake-on-LAN
 
-1. **三层路由、P2P v2.1 与双端 `Relay-first` 无损热切（含 #4 握手修复 & `v0.2.5` / `core v0.2.6` 回归自愈）**
+1. **三层路由、P2P v2.1 与双端 `Relay-first` 无损热切（含 #4 握手修复 & `v0.2.6` / `core v0.2.7` 单向内网与跨进程租约修复）**
    - 路由优先级：**静默局域网发现（UDP LAN，全网卡 IPv4 扫描）→ P2P v2.1 UDP 打洞（全网卡 IPv4 + 全球单播 IPv6 Happy Eyeballs）→ 强制 TLS 1.3 mTLS TCP 中继（`:21117`）**；局域网设备仅在连接路由决策时静默使用，**默认不在设备列表暴露**；
    - **100% 纯私有 STUN 4 样本 NAT 画像与自愈（零第三方公共 STUN）**：仅使用自有 `rc-server` 的 `RCSP`/`RCSA` 双端口（含可选第二公网 IP `udp_probe_alt_ip_addr`）4 样本探测（探测退避放宽至 `[250, 450, 700]ms` / `500ms` / `[250, 450]ms`），精准细分 `Public` / `ConeVerified` / `ConeUnverified` / `AdmSeq` / `AdmRandom` / `ApdmSeq` / `ApdmRandom` / `UdpBlocked`，并通过信令透传扩展 `nat_type` 与 `nat_port_range`；收到任意合法 `RCSA` 响应立即清除 `UdpBlocked` 降级 `ConeUnverified` 并触发异步全量重探自愈；
-   - **`RCP2 v2` 双向能力协商、HMAC-SHA256 认证打洞与梯度两波次生日碰撞**：`Register` 上报 `rcp2_v2: true`，服务端仅在双端均支持时下发 `PunchCoord.punch_secret`（48 字节 `RCP2 v2` HMAC-SHA256 报文，恒定时间验签 + 1.0x 等长 Ack 防放大），旧端或混连平滑回退 `RCP2 v1` 29 字节；配合 `start_after_ms`（快侧 `0..=500ms` RTT 同步起跑）与超时梯度（`P2pOnly = 8s`、`Auto = 2.4s`）按 6 类 NAT 组合执行策略矩阵（`UdpBlocked` / 双端 `ApdmRandom` 0ms 快退、`ApdmSeq ↔ ApdmSeq` 定向会师、`Cone* ↔ ApdmRandom` 两波次滚动释放 `<=96` aux + `<=200 pps` 512 端口采样、`ConeUnverified` 三级渐进探测），并内置 `96` 辅助 socket 硬上限与 `EMFILE`/`ENFILE` FD 守卫；
+   - **`RCP2 v2` 双向能力协商、单向内网成对更新与跨出口兜底**：`Register` 上报 `rcp2_v2: true`，服务端仅在双端均支持时下发 `PunchCoord.punch_secret`（48 字节 `RCP2 v2` HMAC-SHA256 报文，恒定时间验签 + 1.0x 等长 Ack 防放大），旧端或混连平滑回退 `RCP2 v1` 29 字节；`p2p.rs` 收到来自新源端口的合法打洞请求时**成对更新 `(confirmed_peer, peer_sender_nonce)`** 并按 `SocketAddr` 粒度限频，避免单向内网/对称出口错配；`filter_cross_site_lan_addrs` 在跨公网出口场景保留最多 `4` 条低优先级合法私网 LAN 地址兜底，并由 `format_punch_timeout_error` 输出详尽超时诊断；配合 `start_after_ms`（快侧 `0..=500ms`）与超时梯度（`P2pOnly = 8s`、`Auto = 2.4s`）按 6 类 NAT 组合执行策略矩阵（`96` 辅助 socket 硬上限 + `EMFILE`/`ENFILE` 守卫）；
+   - **跨进程 P2P UDP 端口租约（`rc-ui` ↔ `rc-host-agent`）**：系统后台服务代理模式下，`rc-ui` GUI 主进程通过 `ExternalUdpPortHoldHook` 经 `agent.sock` 调用 `AcquireP2pUdpPort`（`30s` TTL、`10s` `Condvar` 后台续期、`Drop` 时 `500ms` 超时 `ReleaseP2pUdpPort`）暂停并复用 `rc-host-agent` 持有的 `UdpProbeSlot` 本地 UDP 端口（`MAX_EXTERNAL_P2P_PORT_LEASES = 16`，异常失联由 `pump_events` 到期自动清理恢复）；
    - **双端 `Relay-first 400ms` + `SwitchableTransport` 无损热切**：`Auto` 模式下首包 `relay_fallback_after_ms`（默认 `400ms`）后并行拨号 `:21117` mTLS 中继秒通保底，P2P 直连就绪或运行期 60s `Relay -> P2P` 复探成功后通过 `SwitchableTransport` 无损平滑热切至直连（`rc-host-agent` 与独立模式主进程均通过 `UiHostConfig` / `HostHandle::set_signal_client` / `UiSessionConfig` 实时同步 `signal_client` 与 `target_device_id` 支撑运行期刷新打洞与按需 `request_relay`）；
    - **#4 握手稳定性**：解耦 QUIC Accept 短分片与 TLS 握手超时，`Welcome` 收到前遇到底层超时/断连自动回退下一级链路；**严守红线**：一旦对方拒绝 mTLS/鉴权、处于 `AuthChallenge` 审批等待期或模式为 `P2pOnly`，绝不误降级。
 2. **三档持久化「连接模式」（热切换不断流恢复）**
